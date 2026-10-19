@@ -37,7 +37,7 @@ export function AdminVoicebots() {
   const load = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/voicebots');
+      const res = await authFetch('/api/voicebots');
       const data = await res.json();
       if (data.ok) setBots(data.voicebots);
     } catch {}

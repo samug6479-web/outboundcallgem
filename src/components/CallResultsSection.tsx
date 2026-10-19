@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { PhoneCall, CheckCircle2, XCircle, ChevronDown, RefreshCw, Clock, Search, Download } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { cn } from '../lib/utils';
+import { authFetch } from '../lib/authFetch';
 
 interface CallResult {
   callId: string;
@@ -155,7 +156,7 @@ function StatsBar() {
   const [stats, setStats] = useState<Stats | null>(null);
 
   useEffect(() => {
-    fetch('/api/voicebot-stats')
+    authFetch('/api/voicebot-stats')
       .then(r => r.json())
       .then(d => setStats(d.totali || null))
       .catch(() => setStats(null));
@@ -194,7 +195,7 @@ export function CallResultsSection() {
   const load = async (p = page) => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/call-results?limit=${PAGE_SIZE}&offset=${p * PAGE_SIZE}`);
+      const res = await authFetch(`/api/call-results?limit=${PAGE_SIZE}&offset=${p * PAGE_SIZE}`);
       const data = await res.json();
       setResults(data.results || []);
       setTotal(data.total || 0);

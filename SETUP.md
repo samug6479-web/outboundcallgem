@@ -32,6 +32,10 @@ Copia `env.example` e configura i valori. Su Vercel vanno impostate nel pannello
 | `SMTP_SECURE` | ➖ | `"true"` per TLS implicito (porta 465). Default: STARTTLS. |
 | `NOTIFY_EMAIL` | ⚠️ | Destinatario delle notifiche (follow-up e fine campagna). |
 | `APP_URL` | ➖ | URL pubblico dell'app. |
+| `MAKE_WEBHOOK_URL` / `MAKE_WEBHOOK_URL_APPUNTAMENTI` | ➖ | Webhook Make per il lancio campagne (standard / appuntamenti). Il browser non li vede più: li chiama il server. Se vuote, si usano gli URL storici. |
+| `MAKE_WEBHOOK_SECRET` | ➖ | Inviato a Make nell'header `x-gem-secret`, da controllare con un filtro nello scenario. |
+| `CALLS_DRY_RUN` | ➖ | `"true"` = lancio simulato (nessuna chiamata). Se vuota: chiamate reali **solo** in produzione Vercel. |
+| `GITHUB_DATA_BRANCH` | ➖ | Branch per `users.json` / `voicebots.json`. Vuota = branch principale. Nelle anteprime Vercel, senza questa variabile, le scritture sono bloccate. |
 
 `*` In produzione GitHub è di fatto necessario, perché su serverless il filesystem è effimero.
 
@@ -42,6 +46,18 @@ Le tabelle usate dal backend (`call_results`, `followups`, `contact_names`, `web
 ```bash
 psql "$DATABASE_URL" -f scripts/migrations/001_access_logs.sql
 ```
+
+La tabella `auth_attempts` (limite tentativi di login/OTP) viene creata dal backend al primo utilizzo; in alternativa `scripts/migrations/002_auth_attempts.sql`.
+
+## Ambiente di test
+
+Le anteprime Vercel (un deploy per ogni branch/PR) **non fanno chiamate reali**: il lancio campagna e la chiamata di prova vengono simulati, e l'app mostra il prefisso `[TEST]`. Anche l'email di riepilogo arriva con `[TEST - nessuna chiamata reale]` nell'oggetto.
+
+Per un test isolato dalla produzione, nelle variabili d'ambiente Vercel con target **Preview**:
+
+1. `DATABASE_URL` → un **branch Neon** dedicato (Neon → Branches → Create branch), non il database di produzione.
+2. `GITHUB_DATA_BRANCH` → un branch dedicato ai dati di test (es. `test-data`, creato da `main`). Senza, le modifiche a utenti e voicebot sono bloccate in anteprima.
+3. `CALLS_DRY_RUN` → lascia vuota (simulazione). Per provare una chiamata vera verso il tuo numero, impostala a `false` solo per il tempo del test.
 
 ## Sviluppo locale
 

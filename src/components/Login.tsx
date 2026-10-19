@@ -15,6 +15,7 @@ export function Login() {
   const [isOtpStep, setIsOtpStep] = useState(false);
   const [setup2FA, setSetup2FA] = useState(false);
   const [qrUrl, setQrUrl] = useState('');
+  const [otpToken, setOtpToken] = useState('');
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -32,6 +33,7 @@ export function Login() {
       setIsOtpStep(true);
       setSetup2FA(res.setup2FA);
       setQrUrl(res.qrUrl);
+      setOtpToken(res.otpToken || '');
       setError('');
     } else if (res && res.ok) {
       const loggedUser = { username: res.username, nome: res.nome, role: res.role, isAdmin: res.isAdmin, canSchedule: res.canSchedule, email: res.email || '', telefono: res.telefono || '', twoFactorEnabled: res.twoFactorEnabled, twoFactorRequired: res.twoFactorRequired };
@@ -52,7 +54,7 @@ export function Login() {
 
     setLoading(true);
     setError('');
-    const res = await verifyOtp(username, otp);
+    const res = await verifyOtp(username, otp, otpToken);
     setLoading(false);
 
     if (!res || !res.ok) {
