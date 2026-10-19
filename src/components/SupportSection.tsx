@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useCampaign } from '../context/CampaignContext';
 import { Mail, Phone, Send, Loader2, CheckCircle2, AlertCircle, Building2 } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { authFetch } from '../lib/authFetch';
 
 export function SupportSection() {
   const { user } = useCampaign();
@@ -27,7 +28,7 @@ export function SupportSection() {
     setError('');
     
     try {
-      const res = await fetch('/api/support', {
+      const res = await authFetch('/api/support', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

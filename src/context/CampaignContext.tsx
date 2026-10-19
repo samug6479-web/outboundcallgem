@@ -68,7 +68,7 @@ interface CampaignContextType {
   updateProfile: (email: string, telefono: string) => Promise<{ ok: boolean; error?: string }>;
   enable2FA: () => Promise<{ ok: boolean; error?: string }>;
   login: (u: string, p: string) => Promise<any>;
-  verifyOtp: (u: string, otp: string) => Promise<any>;
+  verifyOtp: (u: string, otp: string, otpToken?: string) => Promise<any>;
   logout: () => void;
   
   contacts: Contact[];
@@ -185,8 +185,12 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       document.documentElement.classList.add('dark');
       setDarkMode(true);
     }
-    loadVoicebots();
   }, []);
+
+  // La lista voicebot richiede il login: la carichiamo quando c'è un utente.
+  useEffect(() => {
+    if (user) loadVoicebots();
+  }, [user?.username]);
 
   const login = async (u: string, p: string) => {
     try {
@@ -203,12 +207,12 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const verifyOtp = async (u: string, otp: string) => {
+  const verifyOtp = async (u: string, otp: string, otpToken?: string) => {
     try {
       const res = await fetch('/api/verify-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: u, otp })
+        body: JSON.stringify({ username: u, otp, otpToken })
       });
       const data = await res.json();
       
@@ -217,7 +221,6 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
         setUser(loggedUser);
         sessionStorage.setItem('gem_session', JSON.stringify(loggedUser));
         if (data.token) sessionStorage.setItem('gem_token', data.token);
-        fetch('/api/access-log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: data.username, nome: data.nome, action: 'login' }) }).catch(() => {});
         return { ok: true };
       }
       return data;
@@ -246,7 +249,8 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = () => {
-    if (user) fetch('/api/access-log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: user.username, nome: user.nome, action: 'logout' }) }).catch(() => {});
+    // Il token va letto prima di cancellarlo dalla sessione
+    if (user) authFetch('/api/access-log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'logout' }) }).catch(() => {});
     sessionStorage.removeItem('gem_session');
     sessionStorage.removeItem('gem_token');
     setUser(null);
@@ -343,7 +347,7 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
 
   const loadVoicebots = async () => {
     try {
-      const res = await fetch('/api/voicebots');
+      const res = await authFetch('/api/voicebots');
       const data = await res.json();
       if (data.ok) {
         const active = data.voicebots.filter((v: Voicebot) => v.attivo);
@@ -432,21 +436,15 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
   const testSingleCall = async (contact: Contact) => {
     setTestStatus({ type: 'load', msg: `Test chiamata a ${contact.nome} (${contact.numero})...` });
     try {
-      const res = await fetch('https://hook.eu1.make.com/ac3icgiyh1nbvvh463w33qh58uenvfgo', {
+      // La chiamata passa dal server (che conosce l'URL Make), non più dal browser.
+      const res = await authFetch('/api/campaigns/test-call', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contatti: [contact],
-          totale: 1,
-          avviatoIl: new Date().toISOString(),
-          scheduledAt: null,
-          modalita: 'test',
-          operatore: user?.nome,
-          fonte: 'gem-test',
-          chunk: 1, chunks_totali: 1
-        })
+        body: JSON.stringify({ contact: { nome: contact.nome, numero: contact.numero } })
       });
-      if (res.ok) setTestStatus({ type: 'ok', msg: `✓ Chiamata test inviata a ${contact.nome}` });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.dryRun) { setTestStatus({ type: 'ok', msg: `✓ [TEST] Chiamata simulata verso ${contact.nome} — nessuna chiamata reale` }); }
+      else if (res.ok) setTestStatus({ type: 'ok', msg: `✓ Chiamata test inviata a ${contact.nome}` });
       else setTestStatus({ type: 'err', msg: `Errore HTTP ${res.status}${SUPPORT_HINT}` });
     } catch(e: any) {
       setTestStatus({ type: 'err', msg: 'Errore di rete: ' + e.message + SUPPORT_HINT });
@@ -473,60 +471,50 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
     setIsLaunching(true);
     setLaunchStatus({ type: 'load', msg: `Preparazione invio di ${validContacts.length} contatti...` });
 
-    const chunks = [];
-    for (let i = 0; i < validContacts.length; i += concurrency) {
-      chunks.push(validContacts.slice(i, i + concurrency));
-    }
-
     try {
-      const WEBHOOK_URL = campaignType === 'appuntamenti'
-        ? 'https://hook.eu1.make.com/9f7h1ebgktojphmiulyqte4ux7f3tjqv'
-        : 'https://hook.eu1.make.com/ac3icgiyh1nbvvh463w33qh58uenvfgo';
-
-      const results = await Promise.all(chunks.map((chunk, idx) =>
-        fetch(WEBHOOK_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contatti: chunk.map(c => ({
-                nome: c.nome,
-                numero: c.numero,
-                ...(campaignType === 'appuntamenti' && c.data_appuntamento ? { data_appuntamento: c.data_appuntamento } : {}),
-                ...(campaignType === 'appuntamenti' && c.ora_appuntamento ? { ora_appuntamento: c.ora_appuntamento } : {}),
-                ...(campaignType === 'appuntamenti' && c.prestazione ? { prestazione: c.prestazione } : {}),
-              })),
-              tipo_campagna: campaignType,
-            totale: chunk.length,
-            avviatoIl: new Date().toISOString(),
-            scheduledAt: targetAt,
-            modalita: targetAt ? 'scheduled' : 'immediate',
-            operatore: user?.nome,
-            fonte: 'gem-dashboard-react',
-            note: campaignNote || undefined,
-            voicebot_nome: selectedVoicebot?.nome,
-            voicebot_exten: selectedVoicebot?.exten || 8000,
-            voicebot_context: selectedVoicebot?.context || 'outbound-voicebot',
-            chunk: idx + 1,
-            chunks_totali: chunks.length
-          })
+      // Il server valida i dati, inoltra a Make e invia l'email di riepilogo.
+      // Così gli URL dei webhook non sono più visibili nel browser.
+      const res = await authFetch('/api/campaigns/launch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contatti: validContacts.map(c => ({
+            nome: c.nome,
+            numero: c.numero,
+            ...(campaignType === 'appuntamenti' && c.data_appuntamento ? { data_appuntamento: c.data_appuntamento } : {}),
+            ...(campaignType === 'appuntamenti' && c.ora_appuntamento ? { ora_appuntamento: c.ora_appuntamento } : {}),
+            ...(campaignType === 'appuntamenti' && c.prestazione ? { prestazione: c.prestazione } : {}),
+          })),
+          tipo_campagna: campaignType,
+          scheduledAt: targetAt,
+          note: campaignNote || undefined,
+          voicebot_id: selectedVoicebot?.id,
+          concurrency,
         })
-      ));
+      });
+      const data = await res.json().catch(() => ({}));
 
-      const okCount = results.filter(r => r.ok || r.status === 200).length;
-      if (okCount === chunks.length) {
-        setLaunchStatus({ type: 'ok', msg: `Campagna inviata — ${validContacts.length} chiamate in elaborazione.` });
-        saveHistory(validContacts.length, targetAt, concurrency, validContacts.map(c => ({...c})));
+      if (!res.ok && !data.sent) {
+        setLaunchStatus({ type: 'err', msg: (data.error || `Errore HTTP ${res.status}`) + SUPPORT_HINT });
+        return;
+      }
+
+      const testPrefix = data.dryRun ? '[TEST — nessuna chiamata reale] ' : '';
+      const sentNumbers = new Set<string>((data.sentContacts || []).map((c: any) => c.numero));
+      const sentList = validContacts.filter(c => sentNumbers.has(String(c.numero).replace(/[\s\-().]/g, '')));
+      if (data.sent > 0) {
+        saveHistory(data.sent, targetAt, concurrency, (sentList.length ? sentList : validContacts).map(c => ({ ...c })));
         setCampaignNote('');
-        // Notifica email completamento (fire and forget)
-        fetch('/api/notify-campaign', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operatore: user?.nome, count: validContacts.length, scheduledAt: targetAt, note: campaignNote || undefined, userEmail: user?.email || undefined }) }).catch(() => {});
-        // Registra numero → nome, per mostrare il nome reale del contatto negli Esiti Voicebot
-        fetch('/api/register-campaign-contacts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contacts: validContacts.map(c => ({ numero: c.numero, nome: c.nome })) }),
-        }).catch(() => {});
+      }
+
+      if (data.failed > 0) {
+        // Lasciamo in lista solo i contatti NON inviati, così "Avvia" li
+        // riprova senza richiamare chi è già stato inoltrato.
+        const failedNumbers = new Set<string>((data.failedContacts || []).map((c: any) => c.numero));
+        setContacts(validContacts.filter(c => failedNumbers.has(String(c.numero).replace(/[\s\-().]/g, ''))));
+        setLaunchStatus({ type: 'err', msg: `${testPrefix}${data.sent} contatti inviati, ${data.failed} non inviati. In lista sono rimasti solo quelli da riprovare.${SUPPORT_HINT}` });
       } else {
-        setLaunchStatus({ type: 'err', msg: `${okCount}/${chunks.length} blocchi inviati correttamente${SUPPORT_HINT}` });
+        setLaunchStatus({ type: 'ok', msg: `${testPrefix}Campagna inviata — ${data.sent} chiamate in elaborazione.` });
       }
     } catch(err: any) {
       setLaunchStatus({ type: 'err', msg: 'Errore di rete: ' + err.message + SUPPORT_HINT });

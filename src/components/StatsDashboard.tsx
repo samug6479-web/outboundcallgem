@@ -4,6 +4,7 @@ import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, L
 import { Phone, TrendingUp, Users, Clock, CalendarDays, PhoneOff, BarChart2, PhoneIncoming, Timer } from 'lucide-react';
 import { format, subDays, startOfDay, isToday } from 'date-fns';
 import { cn } from '../lib/utils';
+import { authFetch } from '../lib/authFetch';
 
 interface VoicebotTotals {
   totale: number;
@@ -29,7 +30,7 @@ export function StatsDashboard() {
 
   useEffect(() => {
     setVbLoading(true);
-    fetch('/api/voicebot-stats')
+    authFetch('/api/voicebot-stats')
       .then(r => r.json())
       .then(d => {
         if (d.ok) {

@@ -122,6 +122,119 @@ function requireAdmin(req: express.Request & { session?: SessionPayload }, res: 
   next();
 }
 
+// ── Token temporaneo per il secondo passaggio del login (2FA) ─────────
+// Viene rilasciato solo dopo username+password corretti e serve per
+// chiamare /api/verify-otp. Senza, chiunque conoscesse uno username
+// potrebbe tentare i codici a 6 cifre saltando la password.
+function issueOtpToken(username: string): string {
+  return jwt.sign({ username, purpose: "otp" }, SESSION_SECRET, { expiresIn: "10m" });
+}
+
+function verifyOtpToken(token: unknown, username: string): boolean {
+  if (typeof token !== "string" || !token) return false;
+  try {
+    const p = jwt.verify(token, SESSION_SECRET) as any;
+    return p?.purpose === "otp" && String(p.username).toLowerCase() === username.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+// ── Limite tentativi (login, OTP, supporto) ───────────────────────────
+// Su serverless la memoria non è condivisa tra istanze, quindi i
+// tentativi falliti si contano su Postgres. Se il database non è
+// raggiungibile il controllo non blocca nessuno (meglio che impedire
+// l'accesso a tutti).
+let securitySchemaReady: Promise<void> | null = null;
+function ensureSecuritySchema(): Promise<void> {
+  if (!securitySchemaReady) {
+    securitySchemaReady = (async () => {
+      await sql!`
+        CREATE TABLE IF NOT EXISTS auth_attempts (
+          id  SERIAL PRIMARY KEY,
+          key TEXT NOT NULL,
+          ts  TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `;
+      await sql!`CREATE INDEX IF NOT EXISTS idx_auth_attempts_key_ts ON auth_attempts (key, ts DESC)`;
+    })().catch(err => {
+      securitySchemaReady = null;
+      throw err;
+    });
+  }
+  return securitySchemaReady;
+}
+
+async function countAttempts(key: string, windowMinutes: number): Promise<number> {
+  try {
+    await ensureSecuritySchema();
+    const rows = await sql!`
+      SELECT COUNT(*)::int AS n FROM auth_attempts
+      WHERE key = ${key} AND ts > now() - make_interval(mins => ${windowMinutes}::int)
+    `;
+    return (rows as any[])[0]?.n ?? 0;
+  } catch (err) {
+    console.error("Limite tentativi non disponibile (DB):", err);
+    return 0;
+  }
+}
+
+async function recordAttempt(key: string): Promise<void> {
+  try {
+    await ensureSecuritySchema();
+    await sql!`INSERT INTO auth_attempts (key) VALUES (${key})`;
+    // Pulizia leggera dei record vecchi
+    if (Math.random() < 0.05) await sql!`DELETE FROM auth_attempts WHERE ts < now() - interval '1 day'`;
+  } catch (err) {
+    console.error("Impossibile registrare il tentativo (DB):", err);
+  }
+}
+
+async function clearAttempts(key: string): Promise<void> {
+  try {
+    await ensureSecuritySchema();
+    await sql!`DELETE FROM auth_attempts WHERE key = ${key}`;
+  } catch (err) {
+    console.error("Impossibile azzerare i tentativi (DB):", err);
+  }
+}
+
+function clientIp(req: express.Request): string {
+  const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return fwd || req.socket.remoteAddress || "unknown";
+}
+
+const LOGIN_MAX_PER_USER = 10; // tentativi falliti per utente in 15 minuti
+const LOGIN_MAX_PER_IP = 30;   // tentativi falliti per IP in 15 minuti
+const OTP_MAX_PER_USER = 5;    // codici OTP errati per utente in 15 minuti
+const SUPPORT_MAX_PER_USER = 5; // ticket di supporto per utente all'ora
+const TOO_MANY = "Troppi tentativi. Riprova tra qualche minuto.";
+
+// ── Registro accessi: scritto dal server, non più dal browser ─────────
+async function logAccess(username: string, nome: string | undefined, action: "login" | "logout") {
+  try {
+    await withRetry(() => sql!`
+      INSERT INTO access_logs (username, nome, action)
+      VALUES (${username}, ${nome || username}, ${action})
+    `);
+  } catch (err) {
+    // Non bloccante: un log di accesso mancato non deve impedire login/logout.
+    console.error("Error writing access_logs:", err);
+  }
+}
+
+// ── Modalità test (dry-run) per il lancio campagne ────────────────────
+// Le chiamate vere partono solo in produzione su Vercel. Negli ambienti
+// di anteprima/test e in locale il lancio viene simulato: il server
+// valida tutto ma NON inoltra a Make, quindi nessun numero viene chiamato.
+// CALLS_DRY_RUN="true" forza la simulazione ovunque, "false" la disattiva.
+function isCallsDryRun(): boolean {
+  const flag = (process.env.CALLS_DRY_RUN || "").toLowerCase();
+  if (flag === "true") return true;
+  if (flag === "false") return false;
+  return process.env.VERCEL_ENV !== "production";
+}
+
 async function readCallResults(limit = 50, offset = 0): Promise<{ rows: any[]; total: number }> {
   try {
     const rows = await sql`
@@ -236,14 +349,25 @@ async function readContactNames(): Promise<Record<string, string>> {
   }
 }
 
-async function upsertContactName(numero: string, nome: string) {
+// Versione "a blocchi": una sola query per tutta la lista (invece di una per
+// contatto), con i doppioni rimossi prima dell'inserimento.
+async function upsertContactNames(contacts: { numero: string; nome: string }[]) {
+  const map = new Map<string, string>();
+  for (const c of contacts) {
+    const n = normalizePhone(c.numero);
+    if (n && c.nome) map.set(n, String(c.nome).slice(0, 200));
+  }
+  if (map.size === 0) return;
+  const numeri = [...map.keys()];
+  const nomi = [...map.values()];
   try {
-    await sql`
-      INSERT INTO contact_names (numero, nome) VALUES (${numero}, ${nome})
+    await withRetry(() => sql!`
+      INSERT INTO contact_names (numero, nome)
+      SELECT * FROM unnest(${numeri}::text[], ${nomi}::text[])
       ON CONFLICT (numero) DO UPDATE SET nome = EXCLUDED.nome
-    `;
+    `);
   } catch (err) {
-    console.error("Error upserting contact_names in Postgres:", err);
+    console.error("Error upserting contact_names (batch) in Postgres:", err);
   }
 }
 
@@ -321,15 +445,15 @@ app.get("/api/voicebot-stats", requireAuth, async (_req, res) => {
 // Endpoint chiamato dal frontend al lancio di una campagna, per registrare
 // l'associazione numero → nome contatto (serve ad arricchire i risultati
 // del voicebot, dato che il webhook Wildix restituisce solo il numero).
-app.post("/api/register-campaign-contacts", requireAuth, express.json(), async (req, res) => {
+app.post("/api/register-campaign-contacts", requireAuth, express.json({ limit: "5mb" }), async (req, res) => {
   const { contacts } = req.body as { contacts: { numero: string; nome: string }[] };
   if (!Array.isArray(contacts)) {
     return res.status(400).json({ ok: false, error: "contacts deve essere un array" });
   }
-  for (const c of contacts) {
-    const n = normalizePhone(c.numero);
-    if (n && c.nome) await upsertContactName(n, c.nome);
+  if (contacts.length > MAX_CONTACTS_PER_LAUNCH) {
+    return res.status(400).json({ ok: false, error: "Troppi contatti" });
   }
+  await upsertContactNames(contacts);
   res.json({ ok: true, count: contacts.length });
 });
 
@@ -508,7 +632,8 @@ app.get("/api/call-results", requireAuth, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // Da qui in poi: parsing JSON standard per tutte le altre rotte
 // ══════════════════════════════════════════════════════════════
-app.use(express.json());
+// Limite alzato per le liste contatti grandi inviate al lancio campagna.
+app.use(express.json({ limit: "5mb" }));
 
 const USERS_FILE = path.join(process.cwd(), "users.json");
 const GITHUB_REPO = "info4assistance25-maker/outboundcallgem";
@@ -516,13 +641,32 @@ const GITHUB_FILE_PATH = "users.json";
 const VOICEBOTS_FILE_PATH = "voicebots.json";
 const VOICEBOTS_LOCAL = path.join(process.cwd(), "voicebots.json");
 
+// Branch GitHub da cui leggere/scrivere users.json e voicebots.json.
+// Vuoto = branch principale del repo (produzione). Negli ambienti di test
+// va impostato su un branch dedicato (es. "test-data"), così le modifiche
+// fatte in test non toccano gli utenti e i voicebot di produzione.
+const GITHUB_DATA_BRANCH = (process.env.GITHUB_DATA_BRANCH || "").trim();
+
+function githubContentsUrl(file: string): string {
+  const base = `https://api.github.com/repos/${GITHUB_REPO}/contents/${file}`;
+  return GITHUB_DATA_BRANCH ? `${base}?ref=${encodeURIComponent(GITHUB_DATA_BRANCH)}` : base;
+}
+
+// In un'anteprima Vercel senza branch dedicato, le scritture finirebbero sui
+// dati di produzione: le blocchiamo.
+function githubWritesBlocked(): boolean {
+  return process.env.VERCEL_ENV === "preview" && !GITHUB_DATA_BRANCH;
+}
+const GITHUB_WRITE_BLOCKED_MSG =
+  "Scrittura bloccata: ambiente di test senza GITHUB_DATA_BRANCH (eviterebbe di modificare i dati di produzione).";
+
 async function readVoicebots() {
   const token = process.env.GITHUB_TOKEN;
   if (token) {
     try {
       const fileData = await withRetry(async () => {
         const getRes = await fetch(
-          `https://api.github.com/repos/${GITHUB_REPO}/contents/${VOICEBOTS_FILE_PATH}`,
+          githubContentsUrl(VOICEBOTS_FILE_PATH),
           { headers: { Authorization: `token ${token}`, Accept: "application/vnd.github.v3+json", "User-Agent": "gem-app" } }
         );
         if (!getRes.ok) {
@@ -543,6 +687,10 @@ async function readVoicebots() {
 }
 
 async function writeVoicebots(bots: any[]) {
+  if (githubWritesBlocked()) {
+    console.warn(GITHUB_WRITE_BLOCKED_MSG);
+    throw new Error(GITHUB_WRITE_BLOCKED_MSG);
+  }
   const token = process.env.GITHUB_TOKEN;
   if (!token) {
     try { fs.writeFileSync(VOICEBOTS_LOCAL, JSON.stringify(bots, null, 2)); } catch {}
@@ -551,17 +699,17 @@ async function writeVoicebots(bots: any[]) {
   try {
     await withRetry(async () => {
       const getRes = await fetch(
-        `https://api.github.com/repos/${GITHUB_REPO}/contents/${VOICEBOTS_FILE_PATH}`,
+        githubContentsUrl(VOICEBOTS_FILE_PATH),
         { headers: { Authorization: `token ${token}`, Accept: "application/vnd.github.v3+json", "User-Agent": "gem-app" } }
       );
       const sha = getRes.ok ? (await getRes.json() as any).sha : undefined;
       const content = Buffer.from(JSON.stringify(bots, null, 2)).toString("base64");
       const putRes = await fetch(
-        `https://api.github.com/repos/${GITHUB_REPO}/contents/${VOICEBOTS_FILE_PATH}`,
+        githubContentsUrl(VOICEBOTS_FILE_PATH),
         {
           method: "PUT",
           headers: { Authorization: `token ${token}`, Accept: "application/vnd.github.v3+json", "Content-Type": "application/json", "User-Agent": "gem-app" },
-          body: JSON.stringify({ message: "chore: update voicebots", content, ...(sha ? { sha } : {}) })
+          body: JSON.stringify({ message: "chore: update voicebots", content, ...(sha ? { sha } : {}), ...(GITHUB_DATA_BRANCH ? { branch: GITHUB_DATA_BRANCH } : {}) })
         }
       );
       if (!putRes.ok) {
@@ -579,7 +727,7 @@ async function readUsers() {
     try {
       const fileData = await withRetry(async () => {
         const getRes = await fetch(
-          `https://api.github.com/repos/${GITHUB_REPO}/contents/${GITHUB_FILE_PATH}`,
+          githubContentsUrl(GITHUB_FILE_PATH),
           { headers: { Authorization: `token ${token}`, Accept: "application/vnd.github.v3+json", "User-Agent": "gem-app" } }
         );
         if (!getRes.ok) {
@@ -606,6 +754,10 @@ async function readUsers() {
 }
 
 async function writeUsers(users: any[]) {
+  if (githubWritesBlocked()) {
+    console.warn(GITHUB_WRITE_BLOCKED_MSG);
+    return;
+  }
   const token = process.env.GITHUB_TOKEN;
   if (!token) {
     console.error("GITHUB_TOKEN non configurato — impossibile salvare su GitHub");
@@ -615,7 +767,7 @@ async function writeUsers(users: any[]) {
   try {
     // 1. Leggi SHA attuale
     const getRes = await fetch(
-      `https://api.github.com/repos/${GITHUB_REPO}/contents/${GITHUB_FILE_PATH}`,
+      githubContentsUrl(GITHUB_FILE_PATH),
       { headers: { Authorization: `token ${token}`, Accept: "application/vnd.github.v3+json", "User-Agent": "gem-app" } }
     );
     if (!getRes.ok) {
@@ -629,7 +781,7 @@ async function writeUsers(users: any[]) {
     // 2. Scrivi contenuto aggiornato
     const content = Buffer.from(JSON.stringify(users, null, 2)).toString("base64");
     const putRes = await fetch(
-      `https://api.github.com/repos/${GITHUB_REPO}/contents/${GITHUB_FILE_PATH}`,
+      githubContentsUrl(GITHUB_FILE_PATH),
       {
         method: "PUT",
         headers: {
@@ -638,7 +790,7 @@ async function writeUsers(users: any[]) {
           "Content-Type": "application/json",
           "User-Agent": "gem-app"
         },
-        body: JSON.stringify({ message: "chore: update users permissions", content, sha })
+        body: JSON.stringify({ message: "chore: update users permissions", content, sha, ...(GITHUB_DATA_BRANCH ? { branch: GITHUB_DATA_BRANCH } : {}) })
       }
     );
     if (!putRes.ok) {
@@ -663,13 +815,22 @@ app.post("/api/login", async (req, res) => {
     return res.status(400).json({ ok: false, error: "Username e password richiesti" });
   }
 
+  const userKey = `login:user:${String(username).toLowerCase()}`;
+  const ipKey = `login:ip:${clientIp(req)}`;
+  const [userFails, ipFails] = await Promise.all([countAttempts(userKey, 15), countAttempts(ipKey, 15)]);
+  if (userFails >= LOGIN_MAX_PER_USER || ipFails >= LOGIN_MAX_PER_IP) {
+    return res.status(429).json({ ok: false, error: TOO_MANY });
+  }
+
   const users = await readUsers();
-  const idx = users.findIndex((u: any) => u.username.toLowerCase() === username.toLowerCase());
+  const idx = users.findIndex((u: any) => u.username.toLowerCase() === String(username).toLowerCase());
   const user = idx !== -1 ? users[idx] : null;
 
   if (!user || !(await checkPassword(password, user.password))) {
+    await Promise.all([recordAttempt(userKey), recordAttempt(ipKey)]);
     return res.status(401).json({ ok: false, error: "Credenziali errate" });
   }
+  await clearAttempts(userKey);
 
   // Migrazione trasparente: se la password era ancora in chiaro, la
   // sostituiamo subito con l'hash bcrypt corrispondente.
@@ -689,6 +850,7 @@ app.post("/api/login", async (req, res) => {
     const role = user.role || (user.isAdmin ? "Admin" : "Editor");
     const isAdmin = user.isAdmin === true || user.role === "Admin";
     const token = issueSessionToken({ username: user.username, isAdmin });
+    await logAccess(user.username, user.nome, "login");
     return res.json({
       ok: true,
       token,
@@ -727,16 +889,26 @@ app.post("/api/login", async (req, res) => {
     }
     const otpauthUrl = generateTotpURI({ issuer: "GEM Outbound", label: user.username, secret });
     const qrUrl = await QRCode.toDataURL(otpauthUrl);
-    return res.json({ ok: false, requires2FA: true, setup2FA: true, qrUrl });
+    return res.json({ ok: false, requires2FA: true, setup2FA: true, qrUrl, otpToken: issueOtpToken(user.username) });
   }
 
-  return res.json({ ok: false, requires2FA: true, setup2FA: false });
+  return res.json({ ok: false, requires2FA: true, setup2FA: false, otpToken: issueOtpToken(user.username) });
 });
 
 app.post("/api/verify-otp", async (req, res) => {
-  const { username, otp } = req.body;
+  const { username, otp, otpToken } = req.body;
   if (!username || !otp) {
     return res.status(400).json({ ok: false, error: "Username e codice OTP richiesti" });
+  }
+
+  // Il codice OTP è accettato solo dopo aver superato il passaggio password.
+  if (!verifyOtpToken(otpToken, String(username))) {
+    return res.status(401).json({ ok: false, error: "Sessione di accesso scaduta. Effettua di nuovo il login." });
+  }
+
+  const otpKey = `otp:user:${String(username).toLowerCase()}`;
+  if ((await countAttempts(otpKey, 15)) >= OTP_MAX_PER_USER) {
+    return res.status(429).json({ ok: false, error: TOO_MANY });
   }
 
   const users = await readUsers();
@@ -756,8 +928,10 @@ app.post("/api/verify-otp", async (req, res) => {
   }
 
   if (!valid) {
+    await recordAttempt(otpKey);
     return res.status(401).json({ ok: false, error: "Codice OTP non valido o scaduto" });
   }
+  await clearAttempts(otpKey);
 
   // Al primo codice corretto, il 2FA passa da "in configurazione" ad "attivo"
   if (!user.twoFactorEnabled) {
@@ -772,6 +946,7 @@ app.post("/api/verify-otp", async (req, res) => {
   const role = user.role || (user.isAdmin ? "Admin" : "Editor");
   const isAdmin = user.isAdmin === true || user.role === "Admin";
   const token = issueSessionToken({ username: user.username, isAdmin });
+  await logAccess(user.username, user.nome, "login");
 
   res.json({
     ok: true,
@@ -915,11 +1090,23 @@ app.put("/api/users/:username/2fa", requireAuth, async (req: any, res) => {
 });
 
 
-app.post("/api/support", async (req, res) => {
+app.post("/api/support", requireAuth, async (req: any, res) => {
   const { name, email, phone, company, subject, message } = req.body;
   if (!subject || !message || !email || !phone) {
     return res.status(400).json({ ok: false, error: "Dati mancanti (email, telefono, oggetto e messaggio sono obbligatori)" });
   }
+  if ([name, email, phone, company, subject].some(v => v != null && String(v).length > 300) || String(message).length > 10000) {
+    return res.status(400).json({ ok: false, error: "Testo troppo lungo" });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) {
+    return res.status(400).json({ ok: false, error: "Email non valida" });
+  }
+
+  const supportKey = `support:user:${req.session.username.toLowerCase()}`;
+  if ((await countAttempts(supportKey, 60)) >= SUPPORT_MAX_PER_USER) {
+    return res.status(429).json({ ok: false, error: "Hai inviato troppe richieste. Riprova tra un'ora." });
+  }
+  await recordAttempt(supportKey);
 
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
     return res.status(500).json({ ok: false, error: "Credenziali SMTP non configurate." });
@@ -935,17 +1122,18 @@ app.post("/api/support", async (req, res) => {
     },
   });
 
-  const subjectLine = `[Supporto Campagne Out] ${name} ${phone}`;
+  const subjectLine = `[Supporto Campagne Out] ${String(name || "").replace(/[\r\n]/g, " ")} ${String(phone).replace(/[\r\n]/g, " ")}`;
 
   const html = `
-    <p><strong>Da:</strong> ${name}</p>
-    <p><strong>Email:</strong> ${email}</p>
-    <p><strong>Telefono:</strong> ${phone}</p>
-    ${company ? `<p><strong>Azienda:</strong> ${company}</p>` : ''}
-    <p><strong>Oggetto:</strong> ${subject}</p>
+    <p><strong>Da:</strong> ${escapeHtml(name)}</p>
+    <p><strong>Utente app:</strong> ${escapeHtml(req.session.username)}</p>
+    <p><strong>Email:</strong> ${escapeHtml(email)}</p>
+    <p><strong>Telefono:</strong> ${escapeHtml(phone)}</p>
+    ${company ? `<p><strong>Azienda:</strong> ${escapeHtml(company)}</p>` : ''}
+    <p><strong>Oggetto:</strong> ${escapeHtml(subject)}</p>
     <hr>
     <p><strong>Messaggio:</strong></p>
-    <p>${message.replace(/\n/g, '<br>')}</p>
+    <p>${escapeHtml(message).replace(/\n/g, '<br>')}</p>
   `;
 
   try {
@@ -1000,7 +1188,7 @@ app.put("/api/me", requireAuth, async (req: any, res) => {
 });
 
 // ── VOICEBOT ENDPOINTS ──
-app.get("/api/voicebots", async (_req, res) => {
+app.get("/api/voicebots", requireAuth, async (_req, res) => {
   res.json({ ok: true, voicebots: await readVoicebots() });
 });
 
@@ -1053,20 +1241,15 @@ app.delete("/api/voicebots/:id", requireAuth, requireAdmin, async (req, res) => 
 //     nome TEXT,
 //     action TEXT NOT NULL
 //   );
-app.post("/api/access-log", async (req, res) => {
-  const { username, nome, action } = req.body;
-  if (!username || !action) return res.status(400).json({ ok: false });
-  try {
-    await withRetry(() => sql`
-      INSERT INTO access_logs (username, nome, action)
-      VALUES (${username}, ${nome || username}, ${action})
-    `);
-    res.json({ ok: true });
-  } catch (err) {
-    // Non bloccante: un log di accesso mancato non deve impedire login/logout.
-    console.error("Error writing access_logs:", err);
-    res.json({ ok: true });
-  }
+// Il login viene registrato dal server dentro /api/login e /api/verify-otp.
+// Dal browser arriva solo il logout, e l'utente è quello della sessione:
+// nessuno può più scrivere voci a nome di altri.
+app.post("/api/access-log", requireAuth, async (req: any, res) => {
+  if (req.body?.action !== "logout") return res.status(400).json({ ok: false });
+  const users = await readUsers();
+  const user = users.find((u: any) => u.username.toLowerCase() === req.session.username.toLowerCase());
+  await logAccess(req.session.username, user?.nome, "logout");
+  res.json({ ok: true });
 });
 
 app.get("/api/access-logs", requireAuth, requireAdmin, async (_req, res) => {
@@ -1094,19 +1277,21 @@ function escapeHtml(v: unknown): string {
     .replace(/'/g, "&#039;");
 }
 
-app.post("/api/notify-campaign", async (req, res) => {
-  const { operatore, count, scheduledAt, note, userEmail } = req.body;
-  if (!process.env.SMTP_USER) {
-    return res.status(200).json({ ok: false, reason: 'SMTP non configurato' });
-  }
+// Prima era una rotta pubblica (/api/notify-campaign) che accettava qualsiasi
+// destinatario: chiunque poteva usarla per inviare email dal nostro server.
+// Ora la chiama solo il server, dopo un lancio campagna riuscito, e il
+// destinatario è l'email a profilo dell'utente loggato.
+async function sendCampaignEmail(opts: {
+  operatore?: string; count: number; scheduledAt: string | null; note?: string; userEmail?: string; test?: boolean;
+}): Promise<void> {
+  const { operatore, count, scheduledAt, note, userEmail, test } = opts;
+  if (!process.env.SMTP_USER) return;
 
   // Destinatario: l'email dell'utente che ha lanciato la campagna.
   // Fallback a NOTIFY_EMAIL se l'utente non ha un'email a profilo.
   const isValidEmail = typeof userEmail === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(userEmail);
   const to = isValidEmail ? userEmail : process.env.NOTIFY_EMAIL;
-  if (!to) {
-    return res.status(200).json({ ok: false, reason: 'Nessun destinatario: utente senza email e NOTIFY_EMAIL non configurata' });
-  }
+  if (!to) return;
 
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -1138,7 +1323,7 @@ app.post("/api/notify-campaign", async (req, res) => {
     await transporter.sendMail({
       from: `"GEM Campagne Out" <${process.env.SMTP_USER}>`,
       to,
-      subject: `${titolo} — ${contattiLabel}`,
+      subject: `${test ? '[TEST - nessuna chiamata reale] ' : ''}${titolo} — ${contattiLabel}`,
       html: `
       <div style="background:#e8ebf2;padding:24px 0;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(6,8,18,0.12);">
@@ -1176,10 +1361,212 @@ app.post("/api/notify-campaign", async (req, res) => {
       </div>
       `,
     });
-    res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ ok: false, error: 'Errore invio notifica' });
+    console.error('Errore invio notifica campagna:', e);
   }
+}
+
+// ══════════════════════════════════════════════════════════════
+// LANCIO CAMPAGNE
+// Prima il browser chiamava direttamente i webhook Make, i cui URL erano
+// quindi visibili a chiunque aprisse il sito (e utilizzabili per far partire
+// chiamate a spese dell'azienda). Ora il browser chiama queste rotte, che
+// richiedono il login, validano i dati e inoltrano a Make dal server.
+// ══════════════════════════════════════════════════════════════
+const MAKE_WEBHOOK_URL_DEFAULT =
+  process.env.MAKE_WEBHOOK_URL || "https://hook.eu1.make.com/ac3icgiyh1nbvvh463w33qh58uenvfgo";
+const MAKE_WEBHOOK_URL_APPUNTAMENTI =
+  process.env.MAKE_WEBHOOK_URL_APPUNTAMENTI || "https://hook.eu1.make.com/9f7h1ebgktojphmiulyqte4ux7f3tjqv";
+const MAX_CONTACTS_PER_LAUNCH = 5000;
+const MAKE_PARALLEL_REQUESTS = 20;
+
+interface LaunchContact {
+  nome: string;
+  numero: string;
+  data_appuntamento?: string;
+  ora_appuntamento?: string;
+  prestazione?: string;
+}
+
+function cleanText(v: unknown, max = 200): string | undefined {
+  if (v == null) return undefined;
+  const t = String(v).trim().slice(0, max);
+  return t || undefined;
+}
+
+// Valida e ripulisce i contatti ricevuti dal browser. Restituisce null se
+// la lista non è valida (vuota, troppo lunga o con numeri non validi).
+function parseLaunchContacts(raw: unknown, withAppointment: boolean): { contacts: LaunchContact[] } | { error: string } {
+  if (!Array.isArray(raw) || raw.length === 0) return { error: "Nessun contatto da chiamare" };
+  if (raw.length > MAX_CONTACTS_PER_LAUNCH) return { error: `Massimo ${MAX_CONTACTS_PER_LAUNCH} contatti per lancio` };
+  const contacts: LaunchContact[] = [];
+  for (const c of raw as any[]) {
+    const numero = String(c?.numero ?? "").replace(/[\s\-().]/g, "");
+    if (!/^\+?\d{6,15}$/.test(numero)) return { error: `Numero non valido: ${String(c?.numero ?? "").slice(0, 30)}` };
+    const contact: LaunchContact = { nome: cleanText(c?.nome) || numero, numero };
+    if (withAppointment) {
+      const d = cleanText(c?.data_appuntamento, 50);
+      const o = cleanText(c?.ora_appuntamento, 50);
+      const pr = cleanText(c?.prestazione);
+      if (d) contact.data_appuntamento = d;
+      if (o) contact.ora_appuntamento = o;
+      if (pr) contact.prestazione = pr;
+    }
+    contacts.push(contact);
+  }
+  return { contacts };
+}
+
+async function postToMake(url: string, payload: unknown): Promise<boolean> {
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    // Segreto opzionale: in Make si può aggiungere un filtro che accetta
+    // solo le richieste con questo header, così l'URL da solo non basta.
+    if (process.env.MAKE_WEBHOOK_SECRET) headers["x-gem-secret"] = process.env.MAKE_WEBHOOK_SECRET;
+    const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+    if (!r.ok) console.error("Make webhook risponde", r.status);
+    return r.ok;
+  } catch (err) {
+    console.error("Errore di rete verso Make:", err);
+    return false;
+  }
+}
+
+// Esegue i task con un numero massimo di richieste contemporanee.
+async function runLimited<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
+  const out: T[] = new Array(tasks.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, tasks.length) }, async () => {
+    while (next < tasks.length) {
+      const i = next++;
+      out[i] = await tasks[i]();
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+async function findSessionUser(username: string) {
+  const users = await readUsers();
+  return users.find((u: any) => u.username.toLowerCase() === username.toLowerCase()) || null;
+}
+
+app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
+  const { contatti, tipo_campagna, scheduledAt, note, voicebot_id, concurrency } = req.body || {};
+  const campaignType = tipo_campagna === "appuntamenti" ? "appuntamenti" : "standard";
+
+  const parsed = parseLaunchContacts(contatti, campaignType === "appuntamenti");
+  if ("error" in parsed) return res.status(400).json({ ok: false, error: parsed.error });
+  const contacts = parsed.contacts;
+
+  const user = await findSessionUser(req.session.username);
+  if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
+
+  let targetAt: string | null = null;
+  if (scheduledAt) {
+    // Stessa regola del login (canSchedule === true), quindi dell'interfaccia.
+    if (user.canSchedule !== true) {
+      return res.status(403).json({ ok: false, error: "Non hai il permesso di pianificare campagne" });
+    }
+    const t = new Date(scheduledAt);
+    if (isNaN(t.getTime()) || t.getTime() <= Date.now()) {
+      return res.status(400).json({ ok: false, error: "Seleziona un orario futuro" });
+    }
+    targetAt = t.toISOString();
+  }
+
+  // Voicebot: estensione e contesto vengono dalla configurazione salvata,
+  // non dal browser, così non si possono indirizzare chiamate altrove.
+  const bots = await readVoicebots();
+  const bot = voicebot_id ? bots.find((b: any) => b.id === voicebot_id && b.attivo !== false) : null;
+  if (voicebot_id && !bot) return res.status(400).json({ ok: false, error: "Voicebot non trovato o disattivato" });
+
+  const chunkSize = Math.min(Math.max(parseInt(concurrency) || 1, 1), 10);
+  const chunks: LaunchContact[][] = [];
+  for (let i = 0; i < contacts.length; i += chunkSize) chunks.push(contacts.slice(i, i + chunkSize));
+
+  const webhookUrl = campaignType === "appuntamenti" ? MAKE_WEBHOOK_URL_APPUNTAMENTI : MAKE_WEBHOOK_URL_DEFAULT;
+  const avviatoIl = new Date().toISOString();
+  const cleanNote = cleanText(note, 1000);
+  const payloads = chunks.map((chunk, idx) => ({
+    contatti: chunk,
+    tipo_campagna: campaignType,
+    totale: chunk.length,
+    avviatoIl,
+    scheduledAt: targetAt,
+    modalita: targetAt ? "scheduled" : "immediate",
+    operatore: user.nome,
+    fonte: "gem-dashboard-react",
+    note: cleanNote,
+    voicebot_nome: bot?.nome,
+    voicebot_exten: bot?.exten || 8000,
+    voicebot_context: bot?.context || "outbound-voicebot",
+    chunk: idx + 1,
+    chunks_totali: chunks.length,
+  }));
+
+  const dryRun = isCallsDryRun();
+  let results: boolean[];
+  if (dryRun) {
+    console.log(`[DRY-RUN] Lancio simulato: ${contacts.length} contatti in ${chunks.length} blocchi, utente ${user.username}`);
+    results = payloads.map(() => true);
+  } else {
+    results = await runLimited(payloads.map(p => () => postToMake(webhookUrl, p)), MAKE_PARALLEL_REQUESTS);
+  }
+
+  const sentContacts = chunks.filter((_, i) => results[i]).flat();
+  const failedContacts = chunks.filter((_, i) => !results[i]).flat();
+
+  if (sentContacts.length > 0) {
+    // Numero → nome, per mostrare il nome reale negli Esiti Voicebot.
+    // In modalità test non si scrive nel database.
+    if (!dryRun) await upsertContactNames(sentContacts);
+    await sendCampaignEmail({
+      operatore: user.nome,
+      count: sentContacts.length,
+      scheduledAt: targetAt,
+      note: cleanNote,
+      userEmail: user.email,
+      test: dryRun,
+    });
+  }
+
+  res.json({
+    ok: failedContacts.length === 0,
+    dryRun,
+    sent: sentContacts.length,
+    failed: failedContacts.length,
+    chunksOk: results.filter(Boolean).length,
+    chunksTotal: chunks.length,
+    sentContacts,
+    failedContacts,
+    scheduledAt: targetAt,
+  });
+});
+
+app.post("/api/campaigns/test-call", requireAuth, async (req: any, res) => {
+  const parsed = parseLaunchContacts([req.body?.contact], false);
+  if ("error" in parsed) return res.status(400).json({ ok: false, error: parsed.error });
+  const user = await findSessionUser(req.session.username);
+  if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
+
+  const dryRun = isCallsDryRun();
+  if (dryRun) {
+    console.log(`[DRY-RUN] Chiamata test simulata verso ${parsed.contacts[0].numero}, utente ${user.username}`);
+    return res.json({ ok: true, dryRun });
+  }
+  const ok = await postToMake(MAKE_WEBHOOK_URL_DEFAULT, {
+    contatti: parsed.contacts,
+    totale: 1,
+    avviatoIl: new Date().toISOString(),
+    scheduledAt: null,
+    modalita: "test",
+    operatore: user.nome,
+    fonte: "gem-test",
+    chunk: 1,
+    chunks_totali: 1,
+  });
+  res.status(ok ? 200 : 502).json({ ok, dryRun });
 });
 
 export default app;
