@@ -77,11 +77,5 @@
     "password": "Torino.1",
     "nome": "Barbara",
     "canSchedule": true
-  },
-  {
-    "username": "gabriella",
-    "password": "Torino.1",
-    "nome": "Gabriella",
-    "canSchedule": true
   }
 ]
