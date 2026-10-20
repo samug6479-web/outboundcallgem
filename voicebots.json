@@ -46,5 +46,13 @@
     "context": "outbound-voicebot",
     "descrizione": "",
     "attivo": true
+  },
+  {
+    "id": "vb1792501621753",
+    "nome": "WILMA OUTBOUND GEM",
+    "exten": 1010,
+    "context": "outbound-voicebot",
+    "descrizione": "",
+    "attivo": true
   }
 ]
