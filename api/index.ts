@@ -1414,8 +1414,9 @@ function escapeHtml(v: unknown): string {
 // destinatario è l'email a profilo dell'utente loggato.
 async function sendCampaignEmail(opts: {
   operatore?: string; count: number; scheduledAt: string | null; note?: string; userEmail?: string; test?: boolean;
+  voicebot?: string; tipoCampagna?: string;
 }): Promise<void> {
-  const { operatore, count, scheduledAt, note, userEmail, test } = opts;
+  const { operatore, count, scheduledAt, note, userEmail, test, voicebot, tipoCampagna } = opts;
   if (!process.env.SMTP_USER) return;
 
   // Destinatario: l'email dell'utente che ha lanciato la campagna.
@@ -1430,67 +1431,91 @@ async function sendCampaignEmail(opts: {
     secure: process.env.SMTP_SECURE === 'true',
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
   });
-  const ora = new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' });
-  const pianificata = scheduledAt && new Date(scheduledAt).getTime() > Date.now();
-  const titolo = pianificata ? 'La tua campagna è pianificata.' : 'La tua campagna è partita.';
+
+  // "martedì 21 ottobre, ore 14:41" (ora di Roma)
+  const formatQuando = (d: Date) => {
+    const giorno = d.toLocaleDateString('it-IT', { timeZone: 'Europe/Rome', weekday: 'long', day: 'numeric', month: 'long' });
+    const ora = d.toLocaleTimeString('it-IT', { timeZone: 'Europe/Rome', hour: '2-digit', minute: '2-digit' });
+    return `${giorno}, ore ${ora}`;
+  };
+  const pianificata = !!scheduledAt && new Date(scheduledAt).getTime() > Date.now();
+  const quando = formatQuando(pianificata ? new Date(scheduledAt!) : new Date());
   const nContatti = Number(count) || 0;
   const contattiLabel = `${nContatti} ${nContatti === 1 ? 'contatto' : 'contatti'}`;
+  const tipoLabel = tipoCampagna === 'appuntamenti' ? 'Conferma appuntamenti' : 'Standard';
+  const nome = escapeHtml(operatore || '');
   const appUrl = (process.env.APP_URL || 'https://outboundcallgem.vercel.app').replace(/\/$/, '');
-  const logoUrl = `${appUrl}/gem-logo-white.png`;
-  const quandoFrase = pianificata
-    ? `pianificata per ${escapeHtml(new Date(scheduledAt).toLocaleString('it-IT', { timeZone: 'Europe/Rome' }))}`
-    : `dalle ${ora}`;
+  const titolo = pianificata ? 'Campagna pianificata' : 'Campagna avviata';
+  const intro = pianificata
+    ? `la campagna partirà da sola all'orario indicato. Puoi annullarla dalla dashboard fino alla partenza.`
+    : `il voicebot sta chiamando i contatti. Gli esiti arrivano nella dashboard man mano che le chiamate si chiudono.`;
 
-  const capRow = (icon: string, t: string, d: string, last = false) => {
-    const border = last ? '' : 'border-bottom:1px solid #eef1f6;';
-    return `<tr>
-      <td style="padding:16px 0;${border}vertical-align:middle;width:44px;"><img src="${appUrl}/${icon}" width="30" height="30" style="display:block;" alt="" /></td>
-      <td style="padding:16px 0 16px 14px;${border}vertical-align:middle;line-height:1.5;">
-        <strong style="color:#0f172a;font-size:15px;">${t}</strong><br>
-        <span style="color:#64748b;font-size:14px;">${d}</span></td></tr>`;
-  };
+  // Valori in chiaro: l'escape HTML si fa solo quando si costruisce l'HTML.
+  const dati: [string, string][] = [
+    ['Contatti', contattiLabel],
+    ...(voicebot ? [['Voicebot', voicebot] as [string, string]] : []),
+    ['Tipo', tipoLabel],
+    [pianificata ? 'Partenza' : 'Avviata', quando],
+    ...(operatore ? [['Lanciata da', operatore] as [string, string]] : []),
+  ];
+  const datiRows = dati.map(([k, v], i) => {
+    const border = i < dati.length - 1 ? 'border-bottom:1px solid #eef1f6;' : '';
+    return `<tr><td style="padding:11px 0;${border}font-size:14px;color:#64748b;width:40%;">${k}</td>
+      <td style="padding:11px 0;${border}font-size:14px;color:#0f172a;font-weight:600;text-align:right;">${escapeHtml(v)}</td></tr>`;
+  }).join('');
+
+  const step = (n: number, t: string, d: string) => `<tr>
+      <td style="vertical-align:top;width:34px;padding:0 0 14px;"><div style="width:24px;height:24px;line-height:24px;border-radius:999px;background:#e0e7ff;color:#1e3dc8;font-size:12px;font-weight:700;text-align:center;">${n}</div></td>
+      <td style="padding:2px 0 14px;font-size:14px;color:#475569;line-height:1.5;"><strong style="color:#0f172a;">${t}</strong> ${d}</td></tr>`;
+
+  const stato = pianificata
+    ? `<span style="display:inline-block;background:#fef3c7;color:#92400e;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;">&#9679; Pianificata</span>`
+    : `<span style="display:inline-block;background:#dcfce7;color:#166534;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;">&#9679; In corso</span>`;
+
+  const html = `
+<div style="background:#eef1f6;padding:28px 12px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0;">
+  ${test ? `<tr><td style="background:#fef3c7;color:#92400e;font-size:13px;font-weight:600;text-align:center;padding:10px 24px;">Modalità test: nessuna chiamata reale è stata effettuata.</td></tr>` : ''}
+  <tr><td style="padding:28px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+    <td><img src="${appUrl}/gem-logo-color.png" width="96" alt="GEM Group" style="display:block;width:96px;height:auto;"></td>
+    <td style="text-align:right;">${stato}</td></tr></table></td></tr>
+  <tr><td style="padding:26px 40px 6px;font-size:24px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">${titolo}</td></tr>
+  <tr><td style="padding:0 40px 20px;font-size:15px;color:#475569;line-height:1.6;">Ciao${nome ? ` ${nome}` : ''}, ${intro}</td></tr>
+  <tr><td style="padding:0 40px 8px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border-radius:10px;"><tr><td style="padding:6px 20px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${datiRows}</table></td></tr></table></td></tr>
+  ${note ? `<tr><td style="padding:12px 40px 0;"><div style="background:#f8fafc;border-left:3px solid #1e3dc8;padding:12px 16px;font-size:14px;color:#475569;line-height:1.5;"><strong style="color:#0f172a;">Note:</strong> ${escapeHtml(note)}</div></td></tr>` : ''}
+  <tr><td style="padding:24px 40px 4px;font-size:13px;font-weight:700;color:#0f172a;text-transform:uppercase;letter-spacing:0.6px;">Cosa succede ora</td></tr>
+  <tr><td style="padding:8px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+    ${pianificata
+      ? step(1, "All'orario indicato", 'la campagna parte da sola, senza bisogno della tua presenza.')
+      : step(1, 'Le chiamate partono', "una dopo l'altra, gestite dal voicebot.")}
+    ${step(2, 'Esiti Voicebot', 'mostra esito, trascrizione e riassunto di ogni chiamata.')}
+    ${step(3, 'Follow-up', 'raccoglie chi non ha risposto o va richiamato.')}
+  </table></td></tr>
+  <tr><td style="padding:12px 40px 34px;"><a href="${appUrl}" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:14px 20px;border-radius:9px;">${pianificata ? 'Vedi le campagne pianificate' : 'Apri la dashboard'}</a></td></tr>
+  <tr><td style="padding:18px 40px;border-top:1px solid #eef1f6;font-size:12px;color:#94a3b8;line-height:1.6;">GEM Group &middot; Soluzioni di comunicazione e automazione AI su tecnologia Wildix<br>Email automatica inviata da GEM Outbound.</td></tr>
+</table></div>`;
+
+  // Versione solo testo: alcuni client la mostrano al posto dell'HTML e aiuta a non finire nello spam.
+  const text = [
+    ...(test ? ['MODALITÀ TEST: nessuna chiamata reale è stata effettuata.', ''] : []),
+    `${titolo}`,
+    '',
+    `Ciao${operatore ? ` ${operatore}` : ''}, ${intro}`,
+    '',
+    ...dati.map(([k, v]) => `${k}: ${v}`),
+    ...(note ? ['', `Note: ${note}`] : []),
+    '',
+    `Apri la dashboard: ${appUrl}`,
+  ].join('\n');
 
   try {
     await transporter.sendMail({
       from: `"GEM Campagne Out" <${process.env.SMTP_USER}>`,
       to,
-      subject: `${test ? '[TEST - nessuna chiamata reale] ' : ''}${titolo} — ${contattiLabel}`,
-      html: `
-      <div style="background:#e8ebf2;padding:24px 0;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(6,8,18,0.12);">
-          <tr>
-            <td style="background:linear-gradient(135deg,#1e3dc8 0%,#0a1a6b 55%,#060812 100%);padding:36px 40px 30px;text-align:center;">
-              <img src="${logoUrl}" width="115" style="display:inline-block;max-width:115px;height:auto;margin-bottom:16px;" alt="GEM Group" />
-              <div style="color:#ffffff;font-size:23px;font-weight:700;letter-spacing:-0.2px;line-height:1.25;">${titolo}</div>
-              <div style="color:#aeb9ee;font-size:15px;margin-top:6px;">Da qui in poi, ci pensa l'AI.</div>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:30px 40px 0;">
-              <p style="margin:0 0 22px;font-size:15px;color:#334155;line-height:1.6;">Ciao ${escapeHtml(operatore)}, la campagna outbound è stata avviata. Gli assistenti vocali GEM stanno contattando i tuoi clienti — <strong style="color:#0f172a;">${escapeHtml(contattiLabel)}</strong>, ${quandoFrase}. Ogni chiamata viene poi elaborata così, in automatico:</p>
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-                ${capRow('icon-phone.png', 'Chiamate vocali AI', 'Il voicebot conduce ogni conversazione in modo naturale.')}
-                ${capRow('icon-doc.png', 'Trascrizione e riassunto', 'Ogni chiamata diventa testo, con sintesi AI dei punti chiave.')}
-                ${capRow('icon-bell.png', 'Follow-up automatici', 'Se un cliente va richiamato, ricevi subito un avviso.', true)}
-              </table>
-              ${note ? `<p style="margin:20px 0 0;font-size:14px;color:#475569;"><strong style="color:#0f172a;">Note:</strong> ${escapeHtml(note)}</p>` : ''}
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:28px 40px 36px;text-align:center;">
-              <a href="${appUrl}" style="display:inline-block;background:#1e3dc8;color:#ffffff;text-decoration:none;font-size:15px;font-weight:600;padding:15px 40px;border-radius:9px;box-shadow:0 2px 8px rgba(30,61,200,0.3);">Segui gli esiti in tempo reale</a>
-              <p style="margin:15px 0 0;font-size:13px;color:#94a3b8;">Risposte, trascrizioni e follow-up compaiono nella dashboard man mano che arrivano.</p>
-            </td>
-          </tr>
-          <tr>
-            <td style="background:#060812;padding:22px 40px;text-align:center;">
-              <div style="color:#ffffff;font-size:14px;font-weight:600;margin-bottom:3px;">GEM Group</div>
-              <div style="color:#6b7699;font-size:12px;line-height:1.6;">Soluzioni di comunicazione e automazione AI su tecnologia Wildix</div>
-            </td>
-          </tr>
-        </table>
-      </div>
-      `,
+      subject: `${test ? '[TEST - nessuna chiamata reale] ' : ''}${titolo}: ${contattiLabel}${pianificata ? ` - ${quando}` : ''}`,
+      text,
+      html,
     });
   } catch (e) {
     console.error('Errore invio notifica campagna:', e);
@@ -1811,6 +1836,8 @@ async function dispatchDueCampaigns(): Promise<void> {
             note: row.note || undefined,
             userEmail: row.user_email || undefined,
             test: result.dryRun,
+            voicebot: bot?.nome,
+            tipoCampagna: row.tipo_campagna,
           });
         }
       } catch (err: any) {
@@ -1873,6 +1900,8 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
         note: cleanNote,
         userEmail: user.email,
         test: isCallsDryRun(),
+        voicebot: bot?.nome,
+        tipoCampagna: campaignType,
       });
       return res.json({
         ok: true,
@@ -1915,6 +1944,8 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
       note: cleanNote,
       userEmail: user.email,
       test: result.dryRun,
+      voicebot: bot?.nome,
+      tipoCampagna: campaignType,
     });
   }
 
