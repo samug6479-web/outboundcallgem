@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useCampaign } from '../context/CampaignContext';
 import { GemLogo } from './Icons';
-import { LogOut, Sun, Moon, Plus, List, Clock, User, LifeBuoy, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog } from 'lucide-react';
+import { LogOut, Sun, Moon, Plus, List, Clock, User, LifeBuoy, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { Step1Upload, Step2Preview, Step3Settings } from './CampaignSteps';
 import { AppointmentPage } from './AppuntamentiSection';
@@ -288,6 +288,15 @@ export function Dashboard() {
                 <div className="text-xs text-slate-500 truncate">{user?.role || 'Editor'}</div>
               </div>
             </div>
+            {/* Guida utente in PDF (file in public/) */}
+            <a
+              href="/guida-gem-outbound.pdf"
+              download="GEM-Outbound-Guida-utente.pdf"
+              className="mb-2 flex items-center justify-center gap-2 py-2 text-xs font-semibold text-brand-600 dark:text-brand-400 bg-brand-50 dark:bg-brand-900/20 hover:bg-brand-100 dark:hover:bg-brand-900/40 rounded-lg transition-colors"
+            >
+              <BookOpen className="w-3.5 h-3.5" />
+              Guida utente (PDF)
+            </a>
             {/* Theme + logout */}
             <div className="flex gap-2">
               <button
