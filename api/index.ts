@@ -383,14 +383,53 @@ async function logWebhookEvent(eventType: string, reason: string) {
 
 // ── Follow-up: appuntamenti che richiedono un intervento umano ──
 // (disdetta, richiesta informazioni, trasferimento, non risposto)
+// Non crea doppioni: Wildix può reinviare lo stesso evento, quindi lo stesso
+// motivo per la stessa chiamata viene registrato una volta sola.
 async function createFollowup(entry: { callId: string; numero: string | null; nome: string | null; motivo: string }) {
   try {
     await sql`
       INSERT INTO followups (call_id, numero, nome, motivo)
-      VALUES (${entry.callId}, ${entry.numero}, ${entry.nome}, ${entry.motivo})
+      SELECT ${entry.callId}, ${entry.numero}, ${entry.nome}, ${entry.motivo}
+      WHERE NOT EXISTS (
+        SELECT 1 FROM followups WHERE call_id = ${entry.callId} AND motivo = ${entry.motivo}
+      )
     `;
   } catch (err) {
     console.error("Error creating followup:", err);
+  }
+}
+
+// ── Follow-up per chiamate non risposte ──
+// Un solo follow-up "Non risposto" aperto per numero: se lo stesso contatto
+// non risponde più volte non si accumulano righe. Quando poi lo stesso
+// numero risponde a una chiamata successiva, il follow-up si chiude da solo.
+const MOTIVO_NON_RISPOSTO = "Non risposto";
+
+async function createNoAnswerFollowup(entry: { callId: string; numero: string | null; nome: string | null }) {
+  if (!entry.numero) return;
+  try {
+    await sql`
+      INSERT INTO followups (call_id, numero, nome, motivo)
+      SELECT ${entry.callId}, ${entry.numero}, ${entry.nome}, ${MOTIVO_NON_RISPOSTO}
+      WHERE NOT EXISTS (
+        SELECT 1 FROM followups
+        WHERE numero = ${entry.numero} AND motivo = ${MOTIVO_NON_RISPOSTO} AND stato = 'pending'
+      )
+    `;
+  } catch (err) {
+    console.error("Error creating no-answer followup:", err);
+  }
+}
+
+async function closeNoAnswerFollowups(numero: string | null) {
+  if (!numero) return;
+  try {
+    await sql`
+      UPDATE followups SET stato = 'done'
+      WHERE numero = ${numero} AND motivo = ${MOTIVO_NON_RISPOSTO} AND stato = 'pending'
+    `;
+  } catch (err) {
+    console.error("Error closing no-answer followups:", err);
   }
 }
 
@@ -522,6 +561,9 @@ app.post(
           timestamp: new Date(event.time).toISOString(),
           trascrizione: null,
         });
+
+        if (risposto) await closeNoAnswerFollowups(numero);
+        else await createNoAnswerFollowup({ callId: event.id, numero, nome });
       }
 
       if (event.type === "call:transcription:completed") {
