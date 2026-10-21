@@ -1451,6 +1451,183 @@ async function findSessionUser(username: string) {
   return users.find((u: any) => u.username.toLowerCase() === username.toLowerCase()) || null;
 }
 
+interface CampaignSpec {
+  contacts: LaunchContact[];
+  campaignType: "standard" | "appuntamenti";
+  bot: any | null;
+  chunkSize: number;
+  note?: string;
+  operatore: string;
+  scheduledAt: string | null;
+}
+
+// Invia una campagna a Make a blocchi. Usata sia per il lancio immediato sia
+// per le campagne pianificate quando arriva il loro orario.
+async function sendCampaignToMake(spec: CampaignSpec) {
+  const chunks: LaunchContact[][] = [];
+  for (let i = 0; i < spec.contacts.length; i += spec.chunkSize) chunks.push(spec.contacts.slice(i, i + spec.chunkSize));
+
+  const webhookUrl = spec.campaignType === "appuntamenti" ? MAKE_WEBHOOK_URL_APPUNTAMENTI : MAKE_WEBHOOK_URL_DEFAULT;
+  const avviatoIl = new Date().toISOString();
+  const payloads = chunks.map((chunk, idx) => ({
+    contatti: chunk,
+    tipo_campagna: spec.campaignType,
+    totale: chunk.length,
+    avviatoIl,
+    scheduledAt: spec.scheduledAt,
+    modalita: spec.scheduledAt ? "scheduled" : "immediate",
+    operatore: spec.operatore,
+    fonte: "gem-dashboard-react",
+    note: spec.note,
+    voicebot_nome: spec.bot?.nome,
+    voicebot_exten: spec.bot?.exten || 8000,
+    voicebot_context: spec.bot?.context || "outbound-voicebot",
+    chunk: idx + 1,
+    chunks_totali: chunks.length,
+  }));
+
+  const dryRun = isCallsDryRun();
+  let results: boolean[];
+  if (dryRun) {
+    console.log(`[DRY-RUN] Invio simulato: ${spec.contacts.length} contatti in ${chunks.length} blocchi, operatore ${spec.operatore}`);
+    results = payloads.map(() => true);
+  } else {
+    results = await runLimited(payloads.map(p => () => postToMake(webhookUrl, p)), MAKE_PARALLEL_REQUESTS);
+  }
+
+  const sentContacts = chunks.filter((_, i) => results[i]).flat();
+  const failedContacts = chunks.filter((_, i) => !results[i]).flat();
+  // Numero → nome, per mostrare il nome reale negli Esiti Voicebot.
+  // In modalità test non si scrive nel database.
+  if (sentContacts.length > 0 && !dryRun) await upsertContactNames(sentContacts);
+  return { dryRun, sentContacts, failedContacts, chunksOk: results.filter(Boolean).length, chunksTotal: chunks.length };
+}
+
+// ══════════════════════════════════════════════════════════════
+// CAMPAGNE PIANIFICATE
+// Make non sa aspettare un orario: chiama subito. Per questo le campagne
+// pianificate restano nel database e partono dal server quando arriva
+// l'orario. Il "timer" è l'app stessa: finché è aperta su almeno un
+// dispositivo, ogni 30 secondi chiede al server di inviare quelle scadute.
+// Se nessuno ha l'app aperta, una campagna in ritardo di oltre
+// SCHEDULE_MAX_DELAY_MIN minuti non parte da sola: viene segnata "scaduta",
+// per evitare chiamate fuori orario.
+// ══════════════════════════════════════════════════════════════
+const SCHEDULE_MAX_DELAY_MIN = 30;
+
+let scheduleSchemaReady: Promise<void> | null = null;
+function ensureScheduleSchema(): Promise<void> {
+  if (!scheduleSchemaReady) {
+    scheduleSchemaReady = (async () => {
+      await sql!`
+        CREATE TABLE IF NOT EXISTS scheduled_campaigns (
+          id            SERIAL PRIMARY KEY,
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+          created_by    TEXT        NOT NULL,
+          operatore     TEXT,
+          user_email    TEXT,
+          scheduled_at  TIMESTAMPTZ NOT NULL,
+          status        TEXT        NOT NULL DEFAULT 'pending',
+          tipo_campagna TEXT        NOT NULL,
+          voicebot_id   TEXT,
+          chunk_size    INT         NOT NULL DEFAULT 1,
+          note          TEXT,
+          contacts      JSONB       NOT NULL,
+          sent_count    INT,
+          failed_count  INT,
+          dispatched_at TIMESTAMPTZ,
+          error         TEXT
+        )
+      `;
+      await sql!`CREATE INDEX IF NOT EXISTS idx_scheduled_campaigns_due ON scheduled_campaigns (status, scheduled_at)`;
+    })().catch(err => {
+      scheduleSchemaReady = null;
+      throw err;
+    });
+  }
+  return scheduleSchemaReady;
+}
+
+function mapScheduledRow(r: any) {
+  return {
+    id: r.id,
+    createdAt: r.created_at,
+    createdBy: r.created_by,
+    operatore: r.operatore,
+    scheduledAt: r.scheduled_at,
+    status: r.status,
+    tipoCampagna: r.tipo_campagna,
+    note: r.note,
+    count: Array.isArray(r.contacts) ? r.contacts.length : 0,
+    sentCount: r.sent_count,
+    failedCount: r.failed_count,
+    dispatchedAt: r.dispatched_at,
+    error: r.error,
+  };
+}
+
+// Invia le campagne pianificate arrivate all'orario. L'UPDATE ... RETURNING
+// "prenota" le righe in modo atomico: se due dispositivi chiamano insieme,
+// ogni campagna viene presa da uno solo dei due e non parte due volte.
+let dispatchRunning = false;
+async function dispatchDueCampaigns(): Promise<void> {
+  if (!sql || dispatchRunning) return;
+  dispatchRunning = true;
+  try {
+    await ensureScheduleSchema();
+    await sql`
+      UPDATE scheduled_campaigns SET status = 'expired',
+        error = 'Nessuna app aperta all''orario previsto: campagna non avviata'
+      WHERE status = 'pending'
+        AND scheduled_at < now() - make_interval(mins => ${SCHEDULE_MAX_DELAY_MIN}::int)
+    `;
+    const due = (await sql`
+      UPDATE scheduled_campaigns SET status = 'sending', dispatched_at = now()
+      WHERE status = 'pending' AND scheduled_at <= now()
+      RETURNING *
+    `) as any[];
+
+    for (const row of due) {
+      try {
+        const bots = await readVoicebots();
+        const bot = row.voicebot_id ? bots.find((b: any) => b.id === row.voicebot_id) : null;
+        const result = await sendCampaignToMake({
+          contacts: row.contacts,
+          campaignType: row.tipo_campagna === "appuntamenti" ? "appuntamenti" : "standard",
+          bot,
+          chunkSize: row.chunk_size || 1,
+          note: row.note || undefined,
+          operatore: row.operatore || row.created_by,
+          scheduledAt: new Date(row.scheduled_at).toISOString(),
+        });
+        const status = result.failedContacts.length === 0 ? "sent" : result.sentContacts.length > 0 ? "partial" : "failed";
+        await sql`
+          UPDATE scheduled_campaigns
+          SET status = ${status}, sent_count = ${result.sentContacts.length}, failed_count = ${result.failedContacts.length}
+          WHERE id = ${row.id}
+        `;
+        if (result.sentContacts.length > 0) {
+          await sendCampaignEmail({
+            operatore: row.operatore,
+            count: result.sentContacts.length,
+            scheduledAt: null,
+            note: row.note || undefined,
+            userEmail: row.user_email || undefined,
+            test: result.dryRun,
+          });
+        }
+      } catch (err: any) {
+        console.error("Errore invio campagna pianificata", row.id, err);
+        await sql`UPDATE scheduled_campaigns SET status = 'failed', error = ${String(err?.message || err).slice(0, 500)} WHERE id = ${row.id}`;
+      }
+    }
+  } catch (err) {
+    console.error("Errore controllo campagne pianificate:", err);
+  } finally {
+    dispatchRunning = false;
+  }
+}
+
 app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
   const { contatti, tipo_campagna, scheduledAt, note, voicebot_id, concurrency } = req.body || {};
   const campaignType = tipo_campagna === "appuntamenti" ? "appuntamenti" : "standard";
@@ -1462,7 +1639,16 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
   const user = await findSessionUser(req.session.username);
   if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
 
-  let targetAt: string | null = null;
+  // Voicebot: estensione e contesto vengono dalla configurazione salvata,
+  // non dal browser, così non si possono indirizzare chiamate altrove.
+  const bots = await readVoicebots();
+  const bot = voicebot_id ? bots.find((b: any) => b.id === voicebot_id && b.attivo !== false) : null;
+  if (voicebot_id && !bot) return res.status(400).json({ ok: false, error: "Voicebot non trovato o disattivato" });
+
+  const chunkSize = Math.min(Math.max(parseInt(concurrency) || 1, 1), 10);
+  const cleanNote = cleanText(note, 1000);
+
+  // ── Pianificata: si salva e basta, partirà all'orario ──
   if (scheduledAt) {
     // Stessa regola del login (canSchedule === true), quindi dell'interfaccia.
     if (user.canSchedule !== true) {
@@ -1472,76 +1658,118 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
     if (isNaN(t.getTime()) || t.getTime() <= Date.now()) {
       return res.status(400).json({ ok: false, error: "Seleziona un orario futuro" });
     }
-    targetAt = t.toISOString();
+    if (!sql) return res.status(503).json({ ok: false, error: "Database non disponibile: impossibile pianificare" });
+    try {
+      await ensureScheduleSchema();
+      const rows = (await sql`
+        INSERT INTO scheduled_campaigns
+          (created_by, operatore, user_email, scheduled_at, tipo_campagna, voicebot_id, chunk_size, note, contacts)
+        VALUES
+          (${user.username}, ${user.nome || user.username}, ${user.email || null}, ${t.toISOString()},
+           ${campaignType}, ${bot?.id || null}, ${chunkSize}, ${cleanNote || null}, ${JSON.stringify(contacts)}::jsonb)
+        RETURNING id
+      `) as any[];
+      await sendCampaignEmail({
+        operatore: user.nome,
+        count: contacts.length,
+        scheduledAt: t.toISOString(),
+        note: cleanNote,
+        userEmail: user.email,
+        test: isCallsDryRun(),
+      });
+      return res.json({
+        ok: true,
+        scheduled: true,
+        id: rows[0]?.id,
+        dryRun: isCallsDryRun(),
+        sent: 0,
+        failed: 0,
+        sentContacts: contacts,
+        failedContacts: [],
+        scheduledAt: t.toISOString(),
+      });
+    } catch (err) {
+      console.error("Errore salvataggio campagna pianificata:", err);
+      return res.status(500).json({ ok: false, error: "Errore nel salvataggio della campagna pianificata" });
+    }
   }
 
-  // Voicebot: estensione e contesto vengono dalla configurazione salvata,
-  // non dal browser, così non si possono indirizzare chiamate altrove.
-  const bots = await readVoicebots();
-  const bot = voicebot_id ? bots.find((b: any) => b.id === voicebot_id && b.attivo !== false) : null;
-  if (voicebot_id && !bot) return res.status(400).json({ ok: false, error: "Voicebot non trovato o disattivato" });
+  // ── Immediata ──
+  const result = await sendCampaignToMake({
+    contacts, campaignType, bot, chunkSize, note: cleanNote, operatore: user.nome, scheduledAt: null,
+  });
 
-  const chunkSize = Math.min(Math.max(parseInt(concurrency) || 1, 1), 10);
-  const chunks: LaunchContact[][] = [];
-  for (let i = 0; i < contacts.length; i += chunkSize) chunks.push(contacts.slice(i, i + chunkSize));
-
-  const webhookUrl = campaignType === "appuntamenti" ? MAKE_WEBHOOK_URL_APPUNTAMENTI : MAKE_WEBHOOK_URL_DEFAULT;
-  const avviatoIl = new Date().toISOString();
-  const cleanNote = cleanText(note, 1000);
-  const payloads = chunks.map((chunk, idx) => ({
-    contatti: chunk,
-    tipo_campagna: campaignType,
-    totale: chunk.length,
-    avviatoIl,
-    scheduledAt: targetAt,
-    modalita: targetAt ? "scheduled" : "immediate",
-    operatore: user.nome,
-    fonte: "gem-dashboard-react",
-    note: cleanNote,
-    voicebot_nome: bot?.nome,
-    voicebot_exten: bot?.exten || 8000,
-    voicebot_context: bot?.context || "outbound-voicebot",
-    chunk: idx + 1,
-    chunks_totali: chunks.length,
-  }));
-
-  const dryRun = isCallsDryRun();
-  let results: boolean[];
-  if (dryRun) {
-    console.log(`[DRY-RUN] Lancio simulato: ${contacts.length} contatti in ${chunks.length} blocchi, utente ${user.username}`);
-    results = payloads.map(() => true);
-  } else {
-    results = await runLimited(payloads.map(p => () => postToMake(webhookUrl, p)), MAKE_PARALLEL_REQUESTS);
-  }
-
-  const sentContacts = chunks.filter((_, i) => results[i]).flat();
-  const failedContacts = chunks.filter((_, i) => !results[i]).flat();
-
-  if (sentContacts.length > 0) {
-    // Numero → nome, per mostrare il nome reale negli Esiti Voicebot.
-    // In modalità test non si scrive nel database.
-    if (!dryRun) await upsertContactNames(sentContacts);
+  if (result.sentContacts.length > 0) {
     await sendCampaignEmail({
       operatore: user.nome,
-      count: sentContacts.length,
-      scheduledAt: targetAt,
+      count: result.sentContacts.length,
+      scheduledAt: null,
       note: cleanNote,
       userEmail: user.email,
-      test: dryRun,
+      test: result.dryRun,
     });
   }
 
   res.json({
-    ok: failedContacts.length === 0,
-    dryRun,
-    sent: sentContacts.length,
-    failed: failedContacts.length,
-    chunksOk: results.filter(Boolean).length,
-    chunksTotal: chunks.length,
-    sentContacts,
-    failedContacts,
-    scheduledAt: targetAt,
+    ok: result.failedContacts.length === 0,
+    dryRun: result.dryRun,
+    sent: result.sentContacts.length,
+    failed: result.failedContacts.length,
+    chunksOk: result.chunksOk,
+    chunksTotal: result.chunksTotal,
+    sentContacts: result.sentContacts,
+    failedContacts: result.failedContacts,
+    scheduledAt: null,
   });
+});
+
+// Lista delle campagne pianificate (ultimi 14 giorni). Prima di rispondere
+// invia quelle arrivate all'orario: è questa chiamata, ripetuta dall'app ogni
+// 30 secondi, a fare da timer.
+app.get("/api/campaigns/scheduled", requireAuth, async (req: any, res) => {
+  if (!sql) return res.json({ ok: true, campaigns: [] });
+  await dispatchDueCampaigns();
+  try {
+    await ensureScheduleSchema();
+    const isAdmin = req.session.isAdmin === true;
+    const rows = (isAdmin
+      ? await sql`
+          SELECT * FROM scheduled_campaigns
+          WHERE status = 'pending' OR scheduled_at > now() - interval '14 days'
+          ORDER BY scheduled_at DESC LIMIT 100`
+      : await sql`
+          SELECT * FROM scheduled_campaigns
+          WHERE lower(created_by) = lower(${req.session.username})
+            AND (status = 'pending' OR scheduled_at > now() - interval '14 days')
+          ORDER BY scheduled_at DESC LIMIT 100`) as any[];
+    res.json({ ok: true, campaigns: rows.map(mapScheduledRow), serverTime: new Date().toISOString() });
+  } catch (err) {
+    console.error("Errore lettura campagne pianificate:", err);
+    res.status(500).json({ ok: false, error: "Errore lettura campagne pianificate" });
+  }
+});
+
+// Annulla una campagna pianificata non ancora partita (autore o Admin).
+app.post("/api/campaigns/scheduled/:id/cancel", requireAuth, async (req: any, res) => {
+  const id = parseInt(req.params.id);
+  if (!sql || !id) return res.status(400).json({ ok: false, error: "Richiesta non valida" });
+  try {
+    await ensureScheduleSchema();
+    const isAdmin = req.session.isAdmin === true;
+    const rows = (await sql`
+      UPDATE scheduled_campaigns SET status = 'cancelled'
+      WHERE id = ${id} AND status = 'pending'
+        AND (${isAdmin}::boolean OR lower(created_by) = lower(${req.session.username}))
+      RETURNING id
+    `) as any[];
+    if (rows.length === 0) {
+      return res.status(409).json({ ok: false, error: "Campagna non annullabile: già partita, già annullata o non tua" });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Errore annullamento campagna:", err);
+    res.status(500).json({ ok: false, error: "Errore annullamento" });
+  }
 });
 
 app.post("/api/campaigns/test-call", requireAuth, async (req: any, res) => {

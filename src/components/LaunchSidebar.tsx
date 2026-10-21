@@ -4,6 +4,7 @@ import { Play, AlertTriangle, Loader2, Trash2, DownloadCloud, Save, Phone, Clock
 import { format, isToday, isYesterday } from 'date-fns';
 import { it } from 'date-fns/locale';
 import { cn } from '../lib/utils';
+import { ScheduledCampaigns } from './ScheduledCampaigns';
 import * as XLSX from 'xlsx';
 
 function dayLabel(date: Date): string {
@@ -359,6 +360,8 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
         </div>
       </div>
       )}
+
+      {(mode === 'all' || mode === 'launch') && <ScheduledCampaigns />}
 
       {/* HISTORY CARD */}
       {(mode === 'all' || mode === 'history') && (

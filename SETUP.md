@@ -49,6 +49,14 @@ psql "$DATABASE_URL" -f scripts/migrations/001_access_logs.sql
 
 La tabella `auth_attempts` (limite tentativi di login/OTP) viene creata dal backend al primo utilizzo; in alternativa `scripts/migrations/002_auth_attempts.sql`.
 
+## Campagne pianificate
+
+Make non sa aspettare un orario, quindi le campagne pianificate restano nella tabella `scheduled_campaigns` e partono dal server all'orario scelto. Il "timer" è l'app: finché è aperta su almeno un dispositivo, ogni 30 secondi chiama `GET /api/campaigns/scheduled`, che prima di rispondere invia a Make le campagne arrivate all'orario.
+
+- Nessuna app aperta all'orario → la campagna non parte. Se il ritardo supera 30 minuti viene segnata **scaduta** (evita chiamate fuori orario).
+- Una campagna può essere annullata finché è "in attesa" (dal suo autore o da un Admin).
+- La tabella viene creata in automatico; in alternativa `scripts/migrations/003_scheduled_campaigns.sql`.
+
 ## Ambiente di test
 
 Le anteprime Vercel (un deploy per ogni branch/PR) **non fanno chiamate reali**: il lancio campagna e la chiamata di prova vengono simulati, e l'app mostra il prefisso `[TEST]`. Anche l'email di riepilogo arriva con `[TEST - nessuna chiamata reale]` nell'oggetto.

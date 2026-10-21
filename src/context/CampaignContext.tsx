@@ -55,6 +55,22 @@ export interface HistoryItem {
   executionId?: string;
 }
 
+export interface ScheduledCampaign {
+  id: number;
+  createdAt: string;
+  createdBy: string;
+  operatore: string | null;
+  scheduledAt: string;
+  status: 'pending' | 'sending' | 'sent' | 'partial' | 'failed' | 'cancelled' | 'expired';
+  tipoCampagna: string;
+  note: string | null;
+  count: number;
+  sentCount: number | null;
+  failedCount: number | null;
+  dispatchedAt: string | null;
+  error: string | null;
+}
+
 export interface AccessLog {
   ts: string;
   username: string;
@@ -114,6 +130,9 @@ interface CampaignContextType {
   exportHistoryToXLSX: () => void;
   
   history: HistoryItem[];
+  scheduledCampaigns: ScheduledCampaign[];
+  loadScheduledCampaigns: () => Promise<void>;
+  cancelScheduledCampaign: (id: number) => Promise<{ ok: boolean; error?: string }>;
   clearHistory: () => void;
 
   lists: ContactList[];
@@ -190,6 +209,36 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
   // La lista voicebot richiede il login: la carichiamo quando c'è un utente.
   useEffect(() => {
     if (user) loadVoicebots();
+  }, [user?.username]);
+
+  // ── Campagne pianificate ──
+  // Il server le invia a Make quando arriva l'orario, ma solo quando qualcuno
+  // glielo chiede: questa lettura ogni 30 secondi (finché l'app è aperta)
+  // fa da timer.
+  const [scheduledCampaigns, setScheduledCampaigns] = useState<ScheduledCampaign[]>([]);
+  const loadScheduledCampaigns = async () => {
+    try {
+      const res = await authFetch('/api/campaigns/scheduled');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.ok) setScheduledCampaigns(data.campaigns || []);
+    } catch { /* rete assente: si riprova al giro successivo */ }
+  };
+  const cancelScheduledCampaign = async (id: number) => {
+    try {
+      const res = await authFetch(`/api/campaigns/scheduled/${id}/cancel`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      await loadScheduledCampaigns();
+      return res.ok ? { ok: true } : { ok: false, error: data.error || `Errore HTTP ${res.status}` };
+    } catch {
+      return { ok: false, error: 'Errore di rete' };
+    }
+  };
+  useEffect(() => {
+    if (!user) { setScheduledCampaigns([]); return; }
+    loadScheduledCampaigns();
+    const timer = setInterval(loadScheduledCampaigns, 30_000);
+    return () => clearInterval(timer);
   }, [user?.username]);
 
   const login = async (u: string, p: string) => {
@@ -366,10 +415,11 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
   };
 
   // Business hours check — usa la config personalizzata
-  const isBusinessHours = () => {
-    const now = new Date();
-    const day = now.getDay();
-    const hour = now.getHours();
+  // Controlla l'orario indicato (di default adesso). Per le campagne
+  // pianificate va controllato l'orario di partenza, non quello attuale.
+  const isBusinessHours = (at: Date = new Date()) => {
+    const day = at.getDay();
+    const hour = at.getHours();
     return businessHoursConfig.days.includes(day) && hour >= businessHoursConfig.startHour && hour < businessHoursConfig.endHour;
   };
 
@@ -455,17 +505,17 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
   const launchCampaign = async () => {
     if (!validContacts.length) return;
 
-    if (businessHoursEnabled && !isBusinessHours()) {
-      setLaunchStatus({ type: 'err', msg: 'Fuori dagli orari consentiti (lun-ven 9:00-19:00). Disattiva il controllo orari per procedere.' });
-      return;
-    }
-
     let targetAt: string | null = null;
     if (scheduleMode === 'later') {
       if (!scheduledAt) { setLaunchStatus({ type: 'err', msg: 'Seleziona data e ora' }); return; }
       const target = new Date(scheduledAt);
       if (target <= new Date()) { setLaunchStatus({ type: 'err', msg: 'Seleziona un orario futuro' }); return; }
       targetAt = target.toISOString();
+    }
+
+    if (businessHoursEnabled && !isBusinessHours(targetAt ? new Date(targetAt) : new Date())) {
+      setLaunchStatus({ type: 'err', msg: `${targetAt ? "L'orario scelto è" : 'Adesso sei'} fuori dagli orari consentiti. Cambia orario o disattiva il controllo orari.` });
+      return;
     }
 
     setIsLaunching(true);
@@ -500,6 +550,15 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       }
 
       const testPrefix = data.dryRun ? '[TEST — nessuna chiamata reale] ' : '';
+
+      if (data.scheduled) {
+        saveHistory(validContacts.length, targetAt, concurrency, validContacts.map(c => ({ ...c })));
+        setCampaignNote('');
+        loadScheduledCampaigns();
+        const quando = new Date(data.scheduledAt).toLocaleString('it-IT', { dateStyle: 'short', timeStyle: 'short' });
+        setLaunchStatus({ type: 'ok', msg: `${testPrefix}Campagna pianificata per ${quando} — ${validContacts.length} contatti. Partirà all'orario se l'app è aperta su almeno un dispositivo.` });
+        return;
+      }
       const sentNumbers = new Set<string>((data.sentContacts || []).map((c: any) => c.numero));
       const sentList = validContacts.filter(c => sentNumbers.has(String(c.numero).replace(/[\s\-().]/g, '')));
       if (data.sent > 0) {
@@ -539,6 +598,7 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       businessHoursConfig, setBusinessHoursConfig,
       historyFilter, setHistoryFilter, filteredHistory, exportHistoryToXLSX,
       history, clearHistory,
+      scheduledCampaigns, loadScheduledCampaigns, cancelScheduledCampaign,
       lists, saveList, deleteList, loadList,
       darkMode, toggleTheme,
     }}>
