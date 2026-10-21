@@ -188,10 +188,6 @@ export function Step1Upload() {
         {/* Manual Panel */}
         {uploadMode === 'manual' && (
           <div className="space-y-4 animate-in fade-in zoom-in-95 duration-200">
-            <div className="bg-accent-50 dark:bg-accent-500/10 border border-accent-400/30 text-accent-600 dark:text-accent-400 px-4 py-3 rounded-xl text-sm font-medium">
-              📞 <strong className="font-bold">Formato numero:</strong> <code>+39XXXXXXXXXX</code> oppure <code>0XXXXXXXXX</code>
-            </div>
-            
             <div className="border border-slate-200 dark:border-slate-700 rounded-xl overflow-hidden">
               <div className="grid grid-cols-[1fr_1fr_40px] bg-slate-50 dark:bg-slate-800/80 p-3 border-b border-slate-200 dark:border-slate-700 gap-3">
                 <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Nome Cliente</span>
