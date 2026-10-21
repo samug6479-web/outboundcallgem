@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useCampaign } from '../context/CampaignContext';
 import { GemLogo } from './Icons';
-import { LogOut, Sun, Moon, Plus, List, Clock, User, LifeBuoy, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing } from 'lucide-react';
+import { LogOut, Sun, Moon, Plus, List, Clock, User, LifeBuoy, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { Step1Upload, Step2Preview, Step3Settings } from './CampaignSteps';
 import { AppointmentPage } from './AppuntamentiSection';
@@ -141,6 +141,22 @@ export function Dashboard() {
       setShow2FABanner(false);
     }
   }, [user?.twoFactorEnabled]);
+
+  // Avviso profilo incompleto: l'email serve per i riepiloghi delle campagne,
+  // email e telefono per le richieste di assistenza. Sparisce da solo appena
+  // il profilo è completo; la X lo nasconde finché la scheda resta aperta.
+  const [profileBannerDismissed, setProfileBannerDismissed] = useState(
+    () => sessionStorage.getItem('gem_profile_banner_dismissed') === '1'
+  );
+  const missingProfile = [
+    !user?.email?.trim() && 'email',
+    !user?.telefono?.trim() && 'numero di telefono',
+  ].filter(Boolean) as string[];
+  const showProfileBanner = !!user && missingProfile.length > 0 && !profileBannerDismissed && activeTab !== 'profile';
+  const dismissProfileBanner = () => {
+    sessionStorage.setItem('gem_profile_banner_dismissed', '1');
+    setProfileBannerDismissed(true);
+  };
 
   const dismiss2FABanner = () => {
     sessionStorage.setItem('gem_2fa_banner_dismissed', '1');
@@ -331,6 +347,27 @@ export function Dashboard() {
                   {enabling2FA ? 'Attivazione...' : 'Attiva ora'}
                 </button>
                 <button onClick={dismiss2FABanner} className="p-1.5 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 rounded-lg transition-colors">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {showProfileBanner && (
+            <div className="mb-6 flex items-start gap-3 p-4 rounded-2xl border border-amber-200 dark:border-amber-800/50 bg-amber-50 dark:bg-amber-900/10 animate-in fade-in slide-in-from-top-2">
+              <UserCog className="w-5 h-5 text-amber-500 mt-0.5 shrink-0" />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-semibold text-slate-900 dark:text-white">Completa il tuo profilo: {missingProfile.length > 1 ? 'mancano' : 'manca'} {missingProfile.join(' e ')}</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">All'email arrivano i riepiloghi delle tue campagne; email e telefono servono anche per le richieste di assistenza.</p>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={() => handleNav('profile')}
+                  className="px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold rounded-lg transition-colors"
+                >
+                  Completa profilo
+                </button>
+                <button onClick={dismissProfileBanner} aria-label="Nascondi avviso" className="p-1.5 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 rounded-lg transition-colors">
                   <X className="w-4 h-4" />
                 </button>
               </div>
