@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { BellRing, CheckCircle2, Loader2, Phone, RefreshCw } from 'lucide-react';
+import { BellRing, CheckCircle2, Loader2, Phone, RefreshCw, Download } from 'lucide-react';
+import * as XLSX from 'xlsx';
 import { authFetch } from '../lib/authFetch';
 import { cn } from '../lib/utils';
 
@@ -63,6 +64,24 @@ export function FollowupsSection() {
   const motivi = [...new Set(items.map(f => f.motivo))];
   const visible = motivo === 'tutti' ? items : items.filter(f => f.motivo === motivo);
 
+  // Esporta in Excel l'elenco mostrato (stato e filtro motivo correnti)
+  const exportXlsx = () => {
+    const rows = visible.map(f => ({
+      Nome: f.nome || '',
+      Numero: f.numero || '',
+      Motivo: f.motivo,
+      Stato: f.stato === 'done' ? 'Gestito' : 'Da gestire',
+      Data: new Date(f.created_at).toLocaleString('it-IT'),
+      'ID chiamata': f.call_id,
+    }));
+    const ws = XLSX.utils.json_to_sheet(rows);
+    ws['!cols'] = [{ wch: 24 }, { wch: 16 }, { wch: 34 }, { wch: 12 }, { wch: 20 }, { wch: 38 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, stato === 'pending' ? 'Da gestire' : 'Gestiti');
+    const suffix = motivo === 'tutti' ? '' : `-${motivo.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`;
+    XLSX.writeFile(wb, `follow-up-${stato === 'pending' ? 'da-gestire' : 'gestiti'}${suffix}-${new Date().toISOString().slice(0, 10)}.xlsx`);
+  };
+
   return (
     <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-soft overflow-hidden animate-in fade-in slide-in-from-bottom-4 duration-300">
       <div className="p-5 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/30 flex flex-wrap items-center gap-3 justify-between">
@@ -89,6 +108,10 @@ export function FollowupsSection() {
               {motivi.map(m => <option key={m} value={m}>{m}</option>)}
             </select>
           )}
+          <button onClick={exportXlsx} disabled={loading || visible.length === 0} aria-label="Esporta in Excel" title="Esporta in Excel"
+            className="p-1.5 text-slate-400 hover:text-brand-600 hover:bg-brand-50 rounded-lg transition-colors disabled:opacity-40 disabled:hover:bg-transparent">
+            <Download className="w-4 h-4" />
+          </button>
           <button onClick={() => load()} aria-label="Aggiorna" title="Aggiorna"
             className="p-1.5 text-slate-400 hover:text-brand-600 hover:bg-brand-50 rounded-lg transition-colors">
             <RefreshCw className={cn('w-4 h-4', loading && 'animate-spin')} />

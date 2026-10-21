@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from 'recharts';
-import { Phone, PhoneIncoming, PhoneOff, Timer, BellRing, Send, RefreshCw, BarChart2, CalendarClock, LogIn } from 'lucide-react';
+import { Phone, PhoneIncoming, PhoneOff, Timer, BellRing, Send, RefreshCw, BarChart2, CalendarClock, LogIn, Download } from 'lucide-react';
+import * as XLSX from 'xlsx';
 import { format, subDays, startOfDay } from 'date-fns';
 import { useCampaign } from '../context/CampaignContext';
 import { authFetch } from '../lib/authFetch';
@@ -129,6 +130,44 @@ export function StatsDashboard() {
 
   const periodLabel = PERIODS.find(p => p.days === days)?.label.toLowerCase();
 
+  // Esporta il periodo scelto in un file Excel, un foglio per sezione
+  const exportXlsx = () => {
+    if (!stats) return;
+    const wb = XLSX.utils.book_new();
+    const add = (name: string, rows: Record<string, any>[], cols: number[]) => {
+      const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ Nota: 'Nessun dato nel periodo' }]);
+      ws['!cols'] = cols.map(wch => ({ wch }));
+      XLSX.utils.book_append_sheet(wb, ws, name);
+    };
+    add('Riepilogo', [
+      { Voce: 'Periodo', Valore: PERIODS.find(p => p.days === days)?.label },
+      { Voce: 'Esportato il', Valore: new Date().toLocaleString('it-IT') },
+      { Voce: 'Chiamate', Valore: c?.totale ?? 0 },
+      { Voce: 'Risposte', Valore: c?.risposte ?? 0 },
+      { Voce: 'Non risposte', Valore: c?.non_risposte ?? 0 },
+      { Voce: 'Tasso di risposta (%)', Valore: tasso ?? '' },
+      { Voce: 'Durata media (min:sec)', Valore: formatDurata(c?.durata_media_ms ?? null) },
+      { Voce: 'Follow-up aperti (totale)', Valore: followupTot },
+      { Voce: 'Campagne avviate', Valore: stats.campagne?.campagne ?? 0 },
+      { Voce: 'Contatti chiamati', Valore: stats.campagne?.contatti ?? 0 },
+      { Voce: 'Campagne immediate', Valore: stats.campagne?.immediate ?? 0 },
+      { Voce: 'Campagne pianificate', Valore: stats.campagne?.pianificate ?? 0 },
+      { Voce: 'Pianificate in attesa', Valore: stats.pianificateInAttesa },
+    ], [28, 22]);
+    add('Chiamate per giorno', giorni.map(g => ({
+      Giorno: g.label, Risposte: g.risposte, 'Non risposte': g.non_risposte, Totale: g.risposte + g.non_risposte,
+    })), [12, 10, 14, 10]);
+    add('Follow-up per motivo', stats.followupAperti.map(f => ({ Motivo: f.motivo, 'Da gestire': f.totale })), [34, 12]);
+    add('Per operatore', stats.perOperatore.map(o => ({ Operatore: o.operatore, Campagne: o.campagne, Contatti: o.contatti })), [24, 10, 10]);
+    if (isAdmin) {
+      add('Registro accessi', logs.map(l => ({
+        Quando: new Date(l.ts).toLocaleString('it-IT'), Utente: l.nome || l.username, Username: l.username,
+        Azione: l.action === 'login' ? 'Accesso' : l.action === 'logout' ? 'Uscita' : l.action,
+      })), [20, 20, 16, 10]);
+    }
+    XLSX.writeFile(wb, `statistiche-${days === 1 ? 'oggi' : `${days}-giorni`}-${new Date().toISOString().slice(0, 10)}.xlsx`);
+  };
+
   return (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-300">
 
@@ -142,9 +181,14 @@ export function StatsDashboard() {
             </button>
           ))}
         </div>
-        <button onClick={() => load()} className="inline-flex items-center gap-2 text-sm font-semibold text-slate-500 hover:text-brand-600 px-3 py-2 rounded-lg hover:bg-brand-50 dark:hover:bg-slate-800 transition-colors">
-          <RefreshCw className={cn('w-4 h-4', loading && 'animate-spin')} /> Aggiorna
-        </button>
+        <div className="flex items-center gap-1">
+          <button onClick={exportXlsx} disabled={loading || !stats} className="inline-flex items-center gap-2 text-sm font-semibold text-slate-500 hover:text-brand-600 px-3 py-2 rounded-lg hover:bg-brand-50 dark:hover:bg-slate-800 transition-colors disabled:opacity-40">
+            <Download className="w-4 h-4" /> Esporta Excel
+          </button>
+          <button onClick={() => load()} className="inline-flex items-center gap-2 text-sm font-semibold text-slate-500 hover:text-brand-600 px-3 py-2 rounded-lg hover:bg-brand-50 dark:hover:bg-slate-800 transition-colors">
+            <RefreshCw className={cn('w-4 h-4', loading && 'animate-spin')} /> Aggiorna
+          </button>
+        </div>
       </div>
 
       {error && <p className="text-sm text-red-500">{error}</p>}
