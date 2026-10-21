@@ -1,268 +1,279 @@
 import React, { useEffect, useState } from 'react';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from 'recharts';
+import { Phone, PhoneIncoming, PhoneOff, Timer, BellRing, Send, RefreshCw, BarChart2, CalendarClock, LogIn } from 'lucide-react';
+import { format, subDays, startOfDay } from 'date-fns';
 import { useCampaign } from '../context/CampaignContext';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line, CartesianGrid, PieChart, Pie, Cell, Legend, AreaChart, Area } from 'recharts';
-import { Phone, TrendingUp, Users, Clock, CalendarDays, PhoneOff, BarChart2, PhoneIncoming, Timer } from 'lucide-react';
-import { format, subDays, startOfDay, isToday } from 'date-fns';
-import { cn } from '../lib/utils';
 import { authFetch } from '../lib/authFetch';
+import { cn } from '../lib/utils';
 
-interface VoicebotTotals {
-  totale: number;
-  risposte: number;
-  non_risposte: number;
-  durata_media_ms: number | null;
+type Days = 1 | 7 | 30 | 90;
+
+interface StatsResponse {
+  ok: boolean;
+  days: Days;
+  chiamate: { totale: number; risposte: number; non_risposte: number; durata_media_ms: number | null };
+  perGiorno: { giorno: string; risposte: number; non_risposte: number }[];
+  followupAperti: { motivo: string; totale: number }[];
+  campagne: { campagne: number; contatti: number; immediate: number; pianificate: number } | null;
+  perOperatore: { operatore: string; campagne: number; contatti: number }[];
+  pianificateInAttesa: number;
+  registroCampagneDal: string | null;
 }
-interface VoicebotDaily { giorno: string; totale: number; }
 
-function formatDurataMedia(ms: number | null) {
+interface AccessLog { ts: string; username: string; nome: string; action: string }
+
+const PERIODS: { days: Days; label: string }[] = [
+  { days: 1, label: 'Oggi' },
+  { days: 7, label: '7 giorni' },
+  { days: 30, label: '30 giorni' },
+  { days: 90, label: '90 giorni' },
+];
+
+// Colori dei due esiti, verificati per daltonismo e contrasto su sfondo
+// chiaro e scuro (validatore palette): blu = risposte, ambra = non risposte.
+const COLORS = {
+  light: { risposte: '#2563eb', nonRisposte: '#d97706' },
+  dark: { risposte: '#3b82f6', nonRisposte: '#d97706' },
+};
+
+function formatDurata(ms: number | null) {
   if (!ms) return '—';
   const sec = Math.round(ms / 1000);
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  return `${m}:${s.toString().padStart(2, '0')}`;
+  return `${Math.floor(sec / 60)}:${(sec % 60).toString().padStart(2, '0')}`;
+}
+
+function StatCard({ label, value, sub, icon: Icon, loading }: { label: string; value: React.ReactNode; sub?: string; icon: any; loading: boolean }) {
+  return (
+    <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-soft">
+      <div className="w-10 h-10 rounded-xl flex items-center justify-center mb-3 bg-slate-100 dark:bg-slate-800">
+        <Icon className="w-5 h-5 text-slate-500 dark:text-slate-400" />
+      </div>
+      <div className="text-2xl font-extrabold text-slate-900 dark:text-white font-display">{loading ? '…' : value}</div>
+      <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mt-1">{label}</div>
+      {sub && !loading && <div className="text-xs text-slate-400 mt-0.5">{sub}</div>}
+    </div>
+  );
+}
+
+function Card({ title, children, right }: { title: string; children: React.ReactNode; right?: React.ReactNode }) {
+  return (
+    <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-soft">
+      <div className="flex items-center justify-between mb-5 gap-3">
+        <h3 className="text-sm font-bold text-slate-900 dark:text-white uppercase tracking-wider">{title}</h3>
+        {right}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Empty({ text }: { text: string }) {
+  return (
+    <div className="h-40 flex flex-col items-center justify-center gap-3 text-slate-400">
+      <BarChart2 className="w-10 h-10 opacity-30" />
+      <span className="text-sm">{text}</span>
+    </div>
+  );
 }
 
 export function StatsDashboard() {
-  const { history } = useCampaign();
-  const [vbTotals, setVbTotals] = useState<VoicebotTotals | null>(null);
-  const [vbDaily, setVbDaily] = useState<VoicebotDaily[]>([]);
-  const [vbLoading, setVbLoading] = useState(false);
+  const { user, darkMode } = useCampaign();
+  const isAdmin = user?.isAdmin || user?.role === 'Admin';
+  const [days, setDays] = useState<Days>(() => {
+    try { return (Number(localStorage.getItem('gem_stats_days')) as Days) || 30; } catch { return 30; }
+  });
+  const [stats, setStats] = useState<StatsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [logs, setLogs] = useState<AccessLog[]>([]);
+  const [showTable, setShowTable] = useState(false);
+
+  const load = async (d: Days = days) => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await authFetch(`/api/stats?days=${d}`);
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error);
+      setStats(data);
+    } catch (e: any) {
+      setError(e?.message || 'Impossibile caricare le statistiche.');
+    }
+    setLoading(false);
+  };
 
   useEffect(() => {
-    setVbLoading(true);
-    authFetch('/api/voicebot-stats')
-      .then(r => r.json())
-      .then(d => {
-        if (d.ok) {
-          setVbTotals(d.totali || null);
-          setVbDaily(d.perGiorno || []);
-        }
-      })
-      .catch((err) => console.error("Errore caricamento statistiche voicebot:", err))
-      .finally(() => setVbLoading(false));
-  }, []);
+    load(days);
+    try { localStorage.setItem('gem_stats_days', String(days)); } catch { /* storage non disponibile */ }
+  }, [days]);
 
-  // Tasso di risposta reale dal voicebot (DB), su tutte le chiamate gestite
-  const tassoRisposta = vbTotals && vbTotals.totale > 0
-    ? Math.round((vbTotals.risposte / vbTotals.totale) * 100)
-    : null;
+  useEffect(() => {
+    if (!isAdmin) return;
+    authFetch('/api/access-logs').then(r => r.json()).then(d => setLogs(d.logs || [])).catch(() => setLogs([]));
+  }, [isAdmin]);
 
-  // Trend voicebot ultimi 30 giorni, riempiendo i buchi con 0
-  const vbTrend30 = Array.from({ length: 30 }, (_, i) => {
-    const d = startOfDay(subDays(new Date(), 29 - i));
+  const c = stats?.chiamate;
+  const tasso = c && c.totale > 0 ? Math.round((c.risposte / c.totale) * 100) : null;
+  const followupTot = (stats?.followupAperti || []).reduce((s, f) => s + f.totale, 0);
+  const maxFollowup = Math.max(1, ...(stats?.followupAperti || []).map(f => f.totale));
+  const maxOperatore = Math.max(1, ...(stats?.perOperatore || []).map(o => o.contatti));
+  const palette = darkMode ? COLORS.dark : COLORS.light;
+
+  // Un punto per ogni giorno del periodo, anche quelli senza chiamate
+  const giorni = Array.from({ length: days }, (_, i) => {
+    const d = startOfDay(subDays(new Date(), days - 1 - i));
     const key = format(d, 'yyyy-MM-dd');
-    const label = format(d, 'dd/MM');
-    const found = vbDaily.find(v => v.giorno?.startsWith(key));
-    return { label, totale: found?.totale || 0 };
+    const found = stats?.perGiorno.find(g => g.giorno === key);
+    return { label: format(d, 'dd/MM'), risposte: found?.risposte || 0, non_risposte: found?.non_risposte || 0 };
   });
 
-  // Ultimi 7 giorni — chiamate per giorno
-  const last7 = Array.from({ length: 7 }, (_, i) => {
-    const d = startOfDay(subDays(new Date(), 6 - i));
-    const label = format(d, 'dd/MM');
-    const calls = history
-      .filter(h => startOfDay(new Date(h.ts)).getTime() === d.getTime())
-      .reduce((sum, h) => sum + h.count, 0);
-    const campaigns = history.filter(h => startOfDay(new Date(h.ts)).getTime() === d.getTime()).length;
-    return { label, calls, campaigns };
-  });
-
-  // Totali
-  const totalCalls = history.reduce((s, h) => s + h.count, 0);
-  const totalCampaigns = history.length;
-  const avgCalls = totalCampaigns > 0 ? Math.round(totalCalls / totalCampaigns) : 0;
-  const operators = [...new Set(history.map(h => h.opt))];
-
-  // Oggi
-  const todayCalls = history.filter(h => isToday(new Date(h.ts))).reduce((s, h) => s + h.count, 0);
-  const todayCampaigns = history.filter(h => isToday(new Date(h.ts))).length;
-
-  // Per operatore
-  const byOperator = operators.map(op => ({
-    name: op,
-    chiamate: history.filter(h => h.opt === op).reduce((s, h) => s + h.count, 0),
-    campagne: history.filter(h => h.opt === op).length,
-  })).sort((a, b) => b.chiamate - a.chiamate);
-  const maxOpCalls = byOperator[0]?.chiamate || 1;
-
-  // Esiti campagne (scheduled vs immediate)
-  const scheduled = history.filter(h => h.scheduledAt).length;
-  const immediate = history.filter(h => !h.scheduledAt).length;
-  const pieData = [
-    { name: 'Immediata', value: immediate, color: '#3b82f6' },
-    { name: 'Pianificata', value: scheduled, color: '#10b981' },
-  ].filter(d => d.value > 0);
-
-  const statCards = [
-    { label: 'Chiamate Totali', value: totalCalls, icon: Phone, color: 'text-brand-600', bg: 'bg-brand-50 dark:bg-brand-900/20' },
-    { label: 'Campagne Avviate', value: totalCampaigns, icon: TrendingUp, color: 'text-emerald-600', bg: 'bg-emerald-50 dark:bg-emerald-900/20' },
-    { label: 'Oggi', value: todayCalls, icon: CalendarDays, color: 'text-violet-600', bg: 'bg-violet-50 dark:bg-violet-900/20', sub: `${todayCampaigns} campagne` },
-    { label: 'Media per Campagna', value: avgCalls, icon: Clock, color: 'text-amber-600', bg: 'bg-amber-50 dark:bg-amber-900/20' },
-    { label: 'Operatori Attivi', value: operators.length, icon: Users, color: 'text-rose-600', bg: 'bg-rose-50 dark:bg-rose-900/20' },
-  ];
-
-  // KPI reali dal voicebot (database), indipendenti dallo storico locale delle campagne
-  const voicebotCards = [
-    { label: 'Tasso di Risposta', value: tassoRisposta !== null ? `${tassoRisposta}%` : '—', icon: PhoneIncoming, color: 'text-emerald-600', bg: 'bg-emerald-50 dark:bg-emerald-900/20', sub: vbTotals ? `${vbTotals.risposte} / ${vbTotals.totale} chiamate` : undefined },
-    { label: 'Durata Media Chiamata', value: formatDurataMedia(vbTotals?.durata_media_ms ?? null), icon: Timer, color: 'text-brand-600', bg: 'bg-brand-50 dark:bg-brand-900/20', sub: 'minuti:secondi' },
-    { label: 'Non Risposte', value: vbTotals?.non_risposte ?? '—', icon: PhoneOff, color: 'text-red-500', bg: 'bg-red-50 dark:bg-red-900/20' },
-  ];
+  const periodLabel = PERIODS.find(p => p.days === days)?.label.toLowerCase();
 
   return (
-    <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-300">
+    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-300">
 
-      {/* KPI Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-        {statCards.map(({ label, value, icon: Icon, color, bg, sub }: any) => (
-          <div key={label} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-soft">
-            <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center mb-3", bg)}>
-              <Icon className={cn("w-5 h-5", color)} />
-            </div>
-            <div className="text-2xl font-extrabold text-slate-900 dark:text-white font-display">{value}</div>
-            <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mt-1">{label}</div>
-            {sub && <div className="text-xs text-slate-400 mt-0.5">{sub}</div>}
-          </div>
-        ))}
-      </div>
-
-      {/* KPI Voicebot — dati reali dal database chiamate */}
-      <div>
-        <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-3 px-1">Voicebot — Dati Reali</h3>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          {voicebotCards.map(({ label, value, icon: Icon, color, bg, sub }: any) => (
-            <div key={label} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-soft">
-              <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center mb-3", bg)}>
-                <Icon className={cn("w-5 h-5", color)} />
-              </div>
-              <div className="text-2xl font-extrabold text-slate-900 dark:text-white font-display">{vbLoading ? '…' : value}</div>
-              <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mt-1">{label}</div>
-              {sub && <div className="text-xs text-slate-400 mt-0.5">{sub}</div>}
-            </div>
+      {/* Filtri */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden text-sm font-semibold bg-white dark:bg-slate-900" role="tablist" aria-label="Periodo">
+          {PERIODS.map(p => (
+            <button key={p.days} role="tab" aria-selected={days === p.days} onClick={() => setDays(p.days)}
+              className={cn('px-4 py-2 transition-colors', days === p.days ? 'bg-brand-600 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800')}>
+              {p.label}
+            </button>
           ))}
         </div>
+        <button onClick={() => load()} className="inline-flex items-center gap-2 text-sm font-semibold text-slate-500 hover:text-brand-600 px-3 py-2 rounded-lg hover:bg-brand-50 dark:hover:bg-slate-800 transition-colors">
+          <RefreshCw className={cn('w-4 h-4', loading && 'animate-spin')} /> Aggiorna
+        </button>
       </div>
 
-      {/* Trend voicebot ultimi 30 giorni — dati reali */}
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-soft">
-        <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-5 uppercase tracking-wider">Chiamate Voicebot — ultimi 30 giorni</h3>
-        {vbLoading ? (
-          <div className="h-48 flex items-center justify-center text-slate-400 text-sm">Caricamento...</div>
-        ) : !vbTotals || vbTotals.totale === 0 ? (
-          <div className="h-48 flex flex-col items-center justify-center gap-3 text-slate-400">
-            <BarChart2 className="w-10 h-10 opacity-30" />
-            <span className="text-sm">Nessuna chiamata registrata</span>
+      {error && <p className="text-sm text-red-500">{error}</p>}
+
+      {/* KPI */}
+      <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
+        <StatCard loading={loading} icon={Phone} label="Chiamate" value={c?.totale ?? '—'} sub={periodLabel} />
+        <StatCard loading={loading} icon={PhoneIncoming} label="Tasso di risposta" value={tasso !== null ? `${tasso}%` : '—'} sub={c ? `${c.risposte} risposte` : undefined} />
+        <StatCard loading={loading} icon={PhoneOff} label="Non risposte" value={c?.non_risposte ?? '—'} />
+        <StatCard loading={loading} icon={Timer} label="Durata media" value={formatDurata(c?.durata_media_ms ?? null)} sub="min:sec, solo risposte" />
+        <StatCard loading={loading} icon={BellRing} label="Follow-up aperti" value={followupTot} sub="da gestire, totale" />
+        <StatCard loading={loading} icon={Send} label="Campagne avviate" value={stats?.campagne?.campagne ?? 0}
+          sub={stats?.campagne ? `${stats.campagne.contatti} contatti · ${stats.pianificateInAttesa} pianificate in attesa` : undefined} />
+      </div>
+
+      {/* Chiamate per giorno */}
+      <Card title={`Chiamate per giorno — ${periodLabel}`}
+        right={c && c.totale > 0 ? (
+          <button onClick={() => setShowTable(v => !v)} className="text-xs font-semibold text-brand-600 dark:text-brand-400 hover:underline">
+            {showTable ? 'Mostra grafico' : 'Mostra tabella'}
+          </button>
+        ) : undefined}>
+        {loading ? <div className="h-56" /> : !c || c.totale === 0 ? <Empty text="Nessuna chiamata nel periodo" /> : showTable ? (
+          <div className="max-h-72 overflow-auto">
+            <table className="w-full text-sm">
+              <thead className="text-xs text-slate-500 uppercase">
+                <tr><th className="text-left py-2">Giorno</th><th className="text-right">Risposte</th><th className="text-right">Non risposte</th><th className="text-right">Totale</th></tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-slate-700 dark:text-slate-300">
+                {giorni.filter(g => g.risposte + g.non_risposte > 0).reverse().map(g => (
+                  <tr key={g.label}><td className="py-1.5">{g.label}</td><td className="text-right">{g.risposte}</td><td className="text-right">{g.non_risposte}</td><td className="text-right font-semibold">{g.risposte + g.non_risposte}</td></tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         ) : (
-          <ResponsiveContainer width="100%" height={200}>
-            <AreaChart data={vbTrend30}>
-              <defs>
-                <linearGradient id="vbTrendFill" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.35} />
-                  <stop offset="100%" stopColor="#3b82f6" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(100,116,139,0.1)" />
-              <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} interval={4} />
-              <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} allowDecimals={false} />
-              <Tooltip contentStyle={{ background: '#1e293b', border: 'none', borderRadius: 8, fontSize: 12 }} labelStyle={{ color: '#94a3b8' }} itemStyle={{ color: '#e2e8f0' }} />
-              <Area type="monotone" dataKey="totale" stroke="#3b82f6" strokeWidth={2.5} fill="url(#vbTrendFill)" name="Chiamate" />
-            </AreaChart>
+          <ResponsiveContainer width="100%" height={240}>
+            <BarChart data={giorni} barCategoryGap="20%">
+              <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="rgba(100,116,139,0.15)" />
+              <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false}
+                interval={days > 30 ? 9 : days > 7 ? 4 : 0} />
+              <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} allowDecimals={false} width={32} />
+              <Tooltip cursor={{ fill: 'rgba(100,116,139,0.08)' }}
+                contentStyle={{ background: '#1e293b', border: 'none', borderRadius: 8, fontSize: 12 }}
+                labelStyle={{ color: '#94a3b8' }} itemStyle={{ color: '#e2e8f0' }} />
+              <Legend formatter={(v) => <span className="text-xs text-slate-500">{v}</span>} />
+              <Bar dataKey="risposte" name="Risposte" stackId="a" fill={palette.risposte} stroke={darkMode ? '#0f172a' : '#ffffff'} strokeWidth={1} />
+              <Bar dataKey="non_risposte" name="Non risposte" stackId="a" fill={palette.nonRisposte} radius={[4, 4, 0, 0]} stroke={darkMode ? '#0f172a' : '#ffffff'} strokeWidth={1} />
+            </BarChart>
           </ResponsiveContainer>
         )}
-      </div>
+      </Card>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Chiamate ultimi 7 giorni */}
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-soft">
-          <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-5 uppercase tracking-wider">Chiamate — ultimi 7 giorni</h3>
-          {totalCalls === 0 ? (
-            <div className="h-48 flex flex-col items-center justify-center gap-3 text-slate-400">
-              <BarChart2 className="w-10 h-10 opacity-30" />
-              <span className="text-sm">Nessuna campagna ancora avviata</span>
-            </div>
-          ) : (
-            <ResponsiveContainer width="100%" height={180}>
-              <BarChart data={last7} barSize={24}>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(100,116,139,0.1)" />
-                <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
-                <Tooltip contentStyle={{ background: '#1e293b', border: 'none', borderRadius: 8, fontSize: 12 }} labelStyle={{ color: '#94a3b8' }} itemStyle={{ color: '#e2e8f0' }} />
-                <Bar dataKey="calls" fill="#3b82f6" radius={[4, 4, 0, 0]} name="Chiamate" />
-              </BarChart>
-            </ResponsiveContainer>
-          )}
-        </div>
-
-        {/* Trend campagne */}
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-soft">
-          <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-5 uppercase tracking-wider">Campagne — trend 7 giorni</h3>
-          {totalCampaigns === 0 ? (
-            <div className="h-48 flex flex-col items-center justify-center gap-3 text-slate-400">
-              <TrendingUp className="w-10 h-10 opacity-30" />
-              <span className="text-sm">Nessuna campagna ancora avviata</span>
-            </div>
-          ) : (
-            <ResponsiveContainer width="100%" height={180}>
-              <LineChart data={last7}>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(100,116,139,0.1)" />
-                <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} allowDecimals={false} />
-                <Tooltip contentStyle={{ background: '#1e293b', border: 'none', borderRadius: 8, fontSize: 12 }} labelStyle={{ color: '#94a3b8' }} itemStyle={{ color: '#e2e8f0' }} />
-                <Line type="monotone" dataKey="campaigns" stroke="#10b981" strokeWidth={2.5} dot={{ fill: '#10b981', r: 3 }} name="Campagne" />
-              </LineChart>
-            </ResponsiveContainer>
-          )}
-        </div>
-      </div>
-
-      {/* Modalità campagne + Per operatore */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-
-        {/* Pie — modalità */}
-        {pieData.length > 0 && (
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-soft">
-            <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-5 uppercase tracking-wider">Modalità campagne</h3>
-            <div className="flex items-center justify-center">
-              <ResponsiveContainer width="100%" height={200}>
-                <PieChart>
-                  <Pie data={pieData} cx="50%" cy="50%" innerRadius={55} outerRadius={80} paddingAngle={3} dataKey="value">
-                    {pieData.map((entry, i) => (
-                      <Cell key={i} fill={entry.color} />
-                    ))}
-                  </Pie>
-                  <Tooltip contentStyle={{ background: '#1e293b', border: 'none', borderRadius: 8, fontSize: 12 }} itemStyle={{ color: '#e2e8f0' }} />
-                  <Legend formatter={(value) => <span className="text-xs text-slate-500">{value}</span>} />
-                </PieChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-        )}
-
-        {/* Per operatore con progress bar */}
-        {byOperator.length > 0 && (
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-soft">
-            <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-5 uppercase tracking-wider">Per operatore</h3>
-            <div className="space-y-4">
-              {byOperator.map(op => (
-                <div key={op.name}>
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-sm font-semibold text-slate-900 dark:text-white">{op.name}</span>
-                    <span className="text-sm font-bold text-brand-600 dark:text-brand-400">{op.chiamate} chiamate</span>
+        {/* Follow-up aperti per motivo */}
+        <Card title="Follow-up da gestire, per motivo">
+          {loading ? <div className="h-40" /> : followupTot === 0 ? <Empty text="Nessun follow-up aperto" /> : (
+            <div className="space-y-3">
+              {stats!.followupAperti.map(f => (
+                <div key={f.motivo}>
+                  <div className="flex items-center justify-between mb-1 text-sm">
+                    <span className="text-slate-700 dark:text-slate-300">{f.motivo}</span>
+                    <span className="font-bold text-slate-900 dark:text-white">{f.totale}</span>
                   </div>
                   <div className="w-full h-2 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-brand-500 rounded-full transition-all duration-700"
-                      style={{ width: `${Math.round((op.chiamate / maxOpCalls) * 100)}%` }}
-                    />
+                    <div className="h-full rounded-full" style={{ width: `${Math.round((f.totale / maxFollowup) * 100)}%`, background: palette.risposte }} />
                   </div>
-                  <div className="text-xs text-slate-400 mt-1">{op.campagne} campagne · media {op.campagne > 0 ? Math.round(op.chiamate / op.campagne) : 0} per campagna</div>
                 </div>
               ))}
             </div>
-          </div>
-        )}
+          )}
+        </Card>
+
+        {/* Per operatore */}
+        <Card title={`Campagne per operatore — ${periodLabel}`}>
+          {loading ? <div className="h-40" /> : (stats?.perOperatore.length || 0) === 0 ? (
+            <Empty text="Nessuna campagna registrata nel periodo" />
+          ) : (
+            <div className="space-y-3">
+              {stats!.perOperatore.map(o => (
+                <div key={o.operatore}>
+                  <div className="flex items-center justify-between mb-1 text-sm">
+                    <span className="font-semibold text-slate-900 dark:text-white">{o.operatore}</span>
+                    <span className="text-slate-500">{o.contatti} contatti · {o.campagne} {o.campagne === 1 ? 'campagna' : 'campagne'}</span>
+                  </div>
+                  <div className="w-full h-2 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
+                    <div className="h-full rounded-full" style={{ width: `${Math.round((o.contatti / maxOperatore) * 100)}%`, background: palette.risposte }} />
+                  </div>
+                </div>
+              ))}
+              {stats?.campagne && stats.campagne.campagne > 0 && (
+                <p className="text-xs text-slate-400 pt-1 flex items-center gap-1">
+                  <CalendarClock className="w-3.5 h-3.5" />
+                  {stats.campagne.immediate} immediate · {stats.campagne.pianificate} pianificate
+                </p>
+              )}
+            </div>
+          )}
+          {stats?.registroCampagneDal && (
+            <p className="text-xs text-slate-400 mt-4">
+              Campagne registrate dal {new Date(stats.registroCampagneDal).toLocaleDateString('it-IT')}.
+            </p>
+          )}
+        </Card>
       </div>
 
+      {/* Registro accessi (solo Admin) */}
+      {isAdmin && (
+        <Card title="Registro accessi" right={<LogIn className="w-4 h-4 text-slate-400" />}>
+          {logs.length === 0 ? <Empty text="Nessun accesso registrato" /> : (
+            <div className="max-h-72 overflow-auto">
+              <table className="w-full text-sm">
+                <thead className="text-xs text-slate-500 uppercase sticky top-0 bg-white dark:bg-slate-900">
+                  <tr><th className="text-left py-2">Quando</th><th className="text-left">Utente</th><th className="text-left">Azione</th></tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-slate-700 dark:text-slate-300">
+                  {logs.slice(0, 100).map((l, i) => (
+                    <tr key={i}>
+                      <td className="py-1.5 whitespace-nowrap">{new Date(l.ts).toLocaleString('it-IT', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}</td>
+                      <td>{l.nome || l.username}</td>
+                      <td>{l.action === 'login' ? 'Accesso' : l.action === 'logout' ? 'Uscita' : l.action}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+      )}
     </div>
   );
 }

@@ -481,6 +481,82 @@ app.get("/api/voicebot-stats", requireAuth, async (_req, res) => {
   }
 });
 
+// ── Statistiche per periodo ──
+// days = 1 (oggi), 7, 30 o 90. Il periodo parte dalla mezzanotte (ora
+// italiana) di days-1 giorni fa, così "oggi" e i grafici per giorno
+// seguono il calendario italiano e non quello UTC.
+app.get("/api/stats", requireAuth, async (req, res) => {
+  const allowed = [1, 7, 30, 90];
+  const days = allowed.includes(parseInt(req.query.days as string)) ? parseInt(req.query.days as string) : 30;
+  if (!sql) return res.status(503).json({ ok: false, error: "Database non disponibile" });
+
+  const empty = { totale: 0, risposte: 0, non_risposte: 0, durata_media_ms: null };
+  const safe = async <T,>(fn: () => Promise<T>, fallback: T): Promise<T> => {
+    try { return await fn(); } catch (err) { console.error("Errore statistiche:", err); return fallback; }
+  };
+
+  try {
+    await ensureCampaignLogSchema().catch(() => {});
+    await ensureScheduleSchema().catch(() => {});
+
+    const from = (await sql`
+      SELECT ((date_trunc('day', now() AT TIME ZONE 'Europe/Rome') - make_interval(days => ${days}::int - 1))
+              AT TIME ZONE 'Europe/Rome') AS da
+    `) as any[];
+    const da = from[0].da;
+
+    const [chiamate, perGiorno, followupAperti, campagne, perOperatore, pianificateInAttesa] = await Promise.all([
+      safe(async () => ((await sql`
+        SELECT COUNT(*)::int AS totale,
+               COUNT(*) FILTER (WHERE risposto = true)::int AS risposte,
+               COUNT(*) FILTER (WHERE risposto = false)::int AS non_risposte,
+               AVG(durata) FILTER (WHERE durata > 0)::int AS durata_media_ms
+        FROM call_results WHERE ts >= ${da}`) as any[])[0] || empty, empty),
+      safe(async () => (await sql`
+        SELECT to_char(DATE(ts AT TIME ZONE 'Europe/Rome'), 'YYYY-MM-DD') AS giorno,
+               COUNT(*) FILTER (WHERE risposto = true)::int AS risposte,
+               COUNT(*) FILTER (WHERE risposto = false)::int AS non_risposte
+        FROM call_results WHERE ts >= ${da}
+        GROUP BY 1 ORDER BY 1`) as any[], [] as any[]),
+      safe(async () => (await sql`
+        SELECT motivo, COUNT(*)::int AS totale FROM followups
+        WHERE stato = 'pending' GROUP BY motivo ORDER BY totale DESC`) as any[], [] as any[]),
+      safe(async () => ((await sql`
+        SELECT COUNT(*)::int AS campagne,
+               COALESCE(SUM(sent_count), 0)::int AS contatti,
+               COUNT(*) FILTER (WHERE mode = 'immediate')::int AS immediate,
+               COUNT(*) FILTER (WHERE mode = 'scheduled')::int AS pianificate
+        FROM campaign_log WHERE created_at >= ${da} AND dry_run = false`) as any[])[0] || null, null),
+      safe(async () => (await sql`
+        SELECT COALESCE(operatore, username) AS operatore,
+               COUNT(*)::int AS campagne,
+               COALESCE(SUM(sent_count), 0)::int AS contatti
+        FROM campaign_log WHERE created_at >= ${da} AND dry_run = false
+        GROUP BY 1 ORDER BY contatti DESC`) as any[], [] as any[]),
+      safe(async () => ((await sql`
+        SELECT COUNT(*)::int AS n FROM scheduled_campaigns WHERE status = 'pending'`) as any[])[0]?.n ?? 0, 0),
+    ]);
+
+    const logStart = await safe(async () => ((await sql`SELECT MIN(created_at) AS inizio FROM campaign_log`) as any[])[0]?.inizio ?? null, null);
+
+    res.json({
+      ok: true,
+      days,
+      da,
+      chiamate,
+      perGiorno,
+      followupAperti,
+      campagne,
+      perOperatore,
+      pianificateInAttesa,
+      registroCampagneDal: logStart,
+    });
+  } catch (err) {
+    console.error("Errore /api/stats:", err);
+    res.status(500).json({ ok: false, error: "Errore caricamento statistiche" });
+  }
+});
+
 // Endpoint chiamato dal frontend al lancio di una campagna, per registrare
 // l'associazione numero → nome contatto (serve ad arricchire i risultati
 // del voicebot, dato che il webhook Wildix restituisce solo il numero).
@@ -1546,6 +1622,60 @@ async function sendCampaignToMake(spec: CampaignSpec) {
 }
 
 // ══════════════════════════════════════════════════════════════
+// REGISTRO CAMPAGNE (per le statistiche)
+// Ogni invio a Make viene registrato qui, così le statistiche per operatore
+// sono uguali su ogni dispositivo (prima stavano nel browser).
+// ══════════════════════════════════════════════════════════════
+let campaignLogReady: Promise<void> | null = null;
+function ensureCampaignLogSchema(): Promise<void> {
+  if (!campaignLogReady) {
+    campaignLogReady = (async () => {
+      await sql!`
+        CREATE TABLE IF NOT EXISTS campaign_log (
+          id             SERIAL PRIMARY KEY,
+          created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+          username       TEXT        NOT NULL,
+          operatore      TEXT,
+          tipo_campagna  TEXT        NOT NULL,
+          voicebot_nome  TEXT,
+          mode           TEXT        NOT NULL,
+          contacts_count INT         NOT NULL,
+          sent_count     INT         NOT NULL,
+          failed_count   INT         NOT NULL,
+          scheduled_id   INT,
+          dry_run        BOOLEAN     NOT NULL DEFAULT false
+        )
+      `;
+      await sql!`CREATE INDEX IF NOT EXISTS idx_campaign_log_created ON campaign_log (created_at DESC)`;
+    })().catch(err => {
+      campaignLogReady = null;
+      throw err;
+    });
+  }
+  return campaignLogReady;
+}
+
+async function logCampaign(entry: {
+  username: string; operatore?: string | null; tipoCampagna: string; voicebotNome?: string | null;
+  mode: "immediate" | "scheduled"; contactsCount: number; sentCount: number; failedCount: number;
+  scheduledId?: number | null; dryRun: boolean;
+}) {
+  if (!sql) return;
+  try {
+    await ensureCampaignLogSchema();
+    await sql`
+      INSERT INTO campaign_log
+        (username, operatore, tipo_campagna, voicebot_nome, mode, contacts_count, sent_count, failed_count, scheduled_id, dry_run)
+      VALUES
+        (${entry.username}, ${entry.operatore || null}, ${entry.tipoCampagna}, ${entry.voicebotNome || null}, ${entry.mode},
+         ${entry.contactsCount}, ${entry.sentCount}, ${entry.failedCount}, ${entry.scheduledId ?? null}, ${entry.dryRun}::boolean)
+    `;
+  } catch (err) {
+    console.error("Errore scrittura campaign_log (non bloccante):", err);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
 // CAMPAGNE PIANIFICATE
 // Make non sa aspettare un orario: chiama subito. Per questo le campagne
 // pianificate restano nel database e partono dal server quando arriva
@@ -1648,6 +1778,18 @@ async function dispatchDueCampaigns(): Promise<void> {
           SET status = ${status}, sent_count = ${result.sentContacts.length}, failed_count = ${result.failedContacts.length}
           WHERE id = ${row.id}
         `;
+        await logCampaign({
+          username: row.created_by,
+          operatore: row.operatore,
+          tipoCampagna: row.tipo_campagna,
+          voicebotNome: bot?.nome,
+          mode: "scheduled",
+          contactsCount: Array.isArray(row.contacts) ? row.contacts.length : 0,
+          sentCount: result.sentContacts.length,
+          failedCount: result.failedContacts.length,
+          scheduledId: row.id,
+          dryRun: result.dryRun,
+        });
         if (result.sentContacts.length > 0) {
           await sendCampaignEmail({
             operatore: row.operatore,
@@ -1739,6 +1881,17 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
   // ── Immediata ──
   const result = await sendCampaignToMake({
     contacts, campaignType, bot, chunkSize, note: cleanNote, operatore: user.nome, scheduledAt: null,
+  });
+  await logCampaign({
+    username: user.username,
+    operatore: user.nome,
+    tipoCampagna: campaignType,
+    voicebotNome: bot?.nome,
+    mode: "immediate",
+    contactsCount: contacts.length,
+    sentCount: result.sentContacts.length,
+    failedCount: result.failedContacts.length,
+    dryRun: result.dryRun,
   });
 
   if (result.sentContacts.length > 0) {

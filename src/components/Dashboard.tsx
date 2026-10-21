@@ -76,7 +76,7 @@ const TAB_META: Record<Tab, { title: string; subtitle: string }> = {
   callresults: { title: 'Esiti Voicebot', subtitle: 'Esito, trascrizione e riassunto AI di ogni chiamata gestita dal voicebot.' },
   profile: { title: 'Il Mio Profilo', subtitle: 'Gestisci le tue informazioni di contatto e le impostazioni del tuo account.' },
   support: { title: 'Assistenza', subtitle: 'Invia una richiesta direttamente al nostro team tecnico o amministrativo.' },
-  stats: { title: 'Statistiche', subtitle: 'Panoramica delle campagne, chiamate per operatore e log accessi.' },
+  stats: { title: 'Statistiche', subtitle: 'Chiamate, risposte, follow-up e campagne per periodo, uguali su ogni dispositivo.' },
   users: { title: 'Gestione Utenti', subtitle: 'Gestisci accessi, ruoli e permessi per gli utenti della piattaforma.' },
   voicebots: { title: 'Gestione Voicebot', subtitle: 'Configura i voicebot disponibili sul centralino Wildix per le campagne.' },
 };
@@ -389,7 +389,7 @@ export function Dashboard() {
             </div>
           )}
 
-          {activeTab === 'stats' && (isAdmin || isViewer) && (
+          {activeTab === 'stats' && (
             <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
               <StatsDashboard />
             </div>
