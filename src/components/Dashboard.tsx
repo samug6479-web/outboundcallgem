@@ -280,7 +280,7 @@ export function Dashboard() {
             </div>
             {/* User row */}
             <div className="flex items-center gap-3 px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800/50 mb-2">
-              <div className="w-8 h-8 rounded-full bg-brand-100 dark:bg-brand-900/40 flex items-center justify-center text-xs font-bold text-brand-700 dark:text-brand-300 uppercase shrink-0">
+              <div className="w-8 h-8 rounded-full bg-brand-100 dark:bg-brand-500/25 flex items-center justify-center text-xs font-bold text-brand-700 dark:text-brand-200 uppercase shrink-0">
                 {user?.nome?.charAt(0)}
               </div>
               <div className="flex-1 min-w-0">
@@ -341,7 +341,7 @@ export function Dashboard() {
             <Menu className="w-5 h-5" />
           </button>
           <GemLogo className="w-24 text-slate-900 dark:text-white" />
-          <div className="w-8 h-8 rounded-full bg-brand-100 dark:bg-brand-900/40 flex items-center justify-center text-xs font-bold text-brand-700 dark:text-brand-300 uppercase">
+          <div className="w-8 h-8 rounded-full bg-brand-100 dark:bg-brand-500/25 flex items-center justify-center text-xs font-bold text-brand-700 dark:text-brand-200 uppercase">
             {user?.nome?.charAt(0)}
           </div>
         </header>

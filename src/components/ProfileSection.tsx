@@ -26,7 +26,7 @@ export function ProfileSection() {
       {/* Card info account */}
       <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-soft">
         <div className="flex items-center gap-4 mb-6">
-          <div className="w-16 h-16 rounded-2xl bg-brand-100 dark:bg-brand-900/30 flex items-center justify-center text-2xl font-extrabold text-brand-600 dark:text-brand-400 font-display">
+          <div className="w-16 h-16 rounded-2xl bg-brand-100 dark:bg-brand-500/25 flex items-center justify-center text-2xl font-extrabold text-brand-600 dark:text-brand-200 font-display">
             {user?.nome?.charAt(0).toUpperCase()}
           </div>
           <div>

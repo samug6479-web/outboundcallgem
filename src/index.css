@@ -24,6 +24,8 @@
   --color-accent-50:  #e6f8fa;
   --color-accent-400: #4ac8d4;
   --color-accent-500: #2db8c6;
+  --color-accent-600: #1a9aaa;
+  --color-accent-900: #0b3d44;
 
   /* Dark surfaces */
   --color-dark-950: #060812;
@@ -205,3 +207,57 @@
 .dark .bg-emerald-500 {
   box-shadow: 0 0 8px rgba(16,185,129,0.6) !important;
 }
+
+/* ── DARK MODE: colori di default per gli elementi senza variante dark: ──
+   Valgono solo se l'elemento non ha già una classe dark: dello stesso tipo,
+   così le scelte fatte nei componenti restano valide. */
+
+/* Testi blu scuro (link, numeri di telefono, etichette): illeggibili sul navy */
+.dark .text-brand-600:not([class*="dark:text-"]),
+.dark .text-brand-700:not([class*="dark:text-"]),
+.dark .text-brand-800:not([class*="dark:text-"]) {
+  color: #7f95ed;
+}
+.dark [class*="hover:text-brand-"]:hover:not([class*="dark:hover:text-"]) {
+  color: #aab8f3;
+}
+
+/* Sfondi azzurrini chiari (pulsanti secondari, badge): diventano blu trasparente */
+.dark .bg-brand-50:not([class*="dark:bg-"]),
+.dark .bg-brand-100:not([class*="dark:bg-"]) {
+  background-color: rgba(77,109,229,0.16);
+}
+.dark [class*="hover:bg-brand-50"]:hover:not([class*="dark:hover:bg-"]),
+.dark [class*="hover:bg-brand-100"]:hover:not([class*="dark:hover:bg-"]) {
+  background-color: rgba(77,109,229,0.24);
+}
+
+/* Testi scuri rimasti senza variante dark: */
+.dark .text-slate-900:not([class*="dark:text-"]),
+.dark .text-slate-800:not([class*="dark:text-"]) {
+  color: #e2e8f8;
+}
+.dark .text-slate-700:not([class*="dark:text-"]),
+.dark .text-slate-600:not([class*="dark:text-"]) {
+  color: #cbd5e1;
+}
+
+/* Testo secondario: un po' più chiaro per il contrasto sul navy */
+.dark .text-slate-500:not([class*="dark:text-"]) {
+  color: #94a3b8;
+}
+
+/* Hover delle righe e dei pulsanti grigi chiari */
+.dark [class*="hover:bg-slate-50"]:hover:not([class*="dark:hover:bg-"]),
+.dark [class*="hover:bg-slate-100"]:hover:not([class*="dark:hover:bg-"]) {
+  background-color: rgba(74,200,212,0.06);
+}
+
+/* Focus visibile da tastiera */
+.dark :focus-visible {
+  outline: 2px solid #4ac8d4;
+  outline-offset: 2px;
+}
+
+/* Calendario e selettori nativi in tema scuro */
+.dark { color-scheme: dark; }

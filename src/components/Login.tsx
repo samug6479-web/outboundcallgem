@@ -120,7 +120,7 @@ export function Login() {
               type="submit" 
               disabled={loading || otp.length !== 6}
               className={cn(
-                "w-full py-4 mt-2 bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-bold rounded-xl text-sm shadow-md transition-all duration-200 flex items-center justify-center gap-2",
+                "w-full py-4 mt-2 bg-slate-900 dark:bg-brand-500 text-white dark:text-white font-bold rounded-xl text-sm shadow-md transition-all duration-200 flex items-center justify-center gap-2",
                 "hover:shadow-lg hover:-translate-y-0.5 active:translate-y-0",
                 (loading || otp.length !== 6) && "opacity-70 pointer-events-none"
               )}
@@ -165,7 +165,7 @@ export function Login() {
               type="submit" 
               disabled={loading}
               className={cn(
-                "w-full py-4 mt-2 bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-bold rounded-xl text-sm shadow-md transition-all duration-200 flex items-center justify-center gap-2",
+                "w-full py-4 mt-2 bg-slate-900 dark:bg-brand-500 text-white dark:text-white font-bold rounded-xl text-sm shadow-md transition-all duration-200 flex items-center justify-center gap-2",
                 "hover:shadow-lg hover:-translate-y-0.5 active:translate-y-0",
                 loading && "opacity-70 pointer-events-none"
               )}

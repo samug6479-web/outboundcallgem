@@ -322,7 +322,7 @@ export function ContactLists({ onSelectProcess }: { onSelectProcess: () => void 
                       loadList(list.id);
                       onSelectProcess();
                     }}
-                    className="flex items-center gap-1.5 px-4 py-1.5 bg-slate-900 hover:bg-slate-800 dark:bg-slate-100 dark:hover:bg-white dark:text-slate-900 text-white font-bold rounded-lg transition-all text-sm"
+                    className="flex items-center gap-1.5 px-4 py-1.5 bg-slate-900 hover:bg-slate-800 dark:bg-brand-500 dark:hover:bg-brand-400 dark:text-white text-white font-bold rounded-lg transition-all text-sm"
                   >
                     <Play className="w-3.5 h-3.5" /> 
                     Usa

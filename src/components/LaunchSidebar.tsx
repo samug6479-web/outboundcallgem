@@ -116,7 +116,7 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
       {/* LAUNCH CARD */}
       {!isViewer && (mode === 'all' || mode === 'launch') && (
       <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-soft overflow-hidden">
-        <div className="h-1.5 w-full bg-slate-800 dark:bg-slate-200"></div>
+        <div className="h-1.5 w-full bg-slate-800 dark:bg-brand-500"></div>
         <div className="p-6">
           <div className="flex items-center gap-3 mb-5">
             <div className="w-8 h-8 rounded-full bg-brand-100 dark:bg-brand-700/50 text-brand-700 dark:text-brand-300 flex items-center justify-center font-display font-bold">4</div>
@@ -218,7 +218,7 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
                     aria-label="Blocca chiamate fuori orario"
                     className={cn("relative w-10 h-5 rounded-full transition-colors", businessHoursEnabled ? "bg-brand-600" : "bg-slate-300 dark:bg-slate-600")}
                   >
-                    <span className={cn("absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform", businessHoursEnabled ? "translate-x-5" : "translate-x-0.5")} />
+                    <span className={cn("absolute top-0.5 w-4 h-4 bg-white dark:bg-white! rounded-full shadow transition-transform", businessHoursEnabled ? "translate-x-5" : "translate-x-0.5")} />
                   </button>
                 </div>
               </div>
