@@ -14,6 +14,7 @@ import { StatsDashboard } from './StatsDashboard';
 import { ProfileSection } from './ProfileSection';
 import { CallResultsSection } from './CallResultsSection';
 import { FollowupsSection } from './FollowupsSection';
+import { ConfirmModal } from './ConfirmModal';
 
 type Tab = 'campaign' | 'appointments' | 'lists' | 'history' | 'callresults' | 'followups' | 'profile' | 'support' | 'stats' | 'users' | 'voicebots';
 
@@ -121,7 +122,9 @@ function CampaignStepper() {
 }
 
 export function Dashboard() {
-  const { user, darkMode, toggleTheme, logout, enable2FA } = useCampaign();
+  const { user, darkMode, toggleTheme, logout, enable2FA, scheduledCampaigns } = useCampaign();
+  const [confirmLogout, setConfirmLogout] = useState(false);
+  const pendingScheduled = scheduledCampaigns.filter(c => c.status === 'pending').length;
   const isAdmin = user?.isAdmin || user?.role === 'Admin';
   const isViewer = user?.role === 'Viewer';
   const savedTab = sessionStorage.getItem('gem_active_tab') as Tab | null;
@@ -295,7 +298,7 @@ export function Dashboard() {
                 {darkMode ? 'Chiaro' : 'Scuro'}
               </button>
               <button
-                onClick={logout}
+                onClick={() => setConfirmLogout(true)}
                 className="flex-1 flex items-center justify-center gap-2 py-2 text-xs font-semibold text-slate-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
               >
                 <LogOut className="w-3.5 h-3.5" />
@@ -304,6 +307,21 @@ export function Dashboard() {
             </div>
           </div>
         </aside>
+
+        <ConfirmModal
+          open={confirmLogout}
+          title="Vuoi uscire?"
+          message={pendingScheduled > 0
+            ? (pendingScheduled === 1
+              ? "Hai 1 campagna pianificata in attesa: parte all'orario solo se l'app è aperta su almeno un dispositivo."
+              : `Hai ${pendingScheduled} campagne pianificate in attesa: partono all'orario solo se l'app è aperta su almeno un dispositivo.`)
+            : 'Dovrai rifare il login per rientrare.'}
+          confirmLabel="Esci"
+          cancelLabel="Annulla"
+          variant="warning"
+          onConfirm={() => { setConfirmLogout(false); logout(); }}
+          onCancel={() => setConfirmLogout(false)}
+        />
       </>
 
       {/* MAIN */}
