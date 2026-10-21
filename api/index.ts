@@ -399,37 +399,42 @@ async function createFollowup(entry: { callId: string; numero: string | null; no
   }
 }
 
-// ── Follow-up per chiamate non risposte ──
-// Un solo follow-up "Non risposto" aperto per numero: se lo stesso contatto
-// non risponde più volte non si accumulano righe. Quando poi lo stesso
-// numero risponde a una chiamata successiva, il follow-up si chiude da solo.
+// ── Follow-up automatici dall'esito della chiamata ──
+// "Non risposto": nessuno ha risposto.
+// "Chiamata interrotta": ha risposto ma la chiamata è durata meno di
+// INTERRUPTED_CALL_MAX_MS (di solito il contatto ha attaccato subito).
+// Ne resta aperto uno solo per numero e per motivo, così non si accumulano
+// righe; quando lo stesso numero completa una chiamata più lunga, i due
+// follow-up automatici si chiudono da soli.
 const MOTIVO_NON_RISPOSTO = "Non risposto";
+const MOTIVO_INTERROTTA = "Chiamata interrotta";
+const INTERRUPTED_CALL_MAX_MS = 20_000; // talkTime di Wildix è in millisecondi
 
-async function createNoAnswerFollowup(entry: { callId: string; numero: string | null; nome: string | null }) {
+async function createAutoFollowup(entry: { callId: string; numero: string | null; nome: string | null; motivo: string }) {
   if (!entry.numero) return;
   try {
     await sql`
       INSERT INTO followups (call_id, numero, nome, motivo)
-      SELECT ${entry.callId}, ${entry.numero}, ${entry.nome}, ${MOTIVO_NON_RISPOSTO}
+      SELECT ${entry.callId}, ${entry.numero}, ${entry.nome}, ${entry.motivo}
       WHERE NOT EXISTS (
         SELECT 1 FROM followups
-        WHERE numero = ${entry.numero} AND motivo = ${MOTIVO_NON_RISPOSTO} AND stato = 'pending'
+        WHERE numero = ${entry.numero} AND motivo = ${entry.motivo} AND stato = 'pending'
       )
     `;
   } catch (err) {
-    console.error("Error creating no-answer followup:", err);
+    console.error("Error creating auto followup:", err);
   }
 }
 
-async function closeNoAnswerFollowups(numero: string | null) {
-  if (!numero) return;
+async function closeAutoFollowups(numero: string | null, motivi: string[]) {
+  if (!numero || motivi.length === 0) return;
   try {
     await sql`
       UPDATE followups SET stato = 'done'
-      WHERE numero = ${numero} AND motivo = ${MOTIVO_NON_RISPOSTO} AND stato = 'pending'
+      WHERE numero = ${numero} AND motivo = ANY(${motivi}::text[]) AND stato = 'pending'
     `;
   } catch (err) {
-    console.error("Error closing no-answer followups:", err);
+    console.error("Error closing auto followups:", err);
   }
 }
 
@@ -638,8 +643,16 @@ app.post(
           trascrizione: null,
         });
 
-        if (risposto) await closeNoAnswerFollowups(numero);
-        else await createNoAnswerFollowup({ callId: event.id, numero, nome });
+        const durataMs = flow.talkTime || 0;
+        if (!risposto) {
+          await createAutoFollowup({ callId: event.id, numero, nome, motivo: MOTIVO_NON_RISPOSTO });
+        } else if (durataMs < INTERRUPTED_CALL_MAX_MS) {
+          // Ha risposto, quindi l'eventuale "Non risposto" è superato
+          await closeAutoFollowups(numero, [MOTIVO_NON_RISPOSTO]);
+          await createAutoFollowup({ callId: event.id, numero, nome, motivo: MOTIVO_INTERROTTA });
+        } else {
+          await closeAutoFollowups(numero, [MOTIVO_NON_RISPOSTO, MOTIVO_INTERROTTA]);
+        }
       }
 
       if (event.type === "call:transcription:completed") {
