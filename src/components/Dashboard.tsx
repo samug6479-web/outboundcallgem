@@ -41,7 +41,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: 'campaign' as Tab, label: 'Nuova Campagna', icon: Plus, viewerHidden: true },
       { id: 'appointments' as Tab, label: 'Conferma Appuntamenti', icon: CalendarCheck, viewerHidden: true },
       { id: 'lists' as Tab, label: 'Liste Salvate', icon: List, viewerHidden: true },
-      { id: 'live' as Tab, label: 'In diretta', icon: Radio },
+      { id: 'live' as Tab, label: 'In diretta', icon: Radio, viewerHidden: true },
       { id: 'history' as Tab, label: 'Storico Chiamate', icon: Clock },
       { id: 'callresults' as Tab, label: 'Esiti Voicebot', icon: Phone },
       { id: 'followups' as Tab, label: 'Follow-up', icon: BellRing },
@@ -451,7 +451,7 @@ export function Dashboard() {
             <FollowupsSection />
           )}
 
-          {activeTab === 'live' && (
+          {activeTab === 'live' && !isViewer && (
             <LiveSection />
           )}
 

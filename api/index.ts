@@ -1886,6 +1886,10 @@ app.post("/api/live/make-event", express.json({ limit: "20kb" }), async (req, re
 // Dati per la pagina "In diretta": campagne delle ultime ore con i conteggi
 // per stato, ultimi eventi e (per gli admin) gli eventi ricevuti da Wildix.
 app.get("/api/live", requireAuth, async (req: any, res) => {
+  // Solo Editor e Admin: i Viewer non vedono la pagina "In diretta".
+  const user = await findSessionUser(req.session.username);
+  if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
+  if (user.role === "Viewer") return res.status(403).json({ ok: false, error: "Non autorizzato" });
   if (!sql) return res.json({ ok: true, campaigns: [], events: [], diagnostics: null });
   const hours = Math.min(Math.max(parseInt(String(req.query.hours || "12"), 10) || 12, 1), 72);
   try {
