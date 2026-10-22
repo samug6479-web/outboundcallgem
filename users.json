@@ -52,7 +52,7 @@
     "role": "Admin",
     "isAdmin": true,
     "twoFactorRequired": true,
-    "twoFactorEnabled": false,
+    "twoFactorEnabled": true,
     "twoFactorSecret": "GNVYF5CDN2FOHIS4DKJZBJJ5VDLEBLFC"
   },
   {
