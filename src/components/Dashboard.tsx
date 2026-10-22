@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useCampaign } from '../context/CampaignContext';
 import { GemLogo } from './Icons';
-import { LogOut, Sun, Moon, Plus, List, Clock, User, LifeBuoy, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen, Radio, Bot } from 'lucide-react';
+import { LogOut, Sun, Moon, Plus, List, Clock, User, Headset, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen, Radio, Bot } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { authFetch } from '../lib/authFetch';
 import { Step1Upload, Step2Preview, Step3Settings } from './CampaignSteps';
@@ -350,34 +350,28 @@ export function Dashboard() {
               </div>
               <ChevronRight className="w-3.5 h-3.5 text-slate-400 shrink-0" />
             </button>
-            <div className="grid grid-cols-2 gap-1">
-              <button
-                onClick={() => handleNav('support')}
-                className={cn("flex items-center justify-center gap-1.5 py-2 text-xs font-semibold rounded-lg transition-colors",
-                  activeTab === 'support' ? "bg-brand-600 text-white" : "text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800")}
-              >
-                <LifeBuoy className="w-3.5 h-3.5" />
-                Assistenza
-              </button>
+            <div className="grid grid-cols-3 gap-1">
               {/* Guida utente in PDF (file in public/) */}
               <a
                 href="/guida-gem-outbound.pdf"
                 download="GEM-Outbound-Guida-utente.pdf"
-                className="flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
+                title="Scarica la guida utente (PDF)"
+                className="flex flex-col items-center justify-center gap-1 py-2 text-[11px] font-semibold text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
               >
                 <BookOpen className="w-3.5 h-3.5" />
-                Guida PDF
+                Guida
               </a>
               <button
                 onClick={toggleTheme}
-                className="flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
+                title={darkMode ? 'Passa al tema chiaro' : 'Passa al tema scuro'}
+                className="flex flex-col items-center justify-center gap-1 py-2 text-[11px] font-semibold text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
               >
                 {darkMode ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
-                {darkMode ? 'Tema chiaro' : 'Tema scuro'}
+                {darkMode ? 'Chiaro' : 'Scuro'}
               </button>
               <button
                 onClick={() => setConfirmLogout(true)}
-                className="flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-slate-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
+                className="flex flex-col items-center justify-center gap-1 py-2 text-[11px] font-semibold text-slate-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
               >
                 <LogOut className="w-3.5 h-3.5" />
                 Esci
@@ -416,11 +410,28 @@ export function Dashboard() {
         </header>
 
         {/* Page header */}
-        <div className="px-6 lg:px-10 pt-8 pb-6 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
-          <h1 className="text-2xl lg:text-3xl font-bold tracking-tight text-slate-900 dark:text-white">
-            {meta.title}
-          </h1>
-          <p className="text-sm text-slate-500 dark:text-slate-400 mt-1 max-w-2xl">{meta.subtitle}</p>
+        <div className="px-6 lg:px-10 pt-8 pb-6 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="text-2xl lg:text-3xl font-bold tracking-tight text-slate-900 dark:text-white">
+              {meta.title}
+            </h1>
+            <p className="text-sm text-slate-500 dark:text-slate-400 mt-1 max-w-2xl">{meta.subtitle}</p>
+          </div>
+          {/* Assistenza: sempre a portata di mano, in alto a destra (in basso a destra c'è il Kite) */}
+          <button
+            onClick={() => handleNav('support')}
+            title="Serve aiuto? Scrivi all'assistenza"
+            aria-label="Assistenza"
+            className={cn(
+              "shrink-0 flex items-center gap-2 px-3 sm:px-4 py-2 rounded-xl text-sm font-semibold border transition-colors",
+              activeTab === 'support'
+                ? "bg-brand-600 border-brand-600 text-white dark:bg-brand-500 dark:border-brand-500"
+                : "border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:border-brand-300 hover:text-brand-700 hover:bg-brand-50 dark:hover:bg-brand-500/15 dark:hover:text-white"
+            )}
+          >
+            <Headset className="w-4 h-4" />
+            <span className="hidden sm:inline">Assistenza</span>
+          </button>
         </div>
 
         {/* Content */}
