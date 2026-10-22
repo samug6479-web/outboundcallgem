@@ -53,7 +53,9 @@
     "isAdmin": true,
     "twoFactorRequired": true,
     "twoFactorEnabled": true,
-    "twoFactorSecret": "GNVYF5CDN2FOHIS4DKJZBJJ5VDLEBLFC"
+    "twoFactorSecret": "GNVYF5CDN2FOHIS4DKJZBJJ5VDLEBLFC",
+    "email": "mfrattali@gemgroupsrls.it",
+    "telefono": "+393498875310"
   },
   {
     "username": "giovanni",
