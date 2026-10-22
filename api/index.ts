@@ -1495,7 +1495,7 @@ async function sendCampaignEmail(opts: {
       : step(1, 'In diretta', 'mostra la coda, le chiamate in corso e gli esiti, aggiornati ogni pochi secondi.')}
     ${pianificata
       ? step(2, 'In diretta', 'dalla partenza mostra la coda, le chiamate in corso e gli esiti.')
-      : step(2, 'Esiti Voicebot', 'mostra esito, trascrizione e riassunto di ogni chiamata.')}
+      : step(2, 'Esiti Chiamate', 'mostra esito, trascrizione e riassunto di ogni chiamata.')}
     ${step(3, 'Follow-up', 'raccoglie chi non ha risposto o va richiamato.')}
   </table></td></tr>
   <tr><td style="padding:12px 40px 34px;"><a href="${ctaUrl}" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:14px 20px;border-radius:9px;">${ctaLabel}</a></td></tr>
@@ -1665,7 +1665,7 @@ async function sendCampaignToMake(spec: CampaignSpec) {
 
   const sentContacts = chunks.filter((_, i) => results[i]).flat();
   const failedContacts = chunks.filter((_, i) => !results[i]).flat();
-  // Numero → nome, per mostrare il nome reale negli Esiti Voicebot.
+  // Numero → nome, per mostrare il nome reale negli Esiti Chiamate.
   // In modalità test non si scrive nel database.
   if (sentContacts.length > 0 && !dryRun) await upsertContactNames(sentContacts);
   if (liveId) await recordLiveCalls(liveId, chunks, results);

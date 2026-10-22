@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
 import { useCampaign } from '../context/CampaignContext';
 import { GemLogo } from './Icons';
-import { LogOut, Sun, Moon, Plus, List, Clock, User, LifeBuoy, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen, Radio } from 'lucide-react';
+import { LogOut, Sun, Moon, Plus, List, Clock, User, LifeBuoy, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen, Radio, Bot } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { authFetch } from '../lib/authFetch';
 import { Step1Upload, Step2Preview, Step3Settings } from './CampaignSteps';
 import { AppointmentPage } from './AppuntamentiSection';
 import { LaunchSidebar } from './LaunchSidebar';
@@ -25,6 +26,7 @@ interface NavItem {
   icon: React.ElementType;
   adminOnly?: boolean;
   viewerHidden?: boolean;
+  badge?: 'followups' | 'live';
 }
 
 interface NavGroup {
@@ -34,6 +36,8 @@ interface NavGroup {
   viewerOnly?: boolean;
 }
 
+// Menu diviso per scopo: preparare e lanciare, seguire le chiamate, analizzare,
+// amministrare. Profilo e Assistenza stanno nella scheda utente in fondo.
 const NAV_GROUPS: NavGroup[] = [
   {
     label: 'Campagne',
@@ -41,23 +45,21 @@ const NAV_GROUPS: NavGroup[] = [
       { id: 'campaign' as Tab, label: 'Nuova Campagna', icon: Plus, viewerHidden: true },
       { id: 'appointments' as Tab, label: 'Conferma Appuntamenti', icon: CalendarCheck, viewerHidden: true },
       { id: 'lists' as Tab, label: 'Liste Salvate', icon: List, viewerHidden: true },
-      { id: 'live' as Tab, label: 'In diretta', icon: Radio, viewerHidden: true },
-      { id: 'history' as Tab, label: 'Storico Chiamate', icon: Clock },
-      { id: 'callresults' as Tab, label: 'Esiti Voicebot', icon: Phone },
-      { id: 'followups' as Tab, label: 'Follow-up', icon: BellRing },
     ]
   },
   {
-    label: 'Account',
+    label: 'Monitoraggio',
     items: [
-      { id: 'profile' as Tab, label: 'Il Mio Profilo', icon: User },
-      { id: 'support' as Tab, label: 'Assistenza', icon: LifeBuoy },
+      { id: 'live' as Tab, label: 'In diretta', icon: Radio, viewerHidden: true, badge: 'live' },
+      { id: 'callresults' as Tab, label: 'Esiti Chiamate', icon: Phone },
+      { id: 'followups' as Tab, label: 'Follow-up', icon: BellRing, badge: 'followups' },
     ]
   },
   {
     label: 'Report',
     items: [
-      { id: 'stats' as Tab, label: 'Statistiche', icon: BarChart2, adminOnly: false },
+      { id: 'stats' as Tab, label: 'Statistiche', icon: BarChart2 },
+      { id: 'history' as Tab, label: 'Storico Campagne', icon: Clock },
     ]
   },
   {
@@ -65,7 +67,7 @@ const NAV_GROUPS: NavGroup[] = [
     adminOnly: true,
     items: [
       { id: 'users' as Tab, label: 'Gestione Utenti', icon: Users, adminOnly: true },
-      { id: 'voicebots' as Tab, label: 'Voicebot', icon: Phone, adminOnly: true },
+      { id: 'voicebots' as Tab, label: 'Voicebot', icon: Bot, adminOnly: true },
     ]
   },
 ];
@@ -74,10 +76,10 @@ const TAB_META: Record<Tab, { title: string; subtitle: string }> = {
   campaign: { title: 'Nuova Campagna', subtitle: 'Carica la lista contatti, definisci le tempistiche e avvia le chiamate sul centralino Wildix.' },
   appointments: { title: 'Conferma Appuntamenti', subtitle: 'Visualizza, importa e gestisci gli appuntamenti programmati per le campagne di richiamata.' },
   lists: { title: 'Liste Salvate', subtitle: 'Salva, gestisci o riutilizza le tue liste contatti precedentemente caricate.' },
-  history: { title: 'Storico Chiamate', subtitle: 'Consulta lo storico delle campagne effettuate e scarica i report associati.' },
+  history: { title: 'Storico Campagne', subtitle: 'Le campagne lanciate da questo browser, con i report da scaricare.' },
   live: { title: 'In diretta', subtitle: 'Le chiamate delle campagne in corso, aggiornate ogni pochi secondi.' },
   followups: { title: 'Follow-up', subtitle: 'Contatti da richiamare o gestire a mano: chiamate non risposte, rifiuti, disdette e trasferimenti.' },
-  callresults: { title: 'Esiti Voicebot', subtitle: 'Esito, trascrizione e riassunto AI di ogni chiamata gestita dal voicebot.' },
+  callresults: { title: 'Esiti Chiamate', subtitle: 'Esito, trascrizione e riassunto AI di ogni chiamata gestita dal voicebot.' },
   profile: { title: 'Il Mio Profilo', subtitle: 'Gestisci le tue informazioni di contatto e le impostazioni del tuo account.' },
   support: { title: 'Assistenza', subtitle: 'Invia una richiesta direttamente al nostro team tecnico o amministrativo.' },
   stats: { title: 'Statistiche', subtitle: 'Chiamate, risposte, follow-up e campagne per periodo, uguali su ogni dispositivo.' },
@@ -136,7 +138,7 @@ export function Dashboard() {
   const viewerHiddenTabs: Tab[] = ['campaign', 'appointments', 'lists', 'live'];
   const linkTab = urlTab && urlTab in TAB_META && !(isViewer && viewerHiddenTabs.includes(urlTab)) ? urlTab : null;
   const savedTab = sessionStorage.getItem('gem_active_tab') as Tab | null;
-  const [activeTab, setActiveTab] = useState<Tab>(linkTab || savedTab || (isViewer ? 'history' : 'campaign'));
+  const [activeTab, setActiveTab] = useState<Tab>(linkTab || savedTab || (isViewer ? 'callresults' : 'campaign'));
 
   // Tolto ?tab= dall'indirizzo dopo l'apertura, così un ricaricamento non lo riapplica.
   React.useEffect(() => {
@@ -210,6 +212,31 @@ export function Dashboard() {
     if (activeTab === 'campaign') setCampaignType('standard');
   }, [activeTab]);
 
+  // Contatori del menu: follow-up da gestire e campagne in corso (In diretta).
+  // Aggiornati ogni minuto e quando si cambia pagina.
+  const [followupCount, setFollowupCount] = useState(0);
+  const [liveActive, setLiveActive] = useState(false);
+  React.useEffect(() => {
+    let stopped = false;
+    const refresh = async () => {
+      if (document.visibilityState !== 'visible') return;
+      try {
+        const r = await authFetch('/api/followups?stato=pending');
+        const d = await r.json();
+        if (!stopped && r.ok && d.ok) setFollowupCount((d.followups || []).length);
+      } catch { /* il contatore è solo un aiuto: si riprova al prossimo giro */ }
+      if (isViewer) return;
+      try {
+        const r = await authFetch('/api/live?hours=12');
+        const d = await r.json();
+        if (!stopped && r.ok && d.ok) setLiveActive((d.campaigns || []).some((c: any) => c.in_coda > 0 || c.avviate > 0));
+      } catch { /* come sopra */ }
+    };
+    refresh();
+    const t = window.setInterval(refresh, 60000);
+    return () => { stopped = true; window.clearInterval(t); };
+  }, [activeTab, isViewer]);
+
   // Titolo pagina dinamico
   React.useEffect(() => {
     const meta = TAB_META[activeTab];
@@ -281,7 +308,20 @@ export function Dashboard() {
                         >
                           <Icon className="w-4 h-4 shrink-0" />
                           <span className="flex-1">{item.label}</span>
-                          {active && <ChevronRight className="w-3.5 h-3.5 opacity-70" />}
+                          {item.badge === 'followups' && followupCount > 0 && (
+                            <span className={cn('min-w-5 h-5 px-1.5 rounded-full text-[11px] font-bold flex items-center justify-center tabular-nums',
+                              active ? 'bg-white/20 text-white' : 'bg-amber-100 text-amber-800 dark:bg-amber-500/20 dark:text-amber-300')}
+                              title={`${followupCount} da gestire`}>
+                              {followupCount > 99 ? '99+' : followupCount}
+                            </span>
+                          )}
+                          {item.badge === 'live' && liveActive && (
+                            <span className="relative flex h-2 w-2" title="Campagna in corso">
+                              <span className="absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75 animate-ping" />
+                              <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500" />
+                            </span>
+                          )}
+                          {active && !item.badge && <ChevronRight className="w-3.5 h-3.5 opacity-70" />}
                         </button>
                       );
                     })}
@@ -291,44 +331,53 @@ export function Dashboard() {
             })}
           </nav>
 
-          {/* User + actions */}
-          <div className="border-t border-slate-200 dark:border-slate-800 p-3 shrink-0">
-            {/* Wildix status */}
-            <div className="flex items-center gap-2 px-3 py-2 mb-2">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0 animate-pulse" />
-              <span className="text-xs font-medium text-slate-500 uppercase tracking-wider">Wildix · Attivo</span>
-            </div>
-            {/* User row */}
-            <div className="flex items-center gap-3 px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800/50 mb-2">
+          {/* Account: scheda utente (apre il profilo) e azioni */}
+          <div className="border-t border-slate-200 dark:border-slate-800 p-3 shrink-0 space-y-2">
+            <button
+              onClick={() => handleNav('profile')}
+              title="Il mio profilo"
+              className={cn(
+                "w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left transition-colors",
+                activeTab === 'profile' ? "bg-brand-50 dark:bg-brand-500/15 ring-1 ring-brand-200 dark:ring-brand-500/30" : "bg-slate-50 dark:bg-slate-800/50 hover:bg-slate-100 dark:hover:bg-slate-800"
+              )}
+            >
               <div className="w-8 h-8 rounded-full bg-brand-100 dark:bg-brand-500/25 flex items-center justify-center text-xs font-bold text-brand-700 dark:text-brand-200 uppercase shrink-0">
                 {user?.nome?.charAt(0)}
               </div>
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-semibold text-slate-900 dark:text-white truncate">{user?.nome}</div>
-                <div className="text-xs text-slate-500 truncate">{user?.role || 'Editor'}</div>
+                <div className="text-xs text-slate-500 truncate">{user?.role || 'Editor'} · Profilo</div>
               </div>
-            </div>
-            {/* Guida utente in PDF (file in public/) */}
-            <a
-              href="/guida-gem-outbound.pdf"
-              download="GEM-Outbound-Guida-utente.pdf"
-              className="mb-2 flex items-center justify-center gap-2 py-2 text-xs font-semibold text-brand-600 dark:text-brand-400 bg-brand-50 dark:bg-brand-900/20 hover:bg-brand-100 dark:hover:bg-brand-900/40 rounded-lg transition-colors"
-            >
-              <BookOpen className="w-3.5 h-3.5" />
-              Guida utente (PDF)
-            </a>
-            {/* Theme + logout */}
-            <div className="flex gap-2">
+              <ChevronRight className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+            </button>
+            <div className="grid grid-cols-2 gap-1">
+              <button
+                onClick={() => handleNav('support')}
+                className={cn("flex items-center justify-center gap-1.5 py-2 text-xs font-semibold rounded-lg transition-colors",
+                  activeTab === 'support' ? "bg-brand-600 text-white" : "text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800")}
+              >
+                <LifeBuoy className="w-3.5 h-3.5" />
+                Assistenza
+              </button>
+              {/* Guida utente in PDF (file in public/) */}
+              <a
+                href="/guida-gem-outbound.pdf"
+                download="GEM-Outbound-Guida-utente.pdf"
+                className="flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
+              >
+                <BookOpen className="w-3.5 h-3.5" />
+                Guida PDF
+              </a>
               <button
                 onClick={toggleTheme}
-                className="flex-1 flex items-center justify-center gap-2 py-2 text-xs font-semibold text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
+                className="flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
               >
                 {darkMode ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
-                {darkMode ? 'Chiaro' : 'Scuro'}
+                {darkMode ? 'Tema chiaro' : 'Tema scuro'}
               </button>
               <button
                 onClick={() => setConfirmLogout(true)}
-                className="flex-1 flex items-center justify-center gap-2 py-2 text-xs font-semibold text-slate-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
+                className="flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-slate-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
               >
                 <LogOut className="w-3.5 h-3.5" />
                 Esci
