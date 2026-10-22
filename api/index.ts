@@ -1320,16 +1320,19 @@ app.put("/api/me", requireAuth, async (req: any, res) => {
 });
 
 // ── VOICEBOT ENDPOINTS ──
-app.get("/api/voicebots", requireAuth, async (_req, res) => {
-  res.json({ ok: true, voicebots: await readVoicebots() });
+app.get("/api/voicebots", requireAuth, async (req: any, res) => {
+  const bots = await readVoicebots();
+  // Il webhook esiti lo vedono solo gli Admin: chi ha l'indirizzo può scrivere nello Sheets.
+  res.json({ ok: true, voicebots: req.session?.isAdmin ? bots : bots.map(({ webhookEsiti, ...b }: any) => b) });
 });
 
 app.post("/api/voicebots", requireAuth, requireAdmin, async (req, res) => {
-  const { nome, exten, context, descrizione } = req.body;
+  const { nome, exten, context, descrizione, webhookEsiti } = req.body;
   if (!nome || !exten || !context) return res.status(400).json({ ok: false, error: "Nome, interno e contesto sono obbligatori" });
+  if (webhookEsiti && !webhookEsitiValido(webhookEsiti)) return res.status(400).json({ ok: false, error: "Webhook esiti non valido: incolla l'indirizzo del webhook Make (https://hook...make.com/...)" });
   const bots = await readVoicebots();
   const id = `vb${Date.now()}`;
-  bots.push({ id, nome, exten: parseInt(exten), context, descrizione: descrizione || "", attivo: true });
+  bots.push({ id, nome, exten: parseInt(exten), context, descrizione: descrizione || "", attivo: true, webhookEsiti: webhookEsitiValido(webhookEsiti) || "" });
   try {
     await writeVoicebots(bots);
     res.json({ ok: true, id });
@@ -1342,7 +1345,11 @@ app.put("/api/voicebots/:id", requireAuth, requireAdmin, async (req, res) => {
   const bots = await readVoicebots();
   const idx = bots.findIndex((b: any) => b.id === req.params.id);
   if (idx === -1) return res.status(404).json({ ok: false, error: "Voicebot non trovato" });
+  if (req.body?.webhookEsiti && !webhookEsitiValido(req.body.webhookEsiti)) {
+    return res.status(400).json({ ok: false, error: "Webhook esiti non valido: incolla l'indirizzo del webhook Make (https://hook...make.com/...)" });
+  }
   bots[idx] = { ...bots[idx], ...req.body, id: req.params.id };
+  if ("webhookEsiti" in (req.body || {})) bots[idx].webhookEsiti = webhookEsitiValido(req.body.webhookEsiti) || "";
   try {
     await writeVoicebots(bots);
     res.json({ ok: true });
@@ -1668,7 +1675,10 @@ async function sendCampaignToMake(spec: CampaignSpec) {
   // Numero → nome, per mostrare il nome reale negli Esiti Chiamate.
   // In modalità test non si scrive nel database.
   if (sentContacts.length > 0 && !dryRun) await upsertContactNames(sentContacts);
-  if (liveId) await recordLiveCalls(liveId, chunks, results);
+  if (liveId) {
+    await recordLiveCalls(liveId, chunks, results);
+    if (results.some(ok => !ok)) await inviaEsitiFalliti(liveId);
+  }
   return { dryRun, sentContacts, failedContacts, chunksOk: results.filter(Boolean).length, chunksTotal: chunks.length };
 }
 
@@ -1760,6 +1770,7 @@ function ensureLiveSchema(): Promise<void> {
         )
       `;
       await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS voicebot_exten TEXT`;
+      await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS webhook_esiti TEXT`;
       await sql!`
         CREATE TABLE IF NOT EXISTS live_calls (
           id          SERIAL PRIMARY KEY,
@@ -1774,6 +1785,7 @@ function ensureLiveSchema(): Promise<void> {
           updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
         )
       `;
+      await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS esito_inviato BOOLEAN NOT NULL DEFAULT false`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_numero ON live_calls (numero, queued_at DESC)`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_campaign ON live_calls (campaign_id)`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_updated ON live_calls (updated_at DESC)`;
@@ -1791,9 +1803,10 @@ async function createLiveCampaign(spec: CampaignSpec): Promise<number | null> {
   try {
     await ensureLiveSchema();
     const rows = (await sql`
-      INSERT INTO live_campaigns (username, operatore, tipo_campagna, voicebot_nome, voicebot_exten, totale, scheduled_id)
+      INSERT INTO live_campaigns (username, operatore, tipo_campagna, voicebot_nome, voicebot_exten, totale, scheduled_id, webhook_esiti)
       VALUES (${spec.username || null}, ${spec.operatore || null}, ${spec.campaignType}, ${spec.bot?.nome || null},
-              ${spec.bot?.exten != null ? String(spec.bot.exten) : null}, ${spec.contacts.length}, ${spec.scheduledId ?? null})
+              ${spec.bot?.exten != null ? String(spec.bot.exten) : null}, ${spec.contacts.length}, ${spec.scheduledId ?? null},
+              ${webhookEsitiValido(spec.bot?.webhookEsiti)})
       RETURNING id
     `) as any[];
     return rows[0]?.id ?? null;
@@ -1825,6 +1838,77 @@ async function recordLiveCalls(campaignId: number, chunks: LaunchContact[][], re
   }
 }
 
+// ── Esiti delle chiamate non riuscite verso lo Sheets del voicebot ──
+// Il voicebot scrive l'esito con il suo tool (es. salva_lead) solo quando parla
+// con il cliente. Le chiamate rifiutate, senza risposta o in errore non
+// arrivano mai al bot: le invia il sito allo stesso webhook Make, se il
+// voicebot ne ha uno configurato ("Webhook esiti" in Voicebot). Ogni chiamata
+// viene inviata una sola volta (colonna esito_inviato).
+const LIVE_STATI_FALLITI = ["non_partita", "non_risposta", "errore"];
+
+function webhookEsitiValido(url: unknown): string | null {
+  const u = String(url || "").trim();
+  return /^https:\/\/hook\.[a-z0-9.-]+\.make\.com\/[A-Za-z0-9]+$/.test(u) ? u : null;
+}
+
+function esitoFallitoPerSheets(stato: string, errore: string | null) {
+  if (stato === "errore") {
+    return { esito: "ERRORE", riepilogo: `Chiamata non partita per un errore tecnico${errore ? `: ${errore}` : ""}.` };
+  }
+  if (stato === "non_risposta") {
+    return { esito: "NON_RAGGIUNTO", riepilogo: "Il telefono ha squillato ma nessuno ha risposto." };
+  }
+  return {
+    esito: "NON_RAGGIUNTO",
+    riepilogo: errore === "Rifiutata, occupato o senza risposta" || !errore
+      ? "Chiamata rifiutata, occupato o senza risposta."
+      : `Chiamata non partita: ${errore}.`,
+  };
+}
+
+async function inviaEsitiFalliti(campaignId: number | null | undefined) {
+  if (!sql || !campaignId) return;
+  try {
+    // Prima si segnano come inviate (una sola richiesta vince), poi si inviano.
+    const rows = (await sql`
+      UPDATE live_calls l SET esito_inviato = true
+      FROM live_campaigns c
+      WHERE l.campaign_id = ${campaignId} AND c.id = l.campaign_id
+        AND c.webhook_esiti IS NOT NULL AND l.esito_inviato = false
+        AND l.stato = ANY(${LIVE_STATI_FALLITI}::text[])
+      RETURNING l.numero, l.nome, l.stato, l.errore, c.webhook_esiti
+    `) as any[];
+    await Promise.all(rows.map(async row => {
+      const { esito, riepilogo } = esitoFallitoPerSheets(row.stato, row.errore);
+      const body = {
+        esito,
+        nome: row.nome || "non indicato",
+        azienda: "non indicato",
+        ruolo: "non indicato",
+        numero: row.numero,
+        fascia: "non indicato",
+        esigenza: "non indicato",
+        email: "non indicato",
+        riepilogo,
+        note: "Registrato da GEM Outbound: il voicebot non ha parlato con il cliente.",
+      };
+      try {
+        const r = await fetch(row.webhook_esiti, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!r.ok) console.error("Webhook esiti: risposta", r.status, "per", row.numero);
+      } catch (err) {
+        console.error("Webhook esiti non raggiunto per", row.numero, err);
+      }
+    }));
+  } catch (err) {
+    console.error("Errore invio esiti non riusciti (non bloccante):", err);
+  }
+}
+
 // Fine chiamata (webhook Wildix): aggiorna la chiamata aperta verso quel numero.
 // Si considerano solo le chiamate partite dalle campagne del sito. Se l'evento
 // Wildix contiene l'interno del voicebot, si sceglie la campagna con quel bot,
@@ -1835,7 +1919,7 @@ async function markLiveCallCompleted(numero: string | null, risposto: boolean, d
   try {
     await ensureLiveSchema();
     const open = (await sql`
-      SELECT l.id, c.voicebot_exten
+      SELECT l.id, l.campaign_id, c.voicebot_exten
       FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
       WHERE l.numero = ${numero} AND l.stato = ANY(${LIVE_STATI_CORREGGIBILI}::text[]) AND l.queued_at > now() - interval '12 hours'
       ORDER BY l.queued_at DESC
@@ -1847,6 +1931,7 @@ async function markLiveCallCompleted(numero: string | null, risposto: boolean, d
       UPDATE live_calls SET stato = ${stato}, durata_ms = ${durataMs}, call_id = ${callId}, errore = NULL, updated_at = now()
       WHERE id = ${target.id}
     `;
+    if (stato === "non_risposta") await inviaEsitiFalliti(target.campaign_id);
   } catch (err) {
     console.error("Errore aggiornamento chiamata in diretta (non bloccante):", err);
   }
@@ -1904,8 +1989,9 @@ app.post("/api/live/make-event", express.json({ limit: "20kb" }), express.urlenc
           AND queued_at > now() - interval '12 hours'
         ORDER BY queued_at ASC LIMIT 1
       )
-      RETURNING id
+      RETURNING id, campaign_id
     `) as any[];
+    if (updated.length > 0 && stato !== "avviata") await inviaEsitiFalliti(updated[0].campaign_id);
     // Nessuna corrispondenza: chiamata non partita da una campagna del sito
     // (es. "Testa chiamata singola"). Non la registriamo.
     res.json({ ok: true, registrata: updated.length > 0 });

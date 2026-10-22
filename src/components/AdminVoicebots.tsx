@@ -31,7 +31,7 @@ export function AdminVoicebots() {
   const [status, setStatus] = useState<{ type: 'ok' | 'err'; msg: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<Voicebot | null>(null);
 
-  const emptyForm = { nome: '', exten: '', context: 'outbound-voicebot', descrizione: '', attivo: true };
+  const emptyForm = { nome: '', exten: '', context: 'outbound-voicebot', descrizione: '', attivo: true, webhookEsiti: '' };
   const [form, setForm] = useState<any>(emptyForm);
 
   const load = async () => {
@@ -116,7 +116,7 @@ export function AdminVoicebots() {
 
   const startEdit = (bot: Voicebot) => {
     setEditId(bot.id);
-    setForm({ nome: bot.nome, exten: String(bot.exten), context: bot.context, descrizione: bot.descrizione || '', attivo: bot.attivo });
+    setForm({ nome: bot.nome, exten: String(bot.exten), context: bot.context, descrizione: bot.descrizione || '', attivo: bot.attivo, webhookEsiti: bot.webhookEsiti || '' });
     setShowNew(false);
   };
 
@@ -152,6 +152,7 @@ export function AdminVoicebots() {
                 <FormRow label="Interno Wildix (exten)" field="exten" placeholder="Es. 8000" type="number" form={form} setForm={setForm} />
                 {isAdmin && <FormRow label="Contesto (context)" field="context" placeholder="outbound-voicebot" form={form} setForm={setForm} />}
                 <FormRow label="Descrizione (facoltativa)" field="descrizione" placeholder="Es. Sondaggio post-vendita" form={form} setForm={setForm} />
+                {isAdmin && <FormRow label="Webhook esiti (facoltativo)" field="webhookEsiti" placeholder="https://hook.eu1.make.com/..." form={form} setForm={setForm} />}
               </div>
               <div className="flex gap-2">
                 <button onClick={handleSaveNew} className="flex items-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold rounded-xl transition-colors">
@@ -185,6 +186,7 @@ export function AdminVoicebots() {
                         <FormRow label="Interno (exten)" field="exten" placeholder="8000" type="number" form={form} setForm={setForm} />
                         {isAdmin && <FormRow label="Contesto" field="context" placeholder="outbound-voicebot" form={form} setForm={setForm} />}
                         <FormRow label="Descrizione" field="descrizione" placeholder="Facoltativa" form={form} setForm={setForm} />
+                        {isAdmin && <FormRow label="Webhook esiti" field="webhookEsiti" placeholder="https://hook.eu1.make.com/... (facoltativo)" form={form} setForm={setForm} />}
                       </div>
                       <div className="flex gap-2">
                         <button onClick={() => handleSaveEdit(bot.id)} className="flex items-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold rounded-xl transition-colors">
@@ -211,6 +213,7 @@ export function AdminVoicebots() {
                           Interno: <span className="font-mono font-semibold">{bot.exten}</span>
                           {isAdmin && <><span className="mx-2">·</span>Context: <span className="font-mono">{bot.context}</span></>}
                           {bot.descrizione && <><span className="mx-2">·</span>{bot.descrizione}</>}
+                          {isAdmin && bot.webhookEsiti && <><span className="mx-2">·</span>Esiti non riusciti nello Sheets</>}
                         </div>
                       </div>
                       <div className="flex items-center gap-1">

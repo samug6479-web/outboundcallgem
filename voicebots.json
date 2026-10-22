@@ -53,6 +53,7 @@
     "exten": 1010,
     "context": "outbound-voicebot",
     "descrizione": "",
-    "attivo": true
+    "attivo": true,
+    "webhookEsiti": "https://hook.eu1.make.com/tcwm1ljwteqfkfi7k9cokb9f6cyp84ut"
   }
 ]

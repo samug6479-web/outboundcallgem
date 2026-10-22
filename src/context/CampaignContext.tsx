@@ -10,6 +10,7 @@ export interface Voicebot {
   context: string;
   descrizione?: string;
   attivo: boolean;
+  webhookEsiti?: string;
 }
 
 export interface User {
