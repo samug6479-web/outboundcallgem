@@ -130,8 +130,18 @@ export function Dashboard() {
   const pendingScheduled = scheduledCampaigns.filter(c => c.status === 'pending').length;
   const isAdmin = user?.isAdmin || user?.role === 'Admin';
   const isViewer = user?.role === 'Viewer';
+  // ?tab=... nell'indirizzo (es. il pulsante "Segui in diretta" dell'email)
+  // ha la precedenza sulla scheda ricordata. I Viewer non aprono pagine a loro nascoste.
+  const urlTab = new URLSearchParams(window.location.search).get('tab') as Tab | null;
+  const viewerHiddenTabs: Tab[] = ['campaign', 'appointments', 'lists', 'live'];
+  const linkTab = urlTab && urlTab in TAB_META && !(isViewer && viewerHiddenTabs.includes(urlTab)) ? urlTab : null;
   const savedTab = sessionStorage.getItem('gem_active_tab') as Tab | null;
-  const [activeTab, setActiveTab] = useState<Tab>(savedTab || (isViewer ? 'history' : 'campaign'));
+  const [activeTab, setActiveTab] = useState<Tab>(linkTab || savedTab || (isViewer ? 'history' : 'campaign'));
+
+  // Tolto ?tab= dall'indirizzo dopo l'apertura, così un ricaricamento non lo riapplica.
+  React.useEffect(() => {
+    if (urlTab) window.history.replaceState(null, '', window.location.pathname + window.location.hash);
+  }, []);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [show2FABanner, setShow2FABanner] = useState(false);
   const [enabling2FA, setEnabling2FA] = useState(false);

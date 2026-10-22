@@ -1449,7 +1449,10 @@ async function sendCampaignEmail(opts: {
   const titolo = pianificata ? 'Campagna pianificata' : 'Campagna avviata';
   const intro = pianificata
     ? `la campagna partirà da sola all'orario indicato. Puoi annullarla dalla dashboard fino alla partenza.`
-    : `il voicebot sta chiamando i contatti. Gli esiti arrivano nella dashboard man mano che le chiamate si chiudono.`;
+    : `il voicebot sta chiamando i contatti. Puoi seguire ogni chiamata in diretta dal sito.`;
+  // Il pulsante apre direttamente la pagina giusta (?tab=...)
+  const ctaUrl = `${appUrl}/?tab=${pianificata ? 'campaign' : 'live'}`;
+  const ctaLabel = pianificata ? 'Vedi le campagne pianificate' : 'Segui in diretta';
 
   // Valori in chiaro: l'escape HTML si fa solo quando si costruisce l'HTML.
   const dati: [string, string][] = [
@@ -1489,11 +1492,13 @@ async function sendCampaignEmail(opts: {
   <tr><td style="padding:8px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">
     ${pianificata
       ? step(1, "All'orario indicato", 'la campagna parte da sola, senza bisogno della tua presenza.')
-      : step(1, 'Le chiamate partono', "una dopo l'altra, gestite dal voicebot.")}
-    ${step(2, 'Esiti Voicebot', 'mostra esito, trascrizione e riassunto di ogni chiamata.')}
+      : step(1, 'In diretta', 'mostra la coda, le chiamate in corso e gli esiti, aggiornati ogni pochi secondi.')}
+    ${pianificata
+      ? step(2, 'In diretta', 'dalla partenza mostra la coda, le chiamate in corso e gli esiti.')
+      : step(2, 'Esiti Voicebot', 'mostra esito, trascrizione e riassunto di ogni chiamata.')}
     ${step(3, 'Follow-up', 'raccoglie chi non ha risposto o va richiamato.')}
   </table></td></tr>
-  <tr><td style="padding:12px 40px 34px;"><a href="${appUrl}" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:14px 20px;border-radius:9px;">${pianificata ? 'Vedi le campagne pianificate' : 'Apri la dashboard'}</a></td></tr>
+  <tr><td style="padding:12px 40px 34px;"><a href="${ctaUrl}" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:14px 20px;border-radius:9px;">${ctaLabel}</a></td></tr>
   <tr><td style="padding:18px 40px;border-top:1px solid #eef1f6;font-size:12px;color:#94a3b8;line-height:1.6;">GEM Group &middot; Soluzioni di comunicazione e automazione AI su tecnologia Wildix<br>Email automatica inviata da GEM Outbound.</td></tr>
 </table></div>`;
 
@@ -1507,7 +1512,7 @@ async function sendCampaignEmail(opts: {
     ...dati.map(([k, v]) => `${k}: ${v}`),
     ...(note ? ['', `Note: ${note}`] : []),
     '',
-    `Apri la dashboard: ${appUrl}`,
+    `${ctaLabel}: ${ctaUrl}`,
   ].join('\n');
 
   try {
@@ -1725,12 +1730,18 @@ async function logCampaign(entry: {
 // IN DIRETTA
 // Stato di ogni chiamata lanciata dal sito, per la pagina "In diretta":
 //   in_coda      → inviata a Make
-//   avviata      → Make ha chiesto la chiamata a Wildix (Originate) e Wildix l'ha accettata
-//   errore       → Wildix ha rifiutato la richiesta, o l'invio a Make è fallito
-//   risposta / interrotta / non_risposta → chiamata conclusa (webhook Wildix)
+//   avviata      → Wildix ha accettato la chiamata (Originate riuscito)
+//   non_partita  → Wildix ha risposto all'Originate con un errore. L'Originate
+//                  aspetta la risposta del cliente, quindi qui finiscono anche
+//                  le chiamate rifiutate, occupate o senza risposta
+//   errore       → Make non ha raggiunto Wildix, o l'invio a Make è fallito
+//   risposta / interrotta / non_risposta → chiamata conclusa (webhook Wildix),
+//                  che ha sempre l'ultima parola sugli stati precedenti
 // Make avvisa il sito dopo ogni Originate (POST /api/live/make-event).
 // ══════════════════════════════════════════════════════════════
 const LIVE_STATI_APERTI = ["in_coda", "avviata"];
+// Stati che il webhook Wildix di fine chiamata può ancora correggere.
+const LIVE_STATI_CORREGGIBILI = ["in_coda", "avviata", "non_partita", "errore"];
 
 let liveSchemaReady: Promise<void> | null = null;
 function ensureLiveSchema(): Promise<void> {
@@ -1826,7 +1837,7 @@ async function markLiveCallCompleted(numero: string | null, risposto: boolean, d
     const open = (await sql`
       SELECT l.id, c.voicebot_exten
       FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
-      WHERE l.numero = ${numero} AND l.stato = ANY(${LIVE_STATI_APERTI}::text[]) AND l.queued_at > now() - interval '12 hours'
+      WHERE l.numero = ${numero} AND l.stato = ANY(${LIVE_STATI_CORREGGIBILI}::text[]) AND l.queued_at > now() - interval '12 hours'
       ORDER BY l.queued_at DESC
     `) as any[];
     if (open.length === 0) return;
@@ -1848,7 +1859,7 @@ function safeEqual(a: string, b: string): boolean {
 
 // Make → sito, dopo ogni richiesta di chiamata a Wildix (Originate).
 // Protetto dallo stesso segreto che il sito invia a Make (MAKE_WEBHOOK_SECRET).
-app.post("/api/live/make-event", express.json({ limit: "20kb" }), async (req, res) => {
+app.post("/api/live/make-event", express.json({ limit: "20kb" }), express.urlencoded({ extended: false, limit: "20kb" }), async (req, res) => {
   const secret = process.env.MAKE_WEBHOOK_SECRET;
   const given = String(req.headers["x-gem-secret"] || "");
   if (!secret || !safeEqual(given, secret)) return res.status(401).json({ ok: false });
@@ -1857,9 +1868,26 @@ app.post("/api/live/make-event", express.json({ limit: "20kb" }), async (req, re
   const numero = normalizePhone(String(req.body?.numero || ""));
   if (!numero) return res.status(400).json({ ok: false, error: "numero mancante" });
   const campaignId = parseInt(String(req.body?.campagna_id || ""), 10) || null;
-  const errore = req.body?.esito === "errore";
-  const dettaglio = errore ? cleanText(req.body?.dettaglio, 300) || "Richiesta di chiamata rifiutata" : null;
-  const stato = errore ? "errore" : "avviata";
+  // Due forme: { esito: "ok" | "errore", dettaglio } oppure la risposta di
+  // Wildix all'Originate { status, tipo, risultato, motivo, testo }.
+  const status = parseInt(String(req.body?.status || ""), 10) || null;
+  let stato: string;
+  let dettaglio: string | null = null;
+  if (req.body?.esito === "errore") {
+    stato = "errore";
+    dettaglio = cleanText(req.body?.dettaglio, 300) || "Make non ha raggiunto Wildix";
+  } else if (status !== null) {
+    const tipo = String(req.body?.tipo || "").toLowerCase();
+    const ok = status >= 200 && status < 300 && tipo !== "error";
+    stato = ok ? "avviata" : "non_partita";
+    if (!ok) {
+      const testo = [req.body?.motivo, req.body?.risultato, req.body?.testo]
+        .map(v => cleanText(v, 200)).filter(v => v && v !== "[object Object]")[0];
+      dettaglio = `Wildix ${status}${testo ? `: ${testo}` : ""}`.slice(0, 300);
+    }
+  } else {
+    stato = "avviata";
+  }
 
   try {
     await ensureLiveSchema();
@@ -1902,6 +1930,7 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
         count(*) FILTER (WHERE l.stato = 'risposta')::int     AS risposte,
         count(*) FILTER (WHERE l.stato = 'interrotta')::int   AS interrotte,
         count(*) FILTER (WHERE l.stato = 'non_risposta')::int AS non_risposte,
+        count(*) FILTER (WHERE l.stato = 'non_partita')::int  AS non_partite,
         count(*) FILTER (WHERE l.stato = 'errore')::int       AS errori,
         max(l.updated_at) AS ultimo_aggiornamento,
         max(l.updated_at) FILTER (WHERE l.stato <> 'in_coda') AS ultimo_avanzamento

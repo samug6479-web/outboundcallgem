@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Radio, RefreshCw, AlertTriangle, PhoneCall, PhoneOff, PhoneMissed, Phone, Clock, XCircle, ChevronDown } from 'lucide-react';
+import { Radio, RefreshCw, AlertTriangle, PhoneCall, PhoneOff, PhoneMissed, PhoneForwarded, Phone, Clock, XCircle, ChevronDown } from 'lucide-react';
 import { authFetch } from '../lib/authFetch';
 import { useCampaign } from '../context/CampaignContext';
 import { cn } from '../lib/utils';
@@ -19,6 +19,7 @@ interface LiveCampaign {
   risposte: number;
   interrotte: number;
   non_risposte: number;
+  non_partite: number;
   errori: number;
   ultimo_aggiornamento: string | null;
   ultimo_avanzamento: string | null;
@@ -38,7 +39,7 @@ interface LiveEvent {
   voicebot_nome: string | null;
 }
 
-type Stato = 'in_coda' | 'avviata' | 'risposta' | 'interrotta' | 'non_risposta' | 'errore';
+type Stato = 'in_coda' | 'avviata' | 'risposta' | 'interrotta' | 'non_risposta' | 'non_partita' | 'errore';
 
 const POLL_MS = 4000;
 // Oltre questi minuti senza avanzamenti la coda viene segnalata come ferma.
@@ -52,6 +53,8 @@ const STATI: Record<Stato, { label: string; color: string; bar: string; icon: Re
   risposta: { label: 'Risposto', color: 'text-green-600 dark:text-green-400', bar: 'bg-green-500', icon: Phone },
   interrotta: { label: 'Interrotta', color: 'text-amber-600 dark:text-amber-400', bar: 'bg-amber-500', icon: PhoneOff },
   non_risposta: { label: 'Non risposto', color: 'text-slate-500 dark:text-slate-400', bar: 'bg-slate-400', icon: PhoneMissed },
+  // Wildix non ha completato la chiamata: rifiutata, occupato, nessuna risposta o numero non raggiungibile
+  non_partita: { label: 'Non partita', color: 'text-orange-600 dark:text-orange-400', bar: 'bg-orange-400', icon: PhoneForwarded },
   errore: { label: 'Errore', color: 'text-red-600 dark:text-red-400', bar: 'bg-red-500', icon: XCircle },
 };
 
@@ -118,7 +121,7 @@ export function LiveSection() {
     in_coda: a.in_coda + c.in_coda,
     avviate: a.avviate + c.avviate,
     risposte: a.risposte + c.risposte,
-    non_risposte: a.non_risposte + c.non_risposte + c.interrotte,
+    non_risposte: a.non_risposte + c.non_risposte + c.interrotte + c.non_partite,
     errori: a.errori + c.errori,
   }), { in_coda: 0, avviate: 0, risposte: 0, non_risposte: 0, errori: 0 });
 
@@ -127,8 +130,12 @@ export function LiveSection() {
   for (const c of campaigns) {
     const nome = `${c.operatore || 'Campagna'} · ${c.voicebot_nome || 'voicebot predefinito'}`;
     const gestite = c.registrate - c.in_coda;
+    const riuscite = c.avviate + c.risposte + c.interrotte + c.non_risposte;
     if (c.errori >= 3 && c.errori / Math.max(gestite, 1) >= 0.5) {
       avvisi.push({ id: `e${c.id}`, tone: 'red', text: `${nome}: ${c.errori} chiamate in errore su ${gestite}. Controlla lo scenario Make e il voicebot.` });
+    } else if (riuscite === 0 && c.non_partite + c.errori >= 5) {
+      // Nessuna chiamata partita: più probabile un problema di configurazione che 5 rifiuti di fila
+      avvisi.push({ id: `n${c.id}`, tone: 'red', text: `${nome}: nessuna delle prime ${c.non_partite + c.errori} chiamate è partita. Controlla il voicebot e lo scenario Make.` });
     }
     const ultimo = c.ultimo_avanzamento || c.created_at;
     if (c.in_coda > 0 && minutiDa(ultimo, now) > CODA_FERMA_MIN) {
@@ -215,7 +222,7 @@ export function LiveSection() {
             const gestite = c.registrate - c.in_coda;
             const parts: [Stato, number][] = [
               ['risposta', c.risposte], ['interrotta', c.interrotte], ['non_risposta', c.non_risposte],
-              ['errore', c.errori], ['avviata', c.avviate], ['in_coda', c.in_coda],
+              ['non_partita', c.non_partite], ['errore', c.errori], ['avviata', c.avviate], ['in_coda', c.in_coda],
             ];
             const finita = c.in_coda === 0 && c.avviate === 0;
             return (
@@ -315,7 +322,7 @@ export function LiveSection() {
                           {e.durata_ms ? ` · ${durata(e.durata_ms)}` : ''}
                           {e.voicebot_nome ? ` · ${e.voicebot_nome}` : ''}
                         </div>
-                        {e.errore && <div className="text-xs text-red-600 dark:text-red-400 mt-0.5">{e.errore}</div>}
+                        {e.errore && <div className={cn('text-xs mt-0.5', e.stato === 'errore' ? 'text-red-600 dark:text-red-400' : 'text-slate-500')}>{e.errore}</div>}
                       </div>
                     </li>
                   );
@@ -329,6 +336,8 @@ export function LiveSection() {
       <p className="text-xs text-slate-500">
         Mostra solo le chiamate partite dalle campagne lanciate da questo sito, ciascuna con il voicebot scelto per la campagna.
         "In corso" significa che Wildix ha accettato la chiamata: l'esito arriva quando la chiamata finisce.
+        "Non partita": Wildix non ha completato la chiamata (rifiutata, occupato, nessuna risposta o numero non raggiungibile).
+        "Errore": la richiesta non è arrivata a Wildix.
       </p>
 
       {/* Diagnostica (solo admin): eventi Wildix non usati */}
