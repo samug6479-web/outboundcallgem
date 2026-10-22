@@ -19,9 +19,15 @@ export function ContactLists({ onSelectProcess }: { onSelectProcess: () => void 
   // Stato per la modale di conferma eliminazione (Evita l'errore di riferimento)
   const [confirmDeleteList, setConfirmDeleteList] = useState<string | null>(null);
 
+  const [dragOver, setDragOver] = useState(false);
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (file) handleFile(file);
+  };
+
+  // Usata sia dal selettore file sia dal trascinamento.
+  const handleFile = (file: File) => {
 
     const reader = new FileReader();
     
@@ -156,9 +162,20 @@ export function ContactLists({ onSelectProcess }: { onSelectProcess: () => void 
                     ref={fileInputRef}
                     className="hidden"
                   />
-                  <label 
+                  <label
                     htmlFor="listUpload"
-                    className="flex flex-col items-center justify-center gap-3 w-full px-4 py-10 border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-brand-500 dark:hover:border-brand-500 rounded-xl cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors text-sm font-medium text-slate-600 dark:text-slate-300 text-center"
+                    onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+                    onDragLeave={() => setDragOver(false)}
+                    onDrop={e => {
+                      e.preventDefault();
+                      setDragOver(false);
+                      const file = e.dataTransfer.files?.[0];
+                      if (file) handleFile(file);
+                    }}
+                    className={cn("flex flex-col items-center justify-center gap-3 w-full px-4 py-10 border-2 border-dashed rounded-xl cursor-pointer transition-colors text-sm font-medium text-slate-600 dark:text-slate-300 text-center",
+                      dragOver
+                        ? "border-brand-500 bg-brand-50 dark:bg-brand-500/10"
+                        : "border-slate-300 dark:border-slate-700 hover:border-brand-500 dark:hover:border-brand-500 hover:bg-slate-50 dark:hover:bg-slate-800/50")}
                   >
                     <UploadCloud className="w-8 h-8 text-brand-500 mb-2" />
                     <span className="font-bold text-base">{tempContacts.length > 0 ? "File caricato!" : "Scegli un file o trascinalo qui"}</span>
