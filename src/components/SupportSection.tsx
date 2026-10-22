@@ -177,26 +177,27 @@ export function SupportSection() {
       </div>
 
       <div className="space-y-6 animate-in fade-in slide-in-from-bottom-6 duration-500">
-        <div className="bg-gradient-to-br from-brand-600 to-brand-800 rounded-2xl p-6 text-white shadow-soft">
+        <div className="bg-gradient-to-br from-brand-600 to-brand-800 rounded-2xl p-5 xl:p-6 text-white shadow-soft">
           <h3 className="text-lg font-bold font-serif mb-4">Riferimenti Diretti</h3>
           <p className="text-brand-100 text-sm mb-6 leading-relaxed">
             Per questioni urgenti o comunicazioni amministrative, puoi utilizzare i nostri canali diretti.
           </p>
           <div className="space-y-4">
-            <a href="mailto:ticket@gemgroup.odoo.com" className="flex items-center gap-3 p-3 bg-white/10 hover:bg-white/20 rounded-xl transition-colors backdrop-blur-sm group">
-              <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center shrink-0 group-hover:scale-110 transition-transform">
+            <a href="mailto:ticket@gemgroup.odoo.com" className="flex items-center gap-2.5 xl:gap-3 p-3 bg-white/10 hover:bg-white/20 rounded-xl transition-colors backdrop-blur-sm group">
+              <div className="w-9 h-9 xl:w-10 xl:h-10 rounded-full bg-white/20 flex items-center justify-center shrink-0 group-hover:scale-110 transition-transform">
                 <Mail className="w-5 h-5 text-white" />
               </div>
-              <div>
+              <div className="min-w-0">
                 <div className="text-xs text-brand-200 font-medium tracking-wider uppercase mb-0.5">Email Supporto</div>
-                <div className="text-sm font-bold">ticket@gemgroup.odoo.com</div>
+                {/* Va a capo dopo la @ quando il riquadro è stretto */}
+                <div className="text-[13px] font-bold break-words">ticket@<wbr />gemgroup.odoo.com</div>
               </div>
             </a>
-            <a href="tel:+390656556099" className="flex items-center gap-3 p-3 bg-white/10 hover:bg-white/20 rounded-xl transition-colors backdrop-blur-sm group">
-              <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center shrink-0 group-hover:scale-110 transition-transform">
+            <a href="tel:+390656556099" className="flex items-center gap-2.5 xl:gap-3 p-3 bg-white/10 hover:bg-white/20 rounded-xl transition-colors backdrop-blur-sm group">
+              <div className="w-9 h-9 xl:w-10 xl:h-10 rounded-full bg-white/20 flex items-center justify-center shrink-0 group-hover:scale-110 transition-transform">
                 <Phone className="w-5 h-5 text-white" />
               </div>
-              <div>
+              <div className="min-w-0">
                 <div className="text-xs text-brand-200 font-medium tracking-wider uppercase mb-0.5">Telefono Urgenze</div>
                 <div className="text-sm font-bold">+39 0656556099</div>
               </div>
