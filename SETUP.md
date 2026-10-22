@@ -36,6 +36,9 @@ Copia `env.example` e configura i valori. Su Vercel vanno impostate nel pannello
 | `MAKE_WEBHOOK_SECRET` | ➖ | Inviato a Make nell'header `x-gem-secret`, da controllare con un filtro nello scenario. Lo stesso valore protegge `/api/live/make-event`, con cui Make avvisa il sito dopo ogni richiesta di chiamata (pagina "In diretta"). |
 | `CALLS_DRY_RUN` | ➖ | `"true"` = lancio simulato (nessuna chiamata). Se vuota: chiamate reali **solo** in produzione Vercel. |
 | `GITHUB_DATA_BRANCH` | ➖ | Branch per `users.json` / `voicebots.json`. Vuota = branch principale. Nelle anteprime Vercel, senza questa variabile, le scritture sono bloccate. |
+| `CAMPAIGN_QUEUE_MODE` | ➖ | `sito` = la coda delle chiamate la gestisce il sito: manda a Make un contatto per volta e al massimo N chiamate insieme per campagna (vedi sotto). Vuota = invio classico, tutta la lista a Make. |
+| `MAX_CHIAMATE_SIMULTANEE` | ➖ | Con `CAMPAIGN_QUEUE_MODE=sito`, quante chiamate al massimo per campagna (1–10, default 3). Va scelto in base ai canali del centralino e del voicebot. |
+| `CRON_SECRET` | ➖ | Alternativa a `MAKE_WEBHOOK_SECRET` per il timer `/api/cron/tick` (header `Authorization: Bearer …`, formato di Vercel Cron). |
 
 `*` In produzione GitHub è di fatto necessario, perché su serverless il filesystem è effimero.
 
@@ -66,6 +69,60 @@ Per un test isolato dalla produzione, nelle variabili d'ambiente Vercel con targ
 1. `DATABASE_URL` → un **branch Neon** dedicato (Neon → Branches → Create branch), non il database di produzione.
 2. `GITHUB_DATA_BRANCH` → un branch dedicato ai dati di test (es. `test-data`, creato da `main`). Senza, le modifiche a utenti e voicebot sono bloccate in anteprima.
 3. `CALLS_DRY_RUN` → lascia vuota (simulazione). Per provare una chiamata vera verso il tuo numero, impostala a `false` solo per il tempo del test.
+
+### Timer del server (campagne pianificate e code)
+
+Le campagne pianificate partono quando il server viene "svegliato". Senza timer lo fa l'app aperta su un dispositivo, ogni 30 secondi. Con il timer partono anche se nessuno ha l'app aperta.
+
+1. In Make crea uno scenario con un solo modulo **HTTP → Make a request**:
+   - URL `https://<dominio>/api/cron/tick`, metodo `POST`;
+   - header `x-gem-secret` = valore di `MAKE_WEBHOOK_SECRET`;
+   - programmazione **ogni 5 minuti**.
+2. Attivalo. Entro 15 minuti l'app smette di dire "parte solo se l'app è aperta".
+
+Il timer fa anche ripartire le code ferme (vedi sotto). Lo stato si legge in `/api/config` (`timerAttivo`).
+
+### Email di fine campagna
+
+Quando tutte le chiamate di una campagna hanno un esito, a chi l'ha lanciata (email del profilo, altrimenti `NOTIFY_EMAIL`) arriva un'email:
+- numeri della campagna (risposte, non risposte, interrotte, durata media);
+- esito e riassunto di ogni chiamata;
+- CSV allegato da aprire con Excel.
+
+I riassunti arrivano da Wildix qualche minuto dopo la fine della chiamata: l'email li aspetta al massimo 10 minuti. Una campagna senza avanzamenti da oltre 60 minuti riceve un'email "Campagna ferma" con le chiamate rimaste senza esito.
+
+Il controllo parte:
+- a ogni esito di chiamata;
+- a ogni riassunto ricevuto;
+- dal timer, o dall'app aperta ogni 30 secondi.
+
+### Chiamate simultanee (coda gestita dal sito)
+
+Lo scenario Make "Chiama Lista" ha la coda **sequenziale**: le chiamate partono una alla volta, qualunque sia il numero di "chiamate simultanee" scelto. Con `CAMPAIGN_QUEUE_MODE=sito`:
+
+- il sito tiene la coda della campagna e manda a Make **un contatto per esecuzione**;
+- non ci sono mai più di N chiamate in corso per campagna (N = scelta dell'operatore, fino a `MAX_CHIAMATE_SIMULTANEE`);
+- una chiamata libera il posto quando ha un esito:
+  - esito da Make (non partita, errore);
+  - fine chiamata dal webhook Wildix `call:completed` (risposta, interrotta, non risposta);
+- senza notizie da Make entro 10 minuti la chiamata va in errore. Dopo 20 minuti dall'avvio senza fine chiamata il posto si libera comunque.
+
+In Make, lo scenario usato da questa modalità deve avere **Sequential processing disattivato**, altrimenti le esecuzioni restano una alla volta. Il webhook Wildix `call:completed` deve arrivare allo stesso dominio dell'app, altrimenti ogni posto si libera solo dopo 20 minuti.
+
+### Ambiente di test completo
+
+Per provare timer, coda e chiamate simultanee senza toccare la produzione, sull'anteprima Vercel del branch:
+
+1. `DATABASE_URL` (Preview) → branch Neon dedicato.
+2. **Protection Bypass for Automation** (Vercel → Settings → Deployment Protection): genera il segreto. Make e Wildix lo devono inviare nell'header `x-vercel-protection-bypass`, altrimenti l'anteprima li blocca.
+3. In Make, copie di prova degli scenari:
+   - "Chiama Lista" e "Conferma Appuntamenti", con nuovo webhook, Sequential processing disattivato e richiami verso l'URL dell'anteprima;
+   - il timer, verso l'URL dell'anteprima.
+4. Variabili Preview:
+   - `MAKE_WEBHOOK_URL` e `MAKE_WEBHOOK_URL_APPUNTAMENTI` → i webhook delle copie;
+   - `CAMPAIGN_QUEUE_MODE=sito` e `MAX_CHIAMATE_SIMULTANEE`;
+   - `CALLS_DRY_RUN=false` solo durante la prova.
+5. In Wildix (WMS → Integrazioni → Webhook), un secondo webhook `call:completed` verso `https://<anteprima>/api/wildix-webhook` con lo stesso segreto.
 
 ## Sviluppo locale
 

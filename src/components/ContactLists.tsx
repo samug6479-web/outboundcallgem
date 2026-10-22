@@ -18,6 +18,7 @@ export function ContactLists({ onSelectProcess }: { onSelectProcess: () => void 
   
   // Stato per la modale di conferma eliminazione (Evita l'errore di riferimento)
   const [confirmDeleteList, setConfirmDeleteList] = useState<string | null>(null);
+  const [listError, setListError] = useState('');
 
   const [dragOver, setDragOver] = useState(false);
 
@@ -75,10 +76,12 @@ export function ContactLists({ onSelectProcess }: { onSelectProcess: () => void 
     setUploadMode('file');
   };
 
-  const handleSaveUpload = () => {
+  const handleSaveUpload = async () => {
     if (newListName.trim() && tempContacts.length > 0) {
-      saveList(newListName.trim(), tempContacts);
-      cancelUpload();
+      setListError('');
+      const r = await saveList(newListName.trim(), tempContacts);
+      if (r.ok) cancelUpload();
+      else setListError(r.error || 'Lista non salvata');
     }
   };
 
@@ -97,8 +100,16 @@ export function ContactLists({ onSelectProcess }: { onSelectProcess: () => void 
   return (
     <>
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-300">
-      
-      <div className="flex justify-end">
+
+      {listError && (
+        <div className="flex items-center justify-between gap-3 p-3 rounded-xl border border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-900/10 text-sm text-red-700 dark:text-red-300">
+          <span>{listError}</span>
+          <button onClick={() => setListError('')} className="p-1 hover:opacity-70" aria-label="Chiudi"><X className="w-4 h-4" /></button>
+        </div>
+      )}
+
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-sm text-slate-500 dark:text-slate-400">Le liste sono condivise: le vedono tutti gli Editor e gli Admin, da qualsiasi dispositivo.</p>
         <button 
           onClick={() => {
             setIsUploading(true);
@@ -290,7 +301,7 @@ export function ContactLists({ onSelectProcess }: { onSelectProcess: () => void 
                   <div className="w-10 h-10 rounded-full bg-brand-50 dark:bg-brand-900/30 flex items-center justify-center text-brand-600 dark:text-brand-400 mb-4">
                     <List className="w-5 h-5" />
                   </div>
-                  <button 
+                  {list.canDelete !== false && <button
                     onClick={() => {
                       setConfirmDeleteList(list.id);
                     }}
@@ -298,7 +309,7 @@ export function ContactLists({ onSelectProcess }: { onSelectProcess: () => void 
                     title="Elimina lista"
                   >
                     <Trash2 className="w-4 h-4" />
-                  </button>
+                  </button>}
                 </div>
                 
                 <h3 className="text-xl font-bold text-slate-900 dark:text-white mb-2 truncate" title={list.name}>{list.name}</h3>
@@ -344,9 +355,15 @@ export function ContactLists({ onSelectProcess }: { onSelectProcess: () => void 
     <ConfirmModal
         open={!!confirmDeleteList}
         title="Elimina lista"
-        message="Vuoi eliminare questa lista salvata? Questa azione non può essere annullata."
+        message="Vuoi eliminare questa lista salvata? Sparisce per tutti e non si può annullare."
         confirmLabel="Elimina"
-        onConfirm={() => { if (confirmDeleteList) { deleteList(confirmDeleteList); setConfirmDeleteList(null); } }}
+        onConfirm={async () => {
+          if (!confirmDeleteList) return;
+          const id = confirmDeleteList;
+          setConfirmDeleteList(null);
+          const r = await deleteList(id);
+          if (!r.ok) setListError(r.error || 'Lista non eliminata');
+        }}
         onCancel={() => setConfirmDeleteList(null)}
       />
     </>

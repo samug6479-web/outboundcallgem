@@ -76,7 +76,7 @@ const TAB_META: Record<Tab, { title: string; subtitle: string }> = {
   campaign: { title: 'Nuova Campagna', subtitle: 'Carica la lista contatti, definisci le tempistiche e avvia le chiamate sul centralino Wildix.' },
   appointments: { title: 'Conferma Appuntamenti', subtitle: 'Visualizza, importa e gestisci gli appuntamenti programmati per le campagne di richiamata.' },
   lists: { title: 'Liste Salvate', subtitle: 'Salva, gestisci o riutilizza le tue liste contatti precedentemente caricate.' },
-  history: { title: 'Storico Campagne', subtitle: 'Le campagne lanciate da questo browser, con i report da scaricare.' },
+  history: { title: 'Storico Campagne', subtitle: 'Le campagne lanciate da tutti gli operatori, con i report da scaricare.' },
   live: { title: 'In diretta', subtitle: 'Le chiamate delle campagne in corso, aggiornate ogni pochi secondi.' },
   followups: { title: 'Follow-up', subtitle: 'Contatti da richiamare o gestire a mano: chiamate non risposte, rifiuti, disdette e trasferimenti.' },
   callresults: { title: 'Esiti Chiamate', subtitle: 'Esito, trascrizione e riassunto AI di ogni chiamata gestita dal voicebot.' },
@@ -127,7 +127,7 @@ function CampaignStepper() {
 }
 
 export function Dashboard() {
-  const { user, darkMode, toggleTheme, logout, enable2FA, scheduledCampaigns, setCampaignType } = useCampaign();
+  const { user, darkMode, toggleTheme, logout, enable2FA, scheduledCampaigns, setCampaignType, appConfig } = useCampaign();
   const [confirmLogout, setConfirmLogout] = useState(false);
   const pendingScheduled = scheduledCampaigns.filter(c => c.status === 'pending').length;
   const isAdmin = user?.isAdmin || user?.role === 'Admin';
@@ -383,7 +383,7 @@ export function Dashboard() {
         <ConfirmModal
           open={confirmLogout}
           title="Vuoi uscire?"
-          message={pendingScheduled > 0
+          message={pendingScheduled > 0 && !appConfig.timerAttivo
             ? (pendingScheduled === 1
               ? "Hai 1 campagna pianificata in attesa: parte all'orario solo se l'app è aperta su almeno un dispositivo."
               : `Hai ${pendingScheduled} campagne pianificate in attesa: partono all'orario solo se l'app è aperta su almeno un dispositivo.`)

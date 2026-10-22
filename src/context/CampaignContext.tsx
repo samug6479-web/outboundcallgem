@@ -42,9 +42,20 @@ export interface ContactList {
   createdBy: string;
   createdAt: string;
   contacts: Contact[];
+  canDelete?: boolean;
+}
+
+// Impostazioni del server che cambiano cosa mostra l'interfaccia.
+export interface AppConfig {
+  codaSito: boolean;       // il sito gestisce la coda: le chiamate simultanee sono reali
+  maxSimultanee: number;
+  timerAttivo: boolean;    // il timer del server fa partire le pianificate anche ad app chiusa
 }
 
 export interface HistoryItem {
+  id?: string;
+  tipoCampagna?: string;
+  voicebot?: string;
   ts: string;
   count: number;
   scheduledAt: string | null;
@@ -134,11 +145,13 @@ interface CampaignContextType {
   scheduledCampaigns: ScheduledCampaign[];
   loadScheduledCampaigns: () => Promise<void>;
   cancelScheduledCampaign: (id: number) => Promise<{ ok: boolean; error?: string }>;
-  clearHistory: () => void;
+  clearHistory: () => Promise<{ ok: boolean; error?: string }>;
+  loadHistory: () => Promise<void>;
+  appConfig: AppConfig;
 
   lists: ContactList[];
-  saveList: (name: string, contactsToSave: Contact[]) => void;
-  deleteList: (id: string) => void;
+  saveList: (name: string, contactsToSave: Contact[]) => Promise<{ ok: boolean; error?: string }>;
+  deleteList: (id: string) => Promise<{ ok: boolean; error?: string }>;
   loadList: (id: string) => void;
 
   darkMode: boolean;
@@ -194,12 +207,6 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
         .catch(() => {});
     }
 
-    const h = localStorage.getItem('gem_history');
-    if (h) setHistory(JSON.parse(h));
-
-    const lst = localStorage.getItem('gem_lists');
-    if (lst) setLists(JSON.parse(lst));
-
     const theme = localStorage.getItem('gem_theme');
     if (theme === 'dark') {
       document.documentElement.classList.add('dark');
@@ -241,6 +248,63 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
     const timer = setInterval(loadScheduledCampaigns, 30_000);
     return () => clearInterval(timer);
   }, [user?.username]);
+
+  // ── Storico, liste e impostazioni: sul server, uguali su ogni dispositivo ──
+  const [appConfig, setAppConfig] = useState<AppConfig>({ codaSito: false, maxSimultanee: 1, timerAttivo: false });
+  const loadHistory = async () => {
+    try {
+      const res = await authFetch('/api/history');
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) setHistory(data.history || []);
+    } catch { /* rete assente */ }
+  };
+  const loadLists = async () => {
+    try {
+      const res = await authFetch('/api/lists');
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) setLists(data.lists || []);
+    } catch { /* rete assente */ }
+  };
+  // Storico e liste salvati nel browser dalle versioni precedenti: si portano
+  // sul server una volta sola, poi si tolgono dal browser.
+  const importaArchivioLocale = async () => {
+    let liste: any[] = [], storico: any[] = [];
+    try {
+      liste = JSON.parse(localStorage.getItem('gem_lists') || '[]');
+      storico = JSON.parse(localStorage.getItem('gem_history') || '[]');
+    } catch { /* dati illeggibili: niente da importare */ }
+    if (!Array.isArray(liste)) liste = [];
+    if (!Array.isArray(storico)) storico = [];
+    if (liste.length === 0 && storico.length === 0) return;
+    try {
+      const res = await authFetch('/api/archivio/importa', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ liste, storico }),
+      });
+      if (res.ok) {
+        localStorage.removeItem('gem_lists');
+        localStorage.removeItem('gem_history');
+      }
+    } catch { /* si riprova al prossimo accesso */ }
+  };
+  useEffect(() => {
+    if (!user) { setHistory([]); setLists([]); return; }
+    const isViewer = user.role === 'Viewer';
+    (async () => {
+      if (!isViewer) await importaArchivioLocale();
+      await Promise.all([loadHistory(), isViewer ? Promise.resolve() : loadLists()]);
+    })();
+    authFetch('/api/config')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d?.ok) setAppConfig({ codaSito: !!d.codaSito, maxSimultanee: d.maxSimultanee || 1, timerAttivo: !!d.timerAttivo }); })
+      .catch(() => {});
+  }, [user?.username]);
+
+  // Con la coda gestita dal sito le chiamate simultanee non possono superare il limite.
+  useEffect(() => {
+    if (concurrency > appConfig.maxSimultanee) setConcurrency(appConfig.maxSimultanee);
+  }, [appConfig.maxSimultanee]);
 
   const login = async (u: string, p: string) => {
     try {
@@ -357,34 +421,50 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
   const invalidCount = evaluated.filter(c => c.inv).length;
   const duplicateCount = evaluated.filter(c => c.dup).length;
 
-  const saveHistory = (count: number, sched: string | null, chunk: number, contactsList?: Contact[]) => {
-    const newItems = [{ ts: new Date().toISOString(), count, scheduledAt: sched, opt: user?.nome || 'Operatore', chunkSize: chunk, contactsList }, ...history].slice(0, 20);
-    setHistory(newItems);
-    localStorage.setItem('gem_history', JSON.stringify(newItems));
+  const clearHistory = async () => {
+    try {
+      const res = await authFetch('/api/history', { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: data.error || `Errore HTTP ${res.status}` };
+      setHistory([]);
+      return { ok: true };
+    } catch {
+      return { ok: false, error: 'Errore di rete' };
+    }
   };
 
-  const clearHistory = () => {
-    setHistory([]);
-    localStorage.removeItem('gem_history');
+  const saveList = async (name: string, contactsToSave: Contact[]) => {
+    try {
+      const res = await authFetch('/api/lists', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name,
+          contacts: contactsToSave.map(c => ({
+            nome: c.nome, numero: c.numero,
+            data_appuntamento: c.data_appuntamento, ora_appuntamento: c.ora_appuntamento, prestazione: c.prestazione,
+          })),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) return { ok: false, error: data.error || `Errore HTTP ${res.status}` };
+      setLists(prev => [data.list, ...prev]);
+      return { ok: true };
+    } catch {
+      return { ok: false, error: 'Errore di rete' };
+    }
   };
 
-  const saveList = (name: string, contactsToSave: Contact[]) => {
-    const list: ContactList = {
-      id: Date.now().toString(),
-      name,
-      createdBy: user?.nome || 'User',
-      createdAt: new Date().toISOString(),
-      contacts: contactsToSave.map(c => ({...c})), // deep copy
-    };
-    const newLists = [list, ...lists];
-    setLists(newLists);
-    localStorage.setItem('gem_lists', JSON.stringify(newLists));
-  };
-
-  const deleteList = (id: string) => {
-    const newLists = lists.filter(l => l.id !== id);
-    setLists(newLists);
-    localStorage.setItem('gem_lists', JSON.stringify(newLists));
+  const deleteList = async (id: string) => {
+    try {
+      const res = await authFetch(`/api/lists/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: data.error || `Errore HTTP ${res.status}` };
+      setLists(prev => prev.filter(l => l.id !== id));
+      return { ok: true };
+    } catch {
+      return { ok: false, error: 'Errore di rete' };
+    }
   };
 
   const loadList = (id: string) => {
@@ -553,17 +633,16 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       const testPrefix = data.dryRun ? '[TEST — nessuna chiamata reale] ' : '';
 
       if (data.scheduled) {
-        saveHistory(validContacts.length, targetAt, concurrency, validContacts.map(c => ({ ...c })));
+        loadHistory();
         setCampaignNote('');
         loadScheduledCampaigns();
         const quando = new Date(data.scheduledAt).toLocaleString('it-IT', { dateStyle: 'short', timeStyle: 'short' });
-        setLaunchStatus({ type: 'ok', msg: `${testPrefix}Campagna pianificata per ${quando} — ${validContacts.length} contatti. Partirà all'orario se l'app è aperta su almeno un dispositivo.` });
+        const comeParte = appConfig.timerAttivo ? 'Partirà da sola all\'orario.' : 'Partirà all\'orario se l\'app è aperta su almeno un dispositivo.';
+        setLaunchStatus({ type: 'ok', msg: `${testPrefix}Campagna pianificata per ${quando} — ${validContacts.length} contatti. ${comeParte}` });
         return;
       }
-      const sentNumbers = new Set<string>((data.sentContacts || []).map((c: any) => c.numero));
-      const sentList = validContacts.filter(c => sentNumbers.has(String(c.numero).replace(/[\s\-().]/g, '')));
       if (data.sent > 0) {
-        saveHistory(data.sent, targetAt, concurrency, (sentList.length ? sentList : validContacts).map(c => ({ ...c })));
+        loadHistory();
         setCampaignNote('');
       }
 
@@ -598,7 +677,7 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       businessHoursEnabled, setBusinessHoursEnabled,
       businessHoursConfig, setBusinessHoursConfig,
       historyFilter, setHistoryFilter, filteredHistory, exportHistoryToXLSX,
-      history, clearHistory,
+      history, clearHistory, loadHistory, appConfig,
       scheduledCampaigns, loadScheduledCampaigns, cancelScheduledCampaign,
       lists, saveList, deleteList, loadList,
       darkMode, toggleTheme,

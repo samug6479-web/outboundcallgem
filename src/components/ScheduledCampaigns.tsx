@@ -21,7 +21,7 @@ function formatWhen(iso: string) {
 // Elenco delle campagne pianificate, con stato e pulsante Annulla finché
 // non sono partite. Le campagne partono solo se l'app è aperta all'orario.
 export function ScheduledCampaigns() {
-  const { user, scheduledCampaigns, cancelScheduledCampaign } = useCampaign();
+  const { user, scheduledCampaigns, cancelScheduledCampaign, appConfig } = useCampaign();
   const [toCancel, setToCancel] = useState<ScheduledCampaign | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [error, setError] = useState('');
@@ -86,7 +86,9 @@ export function ScheduledCampaigns() {
       <div className="px-5 pb-2">
         {pending.length > 0 && (
           <p className="text-xs text-slate-500 pt-3">
-            Partono all'orario solo se l'app è aperta su almeno un dispositivo. Oltre 30 minuti di ritardo vengono segnate come scadute.
+            {appConfig.timerAttivo
+              ? "Partono da sole all'orario, anche se nessuno ha l'app aperta."
+              : "Partono all'orario solo se l'app è aperta su almeno un dispositivo. Oltre 30 minuti di ritardo vengono segnate come scadute."}
           </p>
         )}
         {error && <p className="text-xs text-red-500 pt-3">{error}</p>}

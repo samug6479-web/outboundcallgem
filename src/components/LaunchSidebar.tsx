@@ -31,7 +31,7 @@ function groupHistoryByDay<T extends { ts: string }>(items: T[]): { label: strin
 export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 'all' }) {
   const { 
     user, validContacts, contacts, invalidCount, duplicateCount,
-    scheduleMode, scheduledAt, concurrency,
+    scheduleMode, scheduledAt, concurrency, setConcurrency, appConfig,
     isLaunching, launchStatus, launchCampaign,
     selectedVoicebot, campaignType,
     testSingleCall, testStatus,
@@ -85,10 +85,11 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
     XLSX.writeFile(wb, `Campagna_${format(new Date(h.ts), 'yyyyMMdd_HHmm')}.xlsx`);
   };
 
-  const handleSaveList = () => {
+  const handleSaveList = async () => {
     if (listName.trim() && validContacts.length > 0) {
-      saveList(listName.trim(), validContacts);
-      setIsSavingList(false); setListName('');
+      const r = await saveList(listName.trim(), validContacts);
+      if (r.ok) { setIsSavingList(false); setListName(''); }
+      else window.alert(r.error || 'Lista non salvata');
     }
   };
 
@@ -153,7 +154,21 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
             )}
             <div className="flex justify-between items-center pb-3 border-b border-slate-200 dark:border-slate-700">
               <span className="text-sm font-semibold text-slate-500">Chiamate Simultanee</span>
-              <span className="text-sm font-bold text-slate-900 dark:text-white">x{concurrency}</span>
+              {/* Scelta possibile solo con la coda gestita dal sito: con lo scenario
+                  Make sequenziale le chiamate partono comunque una alla volta. */}
+              {appConfig.codaSito && appConfig.maxSimultanee > 1 ? (
+                <div className="flex items-center gap-1" role="group" aria-label="Chiamate simultanee">
+                  {Array.from({ length: appConfig.maxSimultanee }, (_, i) => i + 1).map(n => (
+                    <button key={n} type="button" onClick={() => setConcurrency(n)} disabled={isLaunching}
+                      className={cn("w-7 h-7 rounded-lg text-xs font-bold transition-colors",
+                        concurrency === n ? "bg-brand-600 text-white dark:bg-brand-500" : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700")}>
+                      {n}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <span className="text-sm font-bold text-slate-900 dark:text-white">x{concurrency}</span>
+              )}
             </div>
             {validContacts.length > 0 && (
               <div className="flex justify-between items-center pb-3 border-b border-slate-200 dark:border-slate-700">
@@ -487,10 +502,17 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
                   </div>
                 </div>
               ))}
-              <button onClick={clearHistory}
-                className="w-full p-3 text-xs font-bold text-red-500 hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors flex items-center justify-center gap-2">
-                <Trash2 className="w-3.5 h-3.5" /> Cancella Storico
-              </button>
+              {/* Lo storico è condiviso: lo può svuotare solo un Admin */}
+              {user?.isAdmin && (
+                <button onClick={async () => {
+                    if (!window.confirm('Vuoi cancellare lo storico di tutte le campagne? Sparisce per tutti gli utenti.')) return;
+                    const r = await clearHistory();
+                    if (!r.ok) window.alert(r.error || 'Storico non cancellato');
+                  }}
+                  className="w-full p-3 text-xs font-bold text-red-500 hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors flex items-center justify-center gap-2">
+                  <Trash2 className="w-3.5 h-3.5" /> Cancella Storico
+                </button>
+              )}
             </div>
           )}
         </div>

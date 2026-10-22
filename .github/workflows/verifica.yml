@@ -1,0 +1,48 @@
+# Controlli automatici del sito.
+# - Su ogni PR e su main: controllo dei tipi e build.
+# - Dopo ogni deploy di produzione su Vercel, ogni mattina e su richiesta:
+#   verifica del sito pubblicato (scripts/smoke-test.mjs). Se fallisce, GitHub
+#   avvisa via email il proprietario del repository.
+name: Verifica
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  deployment_status:
+  schedule:
+    - cron: "17 6 * * *"   # ogni giorno alle 6:17 UTC (8:17 in Italia d'estate)
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Controllo dei tipi
+        run: npm run lint
+      - name: Build
+        run: npm run build
+
+  sito:
+    if: >-
+      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'deployment_status' &&
+       github.event.deployment_status.state == 'success' &&
+       github.event.deployment.environment == 'Production')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verifica del sito pubblicato
+        env:
+          BASE_URL: https://outboundcallgem.vercel.app
+        run: node scripts/smoke-test.mjs
