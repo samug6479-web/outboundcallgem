@@ -1883,7 +1883,11 @@ app.post("/api/live/make-event", express.json({ limit: "20kb" }), express.urlenc
     if (!ok) {
       const testo = [req.body?.motivo, req.body?.risultato, req.body?.testo]
         .map(v => cleanText(v, 200)).filter(v => v && v !== "[object Object]")[0];
-      dettaglio = `Wildix ${status}${testo ? `: ${testo}` : ""}`.slice(0, 300);
+      // Wildix risponde 500 "Internal Server Error" quando il cliente rifiuta,
+      // è occupato o non risponde (verificato con una chiamata rifiutata).
+      dettaglio = status === 500 && (!testo || /internal server error/i.test(testo))
+        ? "Rifiutata, occupato o senza risposta"
+        : `Wildix ${status}${testo ? `: ${testo}` : ""}`.slice(0, 300);
     }
   } else {
     stato = "avviata";
