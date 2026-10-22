@@ -122,7 +122,7 @@ function CampaignStepper() {
 }
 
 export function Dashboard() {
-  const { user, darkMode, toggleTheme, logout, enable2FA, scheduledCampaigns } = useCampaign();
+  const { user, darkMode, toggleTheme, logout, enable2FA, scheduledCampaigns, setCampaignType } = useCampaign();
   const [confirmLogout, setConfirmLogout] = useState(false);
   const pendingScheduled = scheduledCampaigns.filter(c => c.status === 'pending').length;
   const isAdmin = user?.isAdmin || user?.role === 'Admin';
@@ -189,6 +189,13 @@ export function Dashboard() {
     window.addEventListener('gem:nav', handler);
     return () => window.removeEventListener('gem:nav', handler);
   }, []);
+
+  // Il tipo di campagna è condiviso tra le pagine: "Conferma Appuntamenti" lo
+  // imposta su appuntamenti, quindi tornando su "Nuova Campagna" va rimesso a
+  // standard. Altrimenti una lista normale parte verso lo scenario appuntamenti.
+  React.useEffect(() => {
+    if (activeTab === 'campaign') setCampaignType('standard');
+  }, [activeTab]);
 
   // Titolo pagina dinamico
   React.useEffect(() => {

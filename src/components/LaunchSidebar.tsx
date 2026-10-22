@@ -33,7 +33,7 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
     user, validContacts, contacts, invalidCount, duplicateCount,
     scheduleMode, scheduledAt, concurrency,
     isLaunching, launchStatus, launchCampaign,
-    selectedVoicebot,
+    selectedVoicebot, campaignType,
     testSingleCall, testStatus,
     campaignNote, setCampaignNote,
     businessHoursEnabled, setBusinessHoursEnabled,
@@ -169,6 +169,12 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
                 </span>
               </div>
             )}
+            <div className="flex justify-between items-center">
+              <span className="text-sm font-semibold text-slate-500">Tipo</span>
+              <span className="text-sm font-bold text-slate-900 dark:text-white">
+                {campaignType === 'appuntamenti' ? 'Conferma appuntamenti' : 'Standard'}
+              </span>
+            </div>
             <div className="flex justify-between items-center">
               <span className="text-sm font-semibold text-slate-500">Modalità</span>
               <span className="text-sm font-bold text-brand-600 dark:text-brand-400">
