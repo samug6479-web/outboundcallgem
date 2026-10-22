@@ -133,8 +133,10 @@ export function Step1Upload() {
                 onDragOver={e => e.preventDefault()}
                 onDrop={e => {
                   e.preventDefault();
-                  const file = e.dataTransfer.files[0];
-                  if (uploadMode === 'csv') handleCSV(file); else handleExcel(file);
+                  const file = e.dataTransfer.files?.[0];
+                  if (!file) return;
+                  // Il tipo si decide dall'estensione, non dalla scheda aperta.
+                  if (/\.(xlsx|xls)$/i.test(file.name)) handleExcel(file); else handleCSV(file);
                 }}
               >
                 <input 
