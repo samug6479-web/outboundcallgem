@@ -644,6 +644,7 @@ app.post(
         });
 
         const durataMs = flow.talkTime || 0;
+        await markLiveCallCompleted(numero, risposto, durataMs, event.id, rawBody);
         if (!risposto) {
           await createAutoFollowup({ callId: event.id, numero, nome, motivo: MOTIVO_NON_RISPOSTO });
         } else if (durataMs < INTERRUPTED_CALL_MAX_MS) {
@@ -1615,6 +1616,8 @@ interface CampaignSpec {
   note?: string;
   operatore: string;
   scheduledAt: string | null;
+  username?: string;
+  scheduledId?: number | null;
 }
 
 // Invia una campagna a Make a blocchi. Usata sia per il lancio immediato sia
@@ -1625,6 +1628,10 @@ async function sendCampaignToMake(spec: CampaignSpec) {
 
   const webhookUrl = spec.campaignType === "appuntamenti" ? MAKE_WEBHOOK_URL_APPUNTAMENTI : MAKE_WEBHOOK_URL_DEFAULT;
   const avviatoIl = new Date().toISOString();
+  const dryRun = isCallsDryRun();
+  // Campagna per la pagina "In diretta": Make rimanda indietro campagna_id
+  // per ogni chiamata avviata o fallita. In modalità test non si registra.
+  const liveId = dryRun ? null : await createLiveCampaign(spec);
   const payloads = chunks.map((chunk, idx) => ({
     contatti: chunk,
     tipo_campagna: spec.campaignType,
@@ -1640,9 +1647,9 @@ async function sendCampaignToMake(spec: CampaignSpec) {
     voicebot_context: spec.bot?.context || "outbound-voicebot",
     chunk: idx + 1,
     chunks_totali: chunks.length,
+    campagna_id: liveId,
   }));
 
-  const dryRun = isCallsDryRun();
   let results: boolean[];
   if (dryRun) {
     console.log(`[DRY-RUN] Invio simulato: ${spec.contacts.length} contatti in ${chunks.length} blocchi, operatore ${spec.operatore}`);
@@ -1656,6 +1663,7 @@ async function sendCampaignToMake(spec: CampaignSpec) {
   // Numero → nome, per mostrare il nome reale negli Esiti Voicebot.
   // In modalità test non si scrive nel database.
   if (sentContacts.length > 0 && !dryRun) await upsertContactNames(sentContacts);
+  if (liveId) await recordLiveCalls(liveId, chunks, results);
   return { dryRun, sentContacts, failedContacts, chunksOk: results.filter(Boolean).length, chunksTotal: chunks.length };
 }
 
@@ -1712,6 +1720,222 @@ async function logCampaign(entry: {
     console.error("Errore scrittura campaign_log (non bloccante):", err);
   }
 }
+
+// ══════════════════════════════════════════════════════════════
+// IN DIRETTA
+// Stato di ogni chiamata lanciata dal sito, per la pagina "In diretta":
+//   in_coda      → inviata a Make
+//   avviata      → Make ha chiesto la chiamata a Wildix (Originate) e Wildix l'ha accettata
+//   errore       → Wildix ha rifiutato la richiesta, o l'invio a Make è fallito
+//   risposta / interrotta / non_risposta → chiamata conclusa (webhook Wildix)
+// Make avvisa il sito dopo ogni Originate (POST /api/live/make-event).
+// ══════════════════════════════════════════════════════════════
+const LIVE_STATI_APERTI = ["in_coda", "avviata"];
+
+let liveSchemaReady: Promise<void> | null = null;
+function ensureLiveSchema(): Promise<void> {
+  if (!liveSchemaReady) {
+    liveSchemaReady = (async () => {
+      await sql!`
+        CREATE TABLE IF NOT EXISTS live_campaigns (
+          id            SERIAL PRIMARY KEY,
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+          username      TEXT,
+          operatore     TEXT,
+          tipo_campagna TEXT        NOT NULL,
+          voicebot_nome TEXT,
+          totale        INT         NOT NULL,
+          scheduled_id  INT
+        )
+      `;
+      await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS voicebot_exten TEXT`;
+      await sql!`
+        CREATE TABLE IF NOT EXISTS live_calls (
+          id          SERIAL PRIMARY KEY,
+          campaign_id INT,
+          numero      TEXT        NOT NULL,
+          nome        TEXT,
+          stato       TEXT        NOT NULL,
+          errore      TEXT,
+          call_id     TEXT,
+          durata_ms   INT,
+          queued_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `;
+      await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_numero ON live_calls (numero, queued_at DESC)`;
+      await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_campaign ON live_calls (campaign_id)`;
+      await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_updated ON live_calls (updated_at DESC)`;
+      await sql!`CREATE INDEX IF NOT EXISTS idx_live_campaigns_created ON live_campaigns (created_at DESC)`;
+    })().catch(err => {
+      liveSchemaReady = null;
+      throw err;
+    });
+  }
+  return liveSchemaReady;
+}
+
+async function createLiveCampaign(spec: CampaignSpec): Promise<number | null> {
+  if (!sql) return null;
+  try {
+    await ensureLiveSchema();
+    const rows = (await sql`
+      INSERT INTO live_campaigns (username, operatore, tipo_campagna, voicebot_nome, voicebot_exten, totale, scheduled_id)
+      VALUES (${spec.username || null}, ${spec.operatore || null}, ${spec.campaignType}, ${spec.bot?.nome || null},
+              ${spec.bot?.exten != null ? String(spec.bot.exten) : null}, ${spec.contacts.length}, ${spec.scheduledId ?? null})
+      RETURNING id
+    `) as any[];
+    return rows[0]?.id ?? null;
+  } catch (err) {
+    console.error("Errore creazione campagna in diretta (non bloccante):", err);
+    return null;
+  }
+}
+
+async function recordLiveCalls(campaignId: number, chunks: LaunchContact[][], results: boolean[]) {
+  if (!sql) return;
+  const numeri: string[] = [], nomi: string[] = [], stati: string[] = [], errori: (string | null)[] = [];
+  chunks.forEach((chunk, i) => {
+    for (const c of chunk) {
+      numeri.push(normalizePhone(c.numero) || c.numero);
+      nomi.push(c.nome || "");
+      stati.push(results[i] ? "in_coda" : "errore");
+      errori.push(results[i] ? null : "Invio a Make non riuscito");
+    }
+  });
+  try {
+    await sql`
+      INSERT INTO live_calls (campaign_id, numero, nome, stato, errore)
+      SELECT ${campaignId}, n, nm, st, er
+      FROM unnest(${numeri}::text[], ${nomi}::text[], ${stati}::text[], ${errori}::text[]) AS t(n, nm, st, er)
+    `;
+  } catch (err) {
+    console.error("Errore registrazione chiamate in diretta (non bloccante):", err);
+  }
+}
+
+// Fine chiamata (webhook Wildix): aggiorna la chiamata aperta verso quel numero.
+// Si considerano solo le chiamate partite dalle campagne del sito. Se l'evento
+// Wildix contiene l'interno del voicebot, si sceglie la campagna con quel bot,
+// così una chiamata di un altro bot verso lo stesso numero non si confonde.
+async function markLiveCallCompleted(numero: string | null, risposto: boolean, durataMs: number, callId: string, rawEvent: string) {
+  if (!sql || !numero) return;
+  const stato = !risposto ? "non_risposta" : durataMs < INTERRUPTED_CALL_MAX_MS ? "interrotta" : "risposta";
+  try {
+    await ensureLiveSchema();
+    const open = (await sql`
+      SELECT l.id, c.voicebot_exten
+      FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
+      WHERE l.numero = ${numero} AND l.stato = ANY(${LIVE_STATI_APERTI}::text[]) AND l.queued_at > now() - interval '12 hours'
+      ORDER BY l.queued_at DESC
+    `) as any[];
+    if (open.length === 0) return;
+    const conBot = open.filter(r => r.voicebot_exten && rawEvent.includes(`"${r.voicebot_exten}"`));
+    const target = conBot[0] || open[0];
+    await sql`
+      UPDATE live_calls SET stato = ${stato}, durata_ms = ${durataMs}, call_id = ${callId}, errore = NULL, updated_at = now()
+      WHERE id = ${target.id}
+    `;
+  } catch (err) {
+    console.error("Errore aggiornamento chiamata in diretta (non bloccante):", err);
+  }
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a), bb = Buffer.from(b);
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+
+// Make → sito, dopo ogni richiesta di chiamata a Wildix (Originate).
+// Protetto dallo stesso segreto che il sito invia a Make (MAKE_WEBHOOK_SECRET).
+app.post("/api/live/make-event", express.json({ limit: "20kb" }), async (req, res) => {
+  const secret = process.env.MAKE_WEBHOOK_SECRET;
+  const given = String(req.headers["x-gem-secret"] || "");
+  if (!secret || !safeEqual(given, secret)) return res.status(401).json({ ok: false });
+  if (!sql) return res.status(503).json({ ok: false });
+
+  const numero = normalizePhone(String(req.body?.numero || ""));
+  if (!numero) return res.status(400).json({ ok: false, error: "numero mancante" });
+  const campaignId = parseInt(String(req.body?.campagna_id || ""), 10) || null;
+  const errore = req.body?.esito === "errore";
+  const dettaglio = errore ? cleanText(req.body?.dettaglio, 300) || "Richiesta di chiamata rifiutata" : null;
+  const stato = errore ? "errore" : "avviata";
+
+  try {
+    await ensureLiveSchema();
+    const updated = (await sql`
+      UPDATE live_calls SET stato = ${stato}, errore = ${dettaglio}, updated_at = now()
+      WHERE id = (
+        SELECT id FROM live_calls
+        WHERE numero = ${numero} AND stato = 'in_coda'
+          AND (${campaignId}::int IS NULL OR campaign_id = ${campaignId}::int)
+          AND queued_at > now() - interval '12 hours'
+        ORDER BY queued_at ASC LIMIT 1
+      )
+      RETURNING id
+    `) as any[];
+    // Nessuna corrispondenza: chiamata non partita da una campagna del sito
+    // (es. "Testa chiamata singola"). Non la registriamo.
+    res.json({ ok: true, registrata: updated.length > 0 });
+  } catch (err) {
+    console.error("Errore /api/live/make-event:", err);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// Dati per la pagina "In diretta": campagne delle ultime ore con i conteggi
+// per stato, ultimi eventi e (per gli admin) gli eventi ricevuti da Wildix.
+app.get("/api/live", requireAuth, async (req: any, res) => {
+  if (!sql) return res.json({ ok: true, campaigns: [], events: [], diagnostics: null });
+  const hours = Math.min(Math.max(parseInt(String(req.query.hours || "12"), 10) || 12, 1), 72);
+  try {
+    await ensureLiveSchema();
+    const campaigns = (await sql`
+      SELECT c.id, c.created_at, c.operatore, c.tipo_campagna, c.voicebot_nome, c.voicebot_exten, c.totale, c.scheduled_id,
+        count(l.id)::int AS registrate,
+        count(*) FILTER (WHERE l.stato = 'in_coda')::int      AS in_coda,
+        count(*) FILTER (WHERE l.stato = 'avviata')::int      AS avviate,
+        count(*) FILTER (WHERE l.stato = 'risposta')::int     AS risposte,
+        count(*) FILTER (WHERE l.stato = 'interrotta')::int   AS interrotte,
+        count(*) FILTER (WHERE l.stato = 'non_risposta')::int AS non_risposte,
+        count(*) FILTER (WHERE l.stato = 'errore')::int       AS errori,
+        max(l.updated_at) AS ultimo_aggiornamento,
+        max(l.updated_at) FILTER (WHERE l.stato <> 'in_coda') AS ultimo_avanzamento
+      FROM live_campaigns c
+      LEFT JOIN live_calls l ON l.campaign_id = c.id
+      WHERE c.created_at > now() - make_interval(hours => ${hours})
+      GROUP BY c.id
+      ORDER BY c.created_at DESC
+      LIMIT 30
+    `) as any[];
+    const events = (await sql`
+      SELECT l.id, l.campaign_id, l.numero, l.nome, l.stato, l.errore, l.durata_ms, l.queued_at, l.updated_at,
+             c.operatore, c.voicebot_nome
+      FROM live_calls l
+      LEFT JOIN live_campaigns c ON c.id = l.campaign_id
+      WHERE l.updated_at > now() - make_interval(hours => ${hours}) AND l.stato <> 'in_coda'
+      ORDER BY l.updated_at DESC
+      LIMIT 80
+    `) as any[];
+
+    // Fase 0: quali tipi di evento manda Wildix oltre a quelli già gestiti
+    // (es. call:live:progress per le chiamate in corso). Solo per gli admin.
+    let diagnostics: any = null;
+    if (req.session?.isAdmin) {
+      try {
+        diagnostics = (await sql`
+          SELECT event_type, reason, count(*)::int AS totale FROM webhook_log GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20
+        `) as any[];
+      } catch {
+        diagnostics = [];
+      }
+    }
+    res.json({ ok: true, hours, serverTime: new Date().toISOString(), campaigns, events, diagnostics });
+  } catch (err) {
+    console.error("Errore /api/live:", err);
+    res.status(500).json({ ok: false, error: "Errore caricamento dati in diretta" });
+  }
+});
 
 // ══════════════════════════════════════════════════════════════
 // CAMPAGNE PIANIFICATE
@@ -1809,6 +2033,8 @@ async function dispatchDueCampaigns(): Promise<void> {
           note: row.note || undefined,
           operatore: row.operatore || row.created_by,
           scheduledAt: new Date(row.scheduled_at).toISOString(),
+          username: row.created_by,
+          scheduledId: row.id,
         });
         const status = result.failedContacts.length === 0 ? "sent" : result.sentContacts.length > 0 ? "partial" : "failed";
         await sql`
@@ -1923,6 +2149,7 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
   // ── Immediata ──
   const result = await sendCampaignToMake({
     contacts, campaignType, bot, chunkSize, note: cleanNote, operatore: user.nome, scheduledAt: null,
+    username: user.username,
   });
   await logCampaign({
     username: user.username,

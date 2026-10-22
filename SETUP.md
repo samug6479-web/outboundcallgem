@@ -33,7 +33,7 @@ Copia `env.example` e configura i valori. Su Vercel vanno impostate nel pannello
 | `NOTIFY_EMAIL` | ⚠️ | Destinatario delle notifiche (follow-up e fine campagna). |
 | `APP_URL` | ➖ | URL pubblico dell'app. |
 | `MAKE_WEBHOOK_URL` / `MAKE_WEBHOOK_URL_APPUNTAMENTI` | ➖ | Webhook Make per il lancio campagne (standard / appuntamenti). Il browser non li vede più: li chiama il server. Se vuote, si usano gli URL storici. |
-| `MAKE_WEBHOOK_SECRET` | ➖ | Inviato a Make nell'header `x-gem-secret`, da controllare con un filtro nello scenario. |
+| `MAKE_WEBHOOK_SECRET` | ➖ | Inviato a Make nell'header `x-gem-secret`, da controllare con un filtro nello scenario. Lo stesso valore protegge `/api/live/make-event`, con cui Make avvisa il sito dopo ogni richiesta di chiamata (pagina "In diretta"). |
 | `CALLS_DRY_RUN` | ➖ | `"true"` = lancio simulato (nessuna chiamata). Se vuota: chiamate reali **solo** in produzione Vercel. |
 | `GITHUB_DATA_BRANCH` | ➖ | Branch per `users.json` / `voicebots.json`. Vuota = branch principale. Nelle anteprime Vercel, senza questa variabile, le scritture sono bloccate. |
 

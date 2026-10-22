@@ -1,0 +1,369 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { Radio, RefreshCw, AlertTriangle, PhoneCall, PhoneOff, PhoneMissed, Phone, Clock, XCircle, ChevronDown } from 'lucide-react';
+import { authFetch } from '../lib/authFetch';
+import { useCampaign } from '../context/CampaignContext';
+import { cn } from '../lib/utils';
+
+interface LiveCampaign {
+  id: number;
+  created_at: string;
+  operatore: string | null;
+  tipo_campagna: string;
+  voicebot_nome: string | null;
+  voicebot_exten: string | null;
+  totale: number;
+  scheduled_id: number | null;
+  registrate: number;
+  in_coda: number;
+  avviate: number;
+  risposte: number;
+  interrotte: number;
+  non_risposte: number;
+  errori: number;
+  ultimo_aggiornamento: string | null;
+  ultimo_avanzamento: string | null;
+}
+
+interface LiveEvent {
+  id: number;
+  campaign_id: number | null;
+  numero: string;
+  nome: string | null;
+  stato: Stato;
+  errore: string | null;
+  durata_ms: number | null;
+  queued_at: string;
+  updated_at: string;
+  operatore: string | null;
+  voicebot_nome: string | null;
+}
+
+type Stato = 'in_coda' | 'avviata' | 'risposta' | 'interrotta' | 'non_risposta' | 'errore';
+
+const POLL_MS = 4000;
+// Oltre questi minuti senza avanzamenti la coda viene segnalata come ferma.
+const CODA_FERMA_MIN = 10;
+// Una chiamata avviata da più di tanti minuti senza esito viene segnalata.
+const SENZA_ESITO_MIN = 15;
+
+const STATI: Record<Stato, { label: string; color: string; bar: string; icon: React.ElementType }> = {
+  in_coda: { label: 'In coda', color: 'text-slate-500', bar: 'bg-slate-200 dark:bg-slate-700', icon: Clock },
+  avviata: { label: 'In corso', color: 'text-blue-600 dark:text-blue-400', bar: 'bg-blue-500', icon: PhoneCall },
+  risposta: { label: 'Risposto', color: 'text-green-600 dark:text-green-400', bar: 'bg-green-500', icon: Phone },
+  interrotta: { label: 'Interrotta', color: 'text-amber-600 dark:text-amber-400', bar: 'bg-amber-500', icon: PhoneOff },
+  non_risposta: { label: 'Non risposto', color: 'text-slate-500 dark:text-slate-400', bar: 'bg-slate-400', icon: PhoneMissed },
+  errore: { label: 'Errore', color: 'text-red-600 dark:text-red-400', bar: 'bg-red-500', icon: XCircle },
+};
+
+const minutiDa = (iso: string | null, now: number) => (iso ? (now - new Date(iso).getTime()) / 60000 : Infinity);
+const ora = (iso: string) => new Date(iso).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const durata = (ms: number | null) => {
+  if (!ms) return '';
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+};
+
+// Pagina "In diretta": stato delle chiamate partite dalle campagne del sito,
+// ognuna con il voicebot scelto per quella campagna. Si aggiorna ogni 4 secondi
+// finché la pagina è visibile.
+export function LiveSection() {
+  const { user } = useCampaign();
+  const [hours, setHours] = useState(12);
+  const [campaigns, setCampaigns] = useState<LiveCampaign[]>([]);
+  const [events, setEvents] = useState<LiveEvent[]>([]);
+  const [diagnostics, setDiagnostics] = useState<{ event_type: string; reason: string; totale: number }[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
+  const [now, setNow] = useState(Date.now());
+  const [showDiag, setShowDiag] = useState(false);
+  const timer = useRef<number | null>(null);
+
+  const load = async (h = hours) => {
+    try {
+      const res = await authFetch(`/api/live?hours=${h}`);
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error();
+      setCampaigns(data.campaigns || []);
+      setEvents(data.events || []);
+      setDiagnostics(data.diagnostics ?? null);
+      setUpdatedAt(new Date());
+      setError('');
+    } catch {
+      setError('Impossibile aggiornare i dati in diretta. Nuovo tentativo tra pochi secondi.');
+    }
+    setLoading(false);
+    setNow(Date.now());
+  };
+
+  useEffect(() => {
+    let stopped = false;
+    const tick = async () => {
+      if (stopped) return;
+      if (document.visibilityState === 'visible') await load(hours);
+      if (!stopped) timer.current = window.setTimeout(tick, POLL_MS);
+    };
+    setLoading(true);
+    tick();
+    return () => { stopped = true; if (timer.current) window.clearTimeout(timer.current); };
+  }, [hours]);
+
+  // Il cronometro delle chiamate in corso scorre anche tra un aggiornamento e l'altro
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, []);
+
+  const tot = campaigns.reduce((a, c) => ({
+    in_coda: a.in_coda + c.in_coda,
+    avviate: a.avviate + c.avviate,
+    risposte: a.risposte + c.risposte,
+    non_risposte: a.non_risposte + c.non_risposte + c.interrotte,
+    errori: a.errori + c.errori,
+  }), { in_coda: 0, avviate: 0, risposte: 0, non_risposte: 0, errori: 0 });
+
+  // Avvisi: coda ferma o troppe chiamate in errore
+  const avvisi: { id: string; text: string; tone: 'red' | 'amber' }[] = [];
+  for (const c of campaigns) {
+    const nome = `${c.operatore || 'Campagna'} · ${c.voicebot_nome || 'voicebot predefinito'}`;
+    const gestite = c.registrate - c.in_coda;
+    if (c.errori >= 3 && c.errori / Math.max(gestite, 1) >= 0.5) {
+      avvisi.push({ id: `e${c.id}`, tone: 'red', text: `${nome}: ${c.errori} chiamate in errore su ${gestite}. Controlla lo scenario Make e il voicebot.` });
+    }
+    const ultimo = c.ultimo_avanzamento || c.created_at;
+    if (c.in_coda > 0 && minutiDa(ultimo, now) > CODA_FERMA_MIN) {
+      avvisi.push({ id: `c${c.id}`, tone: 'amber', text: `${nome}: ${c.in_coda} contatti in coda e nessun avanzamento da ${Math.floor(minutiDa(ultimo, now))} minuti. La coda di Make potrebbe essere ferma.` });
+    }
+  }
+
+  const inCorso = events.filter(e => e.stato === 'avviata');
+  const feed = events.filter(e => e.stato !== 'avviata').slice(0, 40);
+
+  const kpi = [
+    { label: 'In coda', value: tot.in_coda, icon: Clock, tone: 'text-slate-500' },
+    { label: 'In corso', value: tot.avviate, icon: PhoneCall, tone: 'text-blue-600 dark:text-blue-400' },
+    { label: 'Risposte', value: tot.risposte, icon: Phone, tone: 'text-green-600 dark:text-green-400' },
+    { label: 'Non risposte', value: tot.non_risposte, icon: PhoneMissed, tone: 'text-slate-500 dark:text-slate-400' },
+    { label: 'Errori', value: tot.errori, icon: XCircle, tone: 'text-red-600 dark:text-red-400' },
+  ];
+
+  return (
+    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-300">
+      {/* Barra superiore */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-sm text-slate-500">
+          <span className="relative flex h-2.5 w-2.5">
+            <span className={cn('absolute inline-flex h-full w-full rounded-full opacity-75', error ? 'bg-red-400' : 'bg-green-400 animate-ping')} />
+            <span className={cn('relative inline-flex rounded-full h-2.5 w-2.5', error ? 'bg-red-500' : 'bg-green-500')} />
+          </span>
+          {updatedAt ? `Aggiornato alle ${updatedAt.toLocaleTimeString('it-IT')}` : 'Caricamento…'}
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="flex rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden text-xs font-semibold">
+            {[12, 24, 72].map(h => (
+              <button key={h} onClick={() => setHours(h)}
+                className={cn('px-3 py-1.5 transition-colors', hours === h ? 'bg-brand-600 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800')}>
+                {h === 72 ? '3 giorni' : `${h} ore`}
+              </button>
+            ))}
+          </div>
+          <button onClick={() => load()} aria-label="Aggiorna" title="Aggiorna"
+            className="p-1.5 text-slate-400 hover:text-brand-600 hover:bg-brand-50 rounded-lg transition-colors">
+            <RefreshCw className={cn('w-4 h-4', loading && 'animate-spin')} />
+          </button>
+        </div>
+      </div>
+
+      {error && <p className="text-sm text-red-500">{error}</p>}
+
+      {/* Contatori */}
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+        {kpi.map(k => (
+          <div key={k.label} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 shadow-soft">
+            <k.icon className={cn('w-4 h-4 mb-2', k.tone)} />
+            <div className="text-2xl font-bold text-slate-900 dark:text-white tabular-nums">{k.value}</div>
+            <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mt-0.5">{k.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Avvisi */}
+      {avvisi.length > 0 && (
+        <div className="space-y-2">
+          {avvisi.map(a => (
+            <div key={a.id} className={cn('flex items-start gap-3 rounded-xl border px-4 py-3 text-sm',
+              a.tone === 'red'
+                ? 'bg-red-50 border-red-200 text-red-800 dark:bg-red-950/40 dark:border-red-900 dark:text-red-300'
+                : 'bg-amber-50 border-amber-200 text-amber-800 dark:bg-amber-950/40 dark:border-amber-900 dark:text-amber-300')}>
+              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+              <span>{a.text}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 xl:grid-cols-5 gap-6 items-start">
+        {/* Campagne */}
+        <div className="xl:col-span-3 space-y-4">
+          <h2 className="text-sm font-bold text-slate-900 dark:text-white uppercase tracking-wide">Campagne</h2>
+          {!loading && campaigns.length === 0 && (
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-8 text-center text-sm text-slate-500">
+              Nessuna campagna lanciata dal sito {hours === 72 ? 'negli ultimi 3 giorni' : `nelle ultime ${hours} ore`}.
+            </div>
+          )}
+          {campaigns.map(c => {
+            const gestite = c.registrate - c.in_coda;
+            const parts: [Stato, number][] = [
+              ['risposta', c.risposte], ['interrotta', c.interrotte], ['non_risposta', c.non_risposte],
+              ['errore', c.errori], ['avviata', c.avviate], ['in_coda', c.in_coda],
+            ];
+            const finita = c.in_coda === 0 && c.avviate === 0;
+            return (
+              <div key={c.id} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-soft">
+                <div className="flex flex-wrap items-start justify-between gap-2 mb-3">
+                  <div className="min-w-0">
+                    <div className="font-semibold text-slate-900 dark:text-white truncate">
+                      {c.voicebot_nome || 'Voicebot predefinito'}
+                      {c.voicebot_exten && <span className="ml-1.5 text-xs font-mono text-slate-400">({c.voicebot_exten})</span>}
+                    </div>
+                    <div className="text-xs text-slate-500 mt-0.5">
+                      {c.operatore || '—'} · {c.tipo_campagna === 'appuntamenti' ? 'Conferma appuntamenti' : 'Standard'}
+                      {c.scheduled_id ? ' · pianificata' : ''} · partita alle {ora(c.created_at).slice(0, 5)}
+                    </div>
+                  </div>
+                  <span className={cn('text-[11px] font-bold px-2 py-0.5 rounded-full',
+                    finita ? 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300' : 'bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-400')}>
+                    {finita ? 'Conclusa' : 'In corso'}
+                  </span>
+                </div>
+                <div className="flex items-baseline justify-between text-sm mb-1.5">
+                  <span className="text-slate-500">Gestite</span>
+                  <span className="font-bold text-slate-900 dark:text-white tabular-nums">{gestite} / {c.totale}</span>
+                </div>
+                <div className="flex h-2.5 w-full rounded-full overflow-hidden bg-slate-100 dark:bg-slate-800" role="img"
+                  aria-label={parts.map(([s, n]) => `${STATI[s].label} ${n}`).join(', ')}>
+                  {parts.map(([s, n]) => n > 0 && (
+                    <div key={s} className={STATI[s].bar} style={{ width: `${(n / Math.max(c.totale, c.registrate, 1)) * 100}%` }} />
+                  ))}
+                </div>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 mt-3 text-xs">
+                  {parts.filter(([, n]) => n > 0).map(([s, n]) => (
+                    <span key={s} className="inline-flex items-center gap-1.5 text-slate-600 dark:text-slate-300">
+                      <span className={cn('w-2 h-2 rounded-full', STATI[s].bar)} />
+                      {STATI[s].label} <span className="font-semibold tabular-nums">{n}</span>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Chiamate in corso + ultimi eventi */}
+        <div className="xl:col-span-2 space-y-6">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-soft overflow-hidden">
+            <div className="px-5 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center gap-2">
+              <PhoneCall className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+              <h2 className="text-sm font-bold text-slate-900 dark:text-white">In corso</h2>
+              <span className="text-sm font-semibold text-slate-400">{inCorso.length}</span>
+            </div>
+            {inCorso.length === 0 ? (
+              <p className="px-5 py-6 text-sm text-slate-500 text-center">Nessuna chiamata in corso.</p>
+            ) : (
+              <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+                {inCorso.map(e => {
+                  const min = minutiDa(e.updated_at, now);
+                  const sec = Math.max(0, Math.floor(min * 60));
+                  return (
+                    <li key={e.id} className="px-5 py-3 flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-slate-900 dark:text-white truncate">{e.nome || e.numero}</div>
+                        <div className="text-xs text-slate-500 truncate">{e.numero} · {e.voicebot_nome || 'voicebot'}</div>
+                      </div>
+                      <span className={cn('text-xs font-mono tabular-nums shrink-0', min > SENZA_ESITO_MIN ? 'text-amber-600 dark:text-amber-400' : 'text-blue-600 dark:text-blue-400')}
+                        title={min > SENZA_ESITO_MIN ? 'Nessun esito ricevuto da Wildix' : 'Da quando è stata avviata'}>
+                        {min > SENZA_ESITO_MIN ? 'senza esito' : `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-soft overflow-hidden">
+            <div className="px-5 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center gap-2">
+              <Radio className="w-4 h-4 text-brand-600" />
+              <h2 className="text-sm font-bold text-slate-900 dark:text-white">Ultimi eventi</h2>
+            </div>
+            {feed.length === 0 ? (
+              <p className="px-5 py-6 text-sm text-slate-500 text-center">Nessun evento.</p>
+            ) : (
+              <ul className="divide-y divide-slate-100 dark:divide-slate-800 max-h-[520px] overflow-y-auto">
+                {feed.map(e => {
+                  const st = STATI[e.stato] || STATI.in_coda;
+                  return (
+                    <li key={e.id} className="px-5 py-2.5 flex items-start gap-3">
+                      <st.icon className={cn('w-4 h-4 mt-0.5 shrink-0', st.color)} />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-baseline justify-between gap-2">
+                          <span className="text-sm font-medium text-slate-900 dark:text-white truncate">{e.nome || e.numero}</span>
+                          <span className="text-[11px] text-slate-400 tabular-nums shrink-0">{ora(e.updated_at)}</span>
+                        </div>
+                        <div className="text-xs text-slate-500">
+                          <span className={cn('font-semibold', st.color)}>{st.label}</span>
+                          {e.durata_ms ? ` · ${durata(e.durata_ms)}` : ''}
+                          {e.voicebot_nome ? ` · ${e.voicebot_nome}` : ''}
+                        </div>
+                        {e.errore && <div className="text-xs text-red-600 dark:text-red-400 mt-0.5">{e.errore}</div>}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <p className="text-xs text-slate-500">
+        Mostra solo le chiamate partite dalle campagne lanciate da questo sito, ciascuna con il voicebot scelto per la campagna.
+        "In corso" significa che Wildix ha accettato la chiamata: l'esito arriva quando la chiamata finisce.
+      </p>
+
+      {/* Diagnostica (solo admin): eventi Wildix non usati */}
+      {user?.isAdmin && diagnostics && (
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden">
+          <button onClick={() => setShowDiag(v => !v)} className="w-full px-5 py-3 flex items-center justify-between text-sm font-semibold text-slate-700 dark:text-slate-300">
+            Diagnostica: eventi Wildix ricevuti e non usati
+            <ChevronDown className={cn('w-4 h-4 transition-transform', showDiag && 'rotate-180')} />
+          </button>
+          {showDiag && (
+            <div className="px-5 pb-4">
+              {diagnostics.length === 0 ? (
+                <p className="text-sm text-slate-500">Nessun evento scartato registrato.</p>
+              ) : (
+                <table className="w-full text-sm">
+                  <thead><tr className="text-left text-xs text-slate-500 uppercase"><th className="py-1">Evento</th><th>Motivo</th><th className="text-right">Totale</th></tr></thead>
+                  <tbody>
+                    {diagnostics.map(d => (
+                      <tr key={d.event_type + d.reason} className="border-t border-slate-100 dark:border-slate-800">
+                        <td className="py-1.5 font-mono text-xs text-slate-700 dark:text-slate-300">{d.event_type}</td>
+                        <td className="text-xs text-slate-500">{d.reason}</td>
+                        <td className="text-right tabular-nums text-slate-900 dark:text-white">{d.totale}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              <p className="text-xs text-slate-500 mt-3">
+                Se compare <span className="font-mono">call:live:progress</span>, Wildix invia già gli aggiornamenti delle chiamate in corso
+                e si possono aggiungere gli stati "squilla" e "in conversazione".
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
