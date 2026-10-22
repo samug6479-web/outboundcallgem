@@ -50,7 +50,9 @@
     "nome": "Miranda",
     "canSchedule": true,
     "role": "Admin",
-    "isAdmin": true
+    "isAdmin": true,
+    "twoFactorRequired": true,
+    "twoFactorEnabled": false
   },
   {
     "username": "giovanni",
