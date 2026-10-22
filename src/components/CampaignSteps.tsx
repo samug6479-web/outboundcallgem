@@ -2,7 +2,7 @@ import React, { useRef, useState } from 'react';
 import { useCampaign } from '../context/CampaignContext';
 import { FileText, FileSpreadsheet, Keyboard, UploadCloud, Plus, Trash2, DownloadCloud, AlertTriangle } from 'lucide-react';
 import * as XLSX from 'xlsx';
-import { cn } from '../lib/utils';
+import { cn, parseContactsCsv } from '../lib/utils';
 
 export function Step1Upload() {
   const { user, uploadMode, setUploadMode, setContacts, updateManualContacts, contacts } = useCampaign();
@@ -17,15 +17,7 @@ export function Step1Upload() {
     const reader = new FileReader();
     reader.onload = (e) => {
       if (!e.target?.result) return;
-      const lines = (e.target.result as string).split('\n').map(l => l.trim()).filter(Boolean);
-      const out = [];
-      for (const line of lines) {
-        const sep = line.includes(';') ? ';' : ',';
-        const parts = line.split(sep).map(p => p.trim().replace(/^"|"$/g, ''));
-        if (parts.length < 2 || !parts[0] || !parts[1]) continue;
-        if (['nome', 'name'].includes(parts[0].toLowerCase())) continue;
-        out.push({ id: crypto.randomUUID(), nome: parts[0], numero: parts[1] });
-      }
+      const out = parseContactsCsv(e.target.result as string).map(c => ({ id: crypto.randomUUID(), ...c }));
       setContacts([]);
       updateManualContacts(out);
     };

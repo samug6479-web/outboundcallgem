@@ -5,6 +5,22 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+// Legge un CSV di contatti "nome, numero". Accetta virgola, punto e virgola
+// (Excel in italiano) o tabulazione, righe Windows (CRLF), virgolette e
+// riga di intestazione. Usato da Nuova Campagna e da Liste Salvate.
+export function parseContactsCsv(text: string): { nome: string; numero: string }[] {
+  const out: { nome: string; numero: string }[] = [];
+  const lines = String(text || '').replace(/^\uFEFF/, '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const sep = line.includes(';') ? ';' : line.includes('\t') ? '\t' : ',';
+    const parts = line.split(sep).map(p => p.trim().replace(/^"|"$/g, '').trim());
+    if (parts.length < 2 || !parts[0] || !parts[1]) continue;
+    if (['nome', 'name'].includes(parts[0].toLowerCase())) continue;
+    out.push({ nome: parts[0], numero: parts[1] });
+  }
+  return out;
+}
+
 export function normalizePhoneNumber(num: string): string {
   if (!num) return num;
   // Rimuovi spazi, trattini, punti, parentesi

@@ -4,7 +4,7 @@ import { List, DownloadCloud, Play, Trash2, Plus, Users, UploadCloud, FileSpread
 import { format } from 'date-fns';
 import { it } from 'date-fns/locale';
 import * as XLSX from 'xlsx';
-import { cn } from '../lib/utils';
+import { cn, parseContactsCsv } from '../lib/utils';
 import { ConfirmModal } from './ConfirmModal';
 
 export function ContactLists({ onSelectProcess }: { onSelectProcess: () => void }) {
@@ -25,22 +25,11 @@ export function ContactLists({ onSelectProcess }: { onSelectProcess: () => void 
 
     const reader = new FileReader();
     
-    if (file.name.endsWith('.csv')) {
+    if (/\.(csv|txt)$/i.test(file.name)) {
       reader.onload = (e) => {
         try {
-          const text = e.target?.result as string;
-          const rows = text.split('\n');
-          const out = [];
-          for (const row of rows) {
-            const cols = row.split(',').map(s => s.trim());
-            if (cols.length >= 2) {
-              const nome = cols[0];
-              const numero = cols[1];
-              if (!nome || !numero) continue;
-              if (['nome', 'name'].includes(nome.toLowerCase())) continue;
-              out.push({ id: crypto.randomUUID(), nome, numero });
-            }
-          }
+          // Stesso lettore di Nuova Campagna: accetta anche il punto e virgola.
+          const out = parseContactsCsv(e.target?.result as string).map(c => ({ id: crypto.randomUUID(), ...c }));
           setTempContacts(out);
         } catch (err) {
           console.error(err);
@@ -162,7 +151,7 @@ export function ContactLists({ onSelectProcess }: { onSelectProcess: () => void 
                   <input
                     type="file"
                     id="listUpload"
-                    accept=".csv,.xls,.xlsx"
+                    accept=".csv,.txt,.xls,.xlsx"
                     onChange={handleFileChange}
                     ref={fileInputRef}
                     className="hidden"
