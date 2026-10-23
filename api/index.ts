@@ -627,6 +627,74 @@ async function avvisaAssegnazione(f: any, username: string, daUsername: string):
   if ((await preferenzeDi(username)).emailAssegnazioni === false) return false;
   const appUrl = (process.env.APP_URL || "https://outboundcallgem.vercel.app").replace(/\/$/, "");
   const link = `${appUrl}/?tab=followups&miei=1`;
+  const nomeDest = (destinatario?.nome || "").split(" ")[0];
+
+  // Riassunto della chiamata e campagna, se ci sono: chi riceve sa già cosa è successo.
+  let riassunto: any = null;
+  try {
+    if (f.call_id) {
+      const rr = (await sql!`SELECT riassunto FROM call_results WHERE call_id = ${f.call_id} AND riassunto IS NOT NULL LIMIT 1`) as any[];
+      riassunto = leggiRiassunto(rr[0]?.riassunto);
+    }
+  } catch { /* senza riassunto */ }
+  const campagna = await campagnaDelNumero(f.numero).catch(() => null);
+  const testoRiassunto = String(riassunto?.testo || riassunto?.titolo || "").trim();
+  const quando = f.created_at
+    ? new Date(f.created_at).toLocaleString("it-IT", { timeZone: "Europe/Rome", day: "2-digit", month: "long", hour: "2-digit", minute: "2-digit" })
+    : "";
+
+  const dati: [string, string, string?][] = [
+    ["Contatto", chi],
+    ...(f.numero ? [["Telefono", f.numero, `tel:${f.numero}`] as [string, string, string]] : []),
+    ...(f.motivo ? [["Motivo", f.motivo] as [string, string]] : []),
+    ...(campagna?.voicebot_nome ? [["Voicebot", campagna.voicebot_nome] as [string, string]] : []),
+    ...(quando ? [["Chiamata del", quando] as [string, string]] : []),
+    ["Assegnato da", daNome],
+  ];
+  const righe = dati.map(([k, v, href], i) => {
+    const border = i < dati.length - 1 ? "border-bottom:1px solid #eef1f6;" : "";
+    const val = href ? `<a href="${escapeHtml(href)}" style="color:#1e3dc8;text-decoration:none;">${escapeHtml(v)}</a>` : escapeHtml(v);
+    return `<tr><td style="padding:11px 0;${border}font-size:14px;color:#64748b;width:40%;">${k}</td>
+      <td style="padding:11px 0;${border}font-size:14px;color:#0f172a;font-weight:600;text-align:right;">${val}</td></tr>`;
+  }).join("");
+  const step = (n: number, t: string, d: string) => `<tr>
+      <td style="vertical-align:top;width:34px;padding:0 0 14px;"><div style="width:24px;height:24px;line-height:24px;border-radius:999px;background:#e0e7ff;color:#1e3dc8;font-size:12px;font-weight:700;text-align:center;">${n}</div></td>
+      <td style="padding:2px 0 14px;font-size:14px;color:#475569;line-height:1.5;"><strong style="color:#0f172a;">${t}</strong> ${d}</td></tr>`;
+
+  const html = `
+<div style="background:#eef1f6;padding:28px 12px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0;">
+  <tr><td style="padding:28px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+    <td><img src="${appUrl}/gem-logo-color.png" width="96" alt="GEM Group" style="display:block;width:96px;height:auto;"></td>
+    <td style="text-align:right;"><span style="display:inline-block;background:#e0e7ff;color:#1e3dc8;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;">&#9679; Assegnato a te</span></td></tr></table></td></tr>
+  <tr><td style="padding:26px 40px 6px;font-size:24px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">Nuovo follow-up da gestire</td></tr>
+  <tr><td style="padding:0 40px 20px;font-size:15px;color:#475569;line-height:1.6;">Ciao${nomeDest ? ` ${escapeHtml(nomeDest)}` : ""}, <strong style="color:#0f172a;">${escapeHtml(daNome)}</strong> ti ha assegnato questo contatto da ricontattare.</td></tr>
+  <tr><td style="padding:0 40px 8px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border-radius:10px;"><tr><td style="padding:6px 20px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${righe}</table></td></tr></table></td></tr>
+  ${f.nota ? `<tr><td style="padding:12px 40px 0;"><div style="background:#f8fafc;border-left:3px solid #1e3dc8;padding:12px 16px;font-size:14px;color:#475569;line-height:1.5;"><strong style="color:#0f172a;">Nota di ${escapeHtml(daNome)}:</strong> ${escapeHtml(f.nota)}</div></td></tr>` : ""}
+  ${testoRiassunto ? `<tr><td style="padding:12px 40px 0;"><div style="background:#f8fafc;border-left:3px solid #94a3b8;padding:12px 16px;font-size:14px;color:#475569;line-height:1.5;"><strong style="color:#0f172a;">Riassunto della chiamata:</strong> ${escapeHtml(testoRiassunto)}</div></td></tr>` : ""}
+  <tr><td style="padding:24px 40px 4px;font-size:13px;font-weight:700;color:#0f172a;text-transform:uppercase;letter-spacing:0.6px;">Cosa fare</td></tr>
+  <tr><td style="padding:8px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+    ${step(1, "Richiama il contatto", f.numero ? `al numero <a href="tel:${escapeHtml(f.numero)}" style="color:#1e3dc8;text-decoration:none;font-weight:600;">${escapeHtml(f.numero)}</a>.` : "appena puoi.")}
+    ${step(2, "Aggiungi una nota", "nel follow-up con l'esito della telefonata.")}
+    ${step(3, "Premi Fatto", "quando il contatto è gestito: sparisce dalla lista Da gestire.")}
+  </table></td></tr>
+  <tr><td style="padding:12px 40px 34px;"><a href="${link}" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:14px 20px;border-radius:9px;">Apri i miei follow-up</a></td></tr>
+  <tr><td style="padding:18px 40px;border-top:1px solid #eef1f6;font-size:12px;color:#94a3b8;line-height:1.6;">GEM Group &middot; Soluzioni di comunicazione e automazione AI su tecnologia Wildix<br>Email automatica inviata da GEM Outbound. Puoi disattivarla da Il Mio Profilo &rsaquo; Avvisi.</td></tr>
+</table></div>`;
+
+  const text = [
+    "Nuovo follow-up da gestire",
+    "",
+    `Ciao${nomeDest ? ` ${nomeDest}` : ""}, ${daNome} ti ha assegnato questo contatto da ricontattare.`,
+    "",
+    ...dati.map(([k, v]) => `${k}: ${v}`),
+    ...(f.nota ? ["", `Nota di ${daNome}: ${f.nota}`] : []),
+    ...(testoRiassunto ? ["", `Riassunto della chiamata: ${testoRiassunto}`] : []),
+    "",
+    `Apri i miei follow-up: ${link}`,
+  ].join("\n");
+
   try {
     const transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST || "smtp.gmail.com",
@@ -637,19 +705,9 @@ async function avvisaAssegnazione(f: any, username: string, daUsername: string):
     await transporter.sendMail({
       from: `"GEM Outbound" <${process.env.SMTP_USER}>`,
       to,
-      subject: `Follow-up assegnato a te: ${chi}`,
-      text: [`${daNome} ti ha assegnato un follow-up.`, "", `${chi}${f.numero && f.nome ? ` (${f.numero})` : ""}`, f.motivo ? `Motivo: ${f.motivo}` : null, f.nota ? `Nota: ${f.nota}` : null, "", `Apri i tuoi follow-up: ${link}`].filter(x => x !== null).join("\n"),
-      html: `
-<div style="background:#eef1f6;padding:28px 12px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0;">
-  <tr><td style="padding:26px 36px 0;font-size:14px;color:#64748b;">${escapeHtml(daNome)} ti ha assegnato un follow-up</td></tr>
-  <tr><td style="padding:8px 36px 4px;font-size:22px;font-weight:700;color:#0f172a;">${escapeHtml(chi)}</td></tr>
-  ${f.numero ? `<tr><td style="padding:0 36px 12px;"><a href="tel:${escapeHtml(f.numero)}" style="font-size:16px;color:#1e3dc8;font-weight:600;text-decoration:none;">${escapeHtml(f.numero)}</a></td></tr>` : ""}
-  ${f.motivo ? `<tr><td style="padding:0 36px 8px;"><span style="display:inline-block;background:#fef3c7;color:#92400e;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;">${escapeHtml(f.motivo)}</span></td></tr>` : ""}
-  ${f.nota ? `<tr><td style="padding:6px 36px 6px;font-size:15px;color:#334155;line-height:1.6;"><strong>Nota:</strong> ${escapeHtml(f.nota)}</td></tr>` : ""}
-  <tr><td style="padding:16px 36px 28px;"><a href="${link}" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:13px 20px;border-radius:9px;">Apri i miei follow-up</a></td></tr>
-  <tr><td style="padding:16px 36px;border-top:1px solid #eef1f6;font-size:12px;color:#94a3b8;">Puoi disattivare queste email da Il Mio Profilo. Email automatica di GEM Outbound.</td></tr>
-</table></div>`,
+      subject: `Nuovo follow-up per te: ${chi}${f.motivo ? ` · ${f.motivo}` : ""}`,
+      text,
+      html,
     });
     return true;
   } catch (err) {
