@@ -971,7 +971,106 @@ function githubWritesBlocked(): boolean {
 const GITHUB_WRITE_BLOCKED_MSG =
   "Scrittura bloccata: ambiente di test senza GITHUB_DATA_BRANCH (eviterebbe di modificare i dati di produzione).";
 
+// ── Dati di configurazione (utenti e voicebot) nel database ──
+// Prima stavano in users.json e voicebots.json su GitHub: ogni modifica
+// (abilitare un voicebot, cambiare un ruolo, il profilo, il 2FA) faceva un
+// commit su main e quindi un nuovo deploy su Vercel. Ora stanno nella tabella
+// dati_config. Alla prima lettura, se la riga manca, si copiano i dati
+// attuali da GitHub (o dal file locale), poi GitHub non viene più toccato.
+let datiConfigReady: Promise<void> | null = null;
+function ensureDatiConfig(): Promise<void> {
+  if (!datiConfigReady) {
+    datiConfigReady = sql!`
+      CREATE TABLE IF NOT EXISTS dati_config (
+        chiave        TEXT PRIMARY KEY,
+        valore        JSONB       NOT NULL,
+        aggiornato_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `.then(() => undefined).catch(err => { datiConfigReady = null; throw err; });
+  }
+  return datiConfigReady;
+}
+
+// Valore dal database; undefined se la riga non c'è ancora.
+async function leggiDatiConfig(chiave: string): Promise<any[] | undefined> {
+  await ensureDatiConfig();
+  const r = (await withRetry(() => sql!`SELECT valore FROM dati_config WHERE chiave = ${chiave}`)) as any[];
+  if (!r[0]) return undefined;
+  const v = typeof r[0].valore === "string" ? JSON.parse(r[0].valore) : r[0].valore;
+  return Array.isArray(v) ? v : [];
+}
+
+async function scriviDatiConfig(chiave: string, valore: any[]): Promise<void> {
+  await ensureDatiConfig();
+  await withRetry(() => sql!`
+    INSERT INTO dati_config (chiave, valore, aggiornato_at) VALUES (${chiave}, ${JSON.stringify(valore)}::jsonb, now())
+    ON CONFLICT (chiave) DO UPDATE SET valore = EXCLUDED.valore, aggiornato_at = now()
+  `);
+}
+
+// Prima lettura: copia nel database i dati presi da GitHub, senza
+// sovrascrivere una riga creata nel frattempo da un'altra richiesta.
+async function importaDatiConfig(chiave: string, valore: any[]): Promise<any[]> {
+  if (!sql || !Array.isArray(valore) || valore.length === 0) return valore;
+  try {
+    await ensureDatiConfig();
+    await sql`INSERT INTO dati_config (chiave, valore) VALUES (${chiave}, ${JSON.stringify(valore)}::jsonb) ON CONFLICT (chiave) DO NOTHING`;
+    return (await leggiDatiConfig(chiave)) ?? valore;
+  } catch (err) {
+    console.error(`Errore importazione ${chiave} nel database:`, err);
+    return valore;
+  }
+}
+
 async function readVoicebots() {
+  if (sql) {
+    try {
+      const v = await leggiDatiConfig("voicebots");
+      if (v !== undefined) return v;
+      return await importaDatiConfig("voicebots", await readVoicebotsGithub());
+    } catch (err) {
+      console.error("Errore lettura voicebot dal database, uso GitHub:", err);
+    }
+  }
+  return readVoicebotsGithub();
+}
+
+async function writeVoicebots(bots: any[]) {
+  if (githubWritesBlocked()) {
+    console.warn(GITHUB_WRITE_BLOCKED_MSG);
+    throw new Error(GITHUB_WRITE_BLOCKED_MSG);
+  }
+  if (sql) return scriviDatiConfig("voicebots", bots);
+  return writeVoicebotsGithub(bots);
+}
+
+async function readUsers() {
+  if (sql) {
+    try {
+      const v = await leggiDatiConfig("users");
+      if (v !== undefined) return v;
+      return await importaDatiConfig("users", await readUsersGithub());
+    } catch (err) {
+      console.error("Errore lettura utenti dal database, uso GitHub:", err);
+    }
+  }
+  return readUsersGithub();
+}
+
+async function writeUsers(users: any[]) {
+  if (githubWritesBlocked()) {
+    console.warn(GITHUB_WRITE_BLOCKED_MSG);
+    return;
+  }
+  if (sql) {
+    // Come prima con GitHub, un errore viene registrato ma non blocca la richiesta.
+    try { return await scriviDatiConfig("users", users); }
+    catch (err) { console.error("Errore scrittura utenti nel database:", err); return; }
+  }
+  return writeUsersGithub(users);
+}
+
+async function readVoicebotsGithub() {
   const token = process.env.GITHUB_TOKEN;
   if (token) {
     try {
@@ -997,7 +1096,7 @@ async function readVoicebots() {
   } catch { return []; }
 }
 
-async function writeVoicebots(bots: any[]) {
+async function writeVoicebotsGithub(bots: any[]) {
   if (githubWritesBlocked()) {
     console.warn(GITHUB_WRITE_BLOCKED_MSG);
     throw new Error(GITHUB_WRITE_BLOCKED_MSG);
@@ -1032,7 +1131,7 @@ async function writeVoicebots(bots: any[]) {
   } catch (err) { console.error("Error writing voicebots to GitHub (dopo retry):", err); throw err; }
 }
 
-async function readUsers() {
+async function readUsersGithub() {
   const token = process.env.GITHUB_TOKEN;
   if (token) {
     try {
@@ -1064,7 +1163,7 @@ async function readUsers() {
   }
 }
 
-async function writeUsers(users: any[]) {
+async function writeUsersGithub(users: any[]) {
   if (githubWritesBlocked()) {
     console.warn(GITHUB_WRITE_BLOCKED_MSG);
     return;
