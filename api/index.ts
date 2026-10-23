@@ -545,6 +545,7 @@ app.put("/api/followups/:id", requireAuth, express.json(), async (req: any, res)
   }
   try {
     await ensureFollowupsExtra();
+    const prima = ((await sql`SELECT assegnato_a FROM followups WHERE id = ${id}`) as any[])[0];
     const r = (await sql`
       UPDATE followups SET
         nota = CASE WHEN ${nota !== undefined}::boolean THEN ${nota ?? null} ELSE nota END,
@@ -554,10 +555,139 @@ app.put("/api/followups/:id", requireAuth, express.json(), async (req: any, res)
       RETURNING *
     `) as any[];
     if (!r[0]) return res.status(404).json({ ok: false, error: "Follow-up non trovato" });
-    res.json({ ok: true, followup: r[0] });
+    // Assegnato a un'altra persona: notifica nel sito ed email (se non l'ha disattivata).
+    let avvisato = false;
+    if (assegnato && (prima?.assegnato_a || "").toLowerCase() !== assegnato.toLowerCase()
+        && assegnato.toLowerCase() !== String(req.session.username).toLowerCase()) {
+      avvisato = await avvisaAssegnazione(r[0], assegnato, req.session.username);
+    }
+    res.json({ ok: true, followup: r[0], avvisato });
   } catch (err) {
     console.error("Errore aggiornamento follow-up:", err);
     res.status(500).json({ ok: false, error: "Errore aggiornamento" });
+  }
+});
+
+// ── Notifiche nel sito (per ora: follow-up assegnati) ──
+let notificheReady: Promise<void> | null = null;
+function ensureNotifiche(): Promise<void> {
+  if (!notificheReady) {
+    notificheReady = (async () => {
+      await sql!`
+        CREATE TABLE IF NOT EXISTS notifiche (
+          id          SERIAL PRIMARY KEY,
+          username    TEXT NOT NULL,
+          tipo        TEXT NOT NULL,
+          titolo      TEXT NOT NULL,
+          testo       TEXT,
+          followup_id INT,
+          creata_da   TEXT,
+          creata_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+          letta_at    TIMESTAMPTZ
+        )
+      `;
+      await sql!`CREATE INDEX IF NOT EXISTS idx_notifiche_utente ON notifiche (username, letta_at, creata_at DESC)`;
+    })().catch(err => { notificheReady = null; throw err; });
+  }
+  return notificheReady;
+}
+
+async function preferenzeDi(username: string): Promise<Record<string, any>> {
+  try {
+    await ensurePreferenze();
+    const r = (await sql!`SELECT valore FROM preferenze_utente WHERE username = ${username.toLowerCase()}`) as any[];
+    return r[0]?.valore || {};
+  } catch { return {}; }
+}
+
+// Follow-up assegnato a una persona: notifica nel sito + email.
+// Restituisce true se l'email è partita.
+async function avvisaAssegnazione(f: any, username: string, daUsername: string): Promise<boolean> {
+  const destinatario = await findSessionUser(username).catch(() => null);
+  const da = await findSessionUser(daUsername).catch(() => null);
+  const daNome = da?.nome || daUsername;
+  const chi = f.nome || f.numero || "Contatto";
+  const titolo = `${daNome} ti ha assegnato un follow-up: ${chi}`;
+  const testo = [f.motivo, f.numero, f.nota].filter(Boolean).join(" · ");
+  try {
+    await ensureNotifiche();
+    // Una sola notifica non letta per follow-up e persona.
+    await sql!`DELETE FROM notifiche WHERE username = ${username.toLowerCase()} AND followup_id = ${f.id} AND letta_at IS NULL`;
+    await sql!`
+      INSERT INTO notifiche (username, tipo, titolo, testo, followup_id, creata_da)
+      VALUES (${username.toLowerCase()}, 'followup_assegnato', ${titolo}, ${testo || null}, ${f.id}, ${daNome})
+    `;
+  } catch (err) {
+    console.error("Errore creazione notifica:", err);
+  }
+
+  if (!process.env.SMTP_USER) return false;
+  const to = destinatario?.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(destinatario.email) ? destinatario.email : null;
+  if (!to) return false;
+  if ((await preferenzeDi(username)).emailAssegnazioni === false) return false;
+  const appUrl = (process.env.APP_URL || "https://outboundcallgem.vercel.app").replace(/\/$/, "");
+  const link = `${appUrl}/?tab=followups&miei=1`;
+  try {
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || "smtp.gmail.com",
+      port: parseInt(process.env.SMTP_PORT || "587"),
+      secure: process.env.SMTP_SECURE === "true",
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+    await transporter.sendMail({
+      from: `"GEM Outbound" <${process.env.SMTP_USER}>`,
+      to,
+      subject: `Follow-up assegnato a te: ${chi}`,
+      text: [`${daNome} ti ha assegnato un follow-up.`, "", `${chi}${f.numero && f.nome ? ` (${f.numero})` : ""}`, f.motivo ? `Motivo: ${f.motivo}` : null, f.nota ? `Nota: ${f.nota}` : null, "", `Apri i tuoi follow-up: ${link}`].filter(x => x !== null).join("\n"),
+      html: `
+<div style="background:#eef1f6;padding:28px 12px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0;">
+  <tr><td style="padding:26px 36px 0;font-size:14px;color:#64748b;">${escapeHtml(daNome)} ti ha assegnato un follow-up</td></tr>
+  <tr><td style="padding:8px 36px 4px;font-size:22px;font-weight:700;color:#0f172a;">${escapeHtml(chi)}</td></tr>
+  ${f.numero ? `<tr><td style="padding:0 36px 12px;"><a href="tel:${escapeHtml(f.numero)}" style="font-size:16px;color:#1e3dc8;font-weight:600;text-decoration:none;">${escapeHtml(f.numero)}</a></td></tr>` : ""}
+  ${f.motivo ? `<tr><td style="padding:0 36px 8px;"><span style="display:inline-block;background:#fef3c7;color:#92400e;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;">${escapeHtml(f.motivo)}</span></td></tr>` : ""}
+  ${f.nota ? `<tr><td style="padding:6px 36px 6px;font-size:15px;color:#334155;line-height:1.6;"><strong>Nota:</strong> ${escapeHtml(f.nota)}</td></tr>` : ""}
+  <tr><td style="padding:16px 36px 28px;"><a href="${link}" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:13px 20px;border-radius:9px;">Apri i miei follow-up</a></td></tr>
+  <tr><td style="padding:16px 36px;border-top:1px solid #eef1f6;font-size:12px;color:#94a3b8;">Puoi disattivare queste email da Il Mio Profilo. Email automatica di GEM Outbound.</td></tr>
+</table></div>`,
+    });
+    return true;
+  } catch (err) {
+    console.error("Errore email assegnazione follow-up:", err);
+    return false;
+  }
+}
+
+// Notifiche non lette dell'utente collegato.
+app.get("/api/notifiche", requireAuth, async (req: any, res) => {
+  if (!sql) return res.json({ ok: true, notifiche: [] });
+  try {
+    await ensureNotifiche();
+    const r = (await sql`
+      SELECT id, tipo, titolo, testo, followup_id, creata_da, creata_at FROM notifiche
+      WHERE username = ${String(req.session.username).toLowerCase()} AND letta_at IS NULL
+      ORDER BY creata_at DESC LIMIT 50
+    `) as any[];
+    res.json({ ok: true, notifiche: r });
+  } catch (err) {
+    console.error("Errore lettura notifiche:", err);
+    res.json({ ok: true, notifiche: [] });
+  }
+});
+
+// Segna come lette: le notifiche indicate, o tutte.
+app.post("/api/notifiche/lette", requireAuth, express.json(), async (req: any, res) => {
+  if (!sql) return res.json({ ok: true });
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((x: any) => parseInt(x, 10)).filter((x: number) => x > 0) : null;
+  try {
+    await ensureNotifiche();
+    const u = String(req.session.username).toLowerCase();
+    if (ids && ids.length) await sql`UPDATE notifiche SET letta_at = now() WHERE username = ${u} AND letta_at IS NULL AND id = ANY(${ids}::int[])`;
+    else await sql`UPDATE notifiche SET letta_at = now() WHERE username = ${u} AND letta_at IS NULL`;
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Errore notifiche lette:", err);
+    res.status(500).json({ ok: false });
   }
 });
 
@@ -3970,6 +4100,7 @@ app.put("/api/preferenze", requireAuth, async (req: any, res) => {
   const nuove: Record<string, unknown> = {};
   if (b.tema === "chiaro" || b.tema === "scuro") nuove.tema = b.tema;
   if ([1, 7, 30, 90].includes(Number(b.statsGiorni))) nuove.statsGiorni = Number(b.statsGiorni);
+  if (typeof b.emailAssegnazioni === "boolean") nuove.emailAssegnazioni = b.emailAssegnazioni;
   if (Object.keys(nuove).length === 0) return res.status(400).json({ ok: false, error: "Nessuna preferenza valida" });
   try {
     await ensurePreferenze();

@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { authFetch } from '../lib/authFetch';
 import { useCampaign } from '../context/CampaignContext';
-import { User, Mail, Phone, Save, Loader2, CheckCircle2, AlertCircle, Shield, Building2 } from 'lucide-react';
+import { User, Mail, Phone, Save, Loader2, CheckCircle2, AlertCircle, Shield, Building2, BellRing } from 'lucide-react';
 import { cn } from '../lib/utils';
 
 export function ProfileSection() {
@@ -10,6 +11,27 @@ export function ProfileSection() {
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
   const [error, setError] = useState('');
+
+  // Email quando qualcuno mi assegna un follow-up (predefinito: sì).
+  const [emailAss, setEmailAss] = useState(true);
+  const [salvandoAvvisi, setSalvandoAvvisi] = useState(false);
+  useEffect(() => {
+    authFetch('/api/preferenze').then(r => r.json())
+      .then(d => { if (d?.ok && d.preferenze?.emailAssegnazioni === false) setEmailAss(false); })
+      .catch(() => {});
+  }, []);
+  const cambiaEmailAss = async () => {
+    const nuovo = !emailAss;
+    setEmailAss(nuovo);
+    setSalvandoAvvisi(true);
+    try {
+      const res = await authFetch('/api/preferenze', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ emailAssegnazioni: nuovo }),
+      });
+      if (!res.ok) setEmailAss(!nuovo);
+    } catch { setEmailAss(!nuovo); }
+    setSalvandoAvvisi(false);
+  };
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -97,6 +119,25 @@ export function ProfileSection() {
             {loading ? 'Salvataggio...' : 'Salva modifiche'}
           </button>
         </form>
+      </div>
+
+      {/* Avvisi */}
+      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-soft">
+        <h2 className="text-base font-bold text-slate-900 dark:text-white mb-1 flex items-center gap-2"><BellRing className="w-4 h-4 text-brand-600" /> Avvisi</h2>
+        <p className="text-sm text-slate-500 mb-5">Quando qualcuno ti assegna un follow-up lo vedi in cima al sito al prossimo accesso.</p>
+        <div className="flex items-center gap-4">
+          <div className="flex-1">
+            <div className="text-sm font-semibold text-slate-800 dark:text-slate-200">Email quando mi assegnano un follow-up</div>
+            <div className="text-xs text-slate-500 mt-0.5">
+              {user?.email ? `Arriva a ${user.email}.` : "Inserisci la tua email qui sopra per riceverla."}
+            </div>
+          </div>
+          <button type="button" role="switch" aria-checked={emailAss} aria-label="Email quando mi assegnano un follow-up"
+            onClick={cambiaEmailAss} disabled={salvandoAvvisi}
+            className={cn('relative w-11 h-6 rounded-full transition-colors shrink-0 disabled:opacity-60', emailAss ? 'bg-brand-600' : 'bg-slate-300 dark:bg-slate-600')}>
+            <span className={cn('absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform', emailAss ? 'translate-x-5' : 'translate-x-0')} />
+          </button>
+        </div>
       </div>
     </div>
   );

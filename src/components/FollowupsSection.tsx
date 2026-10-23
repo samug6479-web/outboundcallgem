@@ -35,7 +35,7 @@ function motivoClass(motivo: string) {
 // Elenco dei contatti da richiamare o gestire a mano: chiamate non risposte,
 // appuntamenti rifiutati, disdette, trasferimenti, ecc.
 // Nota e persona assegnata: si apre sotto la riga.
-function DettaglioFollowup({ f, utenti, onSaved }: { f: Followup; utenti: Utente[]; onSaved: (f: Followup) => void }) {
+function DettaglioFollowup({ f, utenti, io, onSaved }: { f: Followup; utenti: Utente[]; io?: string; onSaved: (f: Followup) => void }) {
   const [nota, setNota] = useState(f.nota || '');
   const [assegnato, setAssegnato] = useState(f.assegnato_a || '');
   const [saving, setSaving] = useState(false);
@@ -65,6 +65,11 @@ function DettaglioFollowup({ f, utenti, onSaved }: { f: Followup; utenti: Utente
           <option value="">Nessuno</option>
           {utenti.map(u => <option key={u.username} value={u.username}>{u.nome}</option>)}
         </select>
+        {assegnato && assegnato.toLowerCase() !== (f.assegnato_a || '').toLowerCase() && assegnato.toLowerCase() !== (io || '').toLowerCase() && (
+          <span className="text-[11px] text-slate-500">
+            Salvando, {utenti.find(u => u.username === assegnato)?.nome || assegnato} riceve un avviso nel sito e un'email.
+          </span>
+        )}
       </div>
       <textarea value={nota} onChange={e => setNota(e.target.value)} rows={2} placeholder="Nota (es. richiamato, vuole un preventivo)" aria-label="Nota"
         className="w-full text-sm px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-brand-500" />
@@ -83,7 +88,18 @@ function DettaglioFollowup({ f, utenti, onSaved }: { f: Followup; utenti: Utente
 export function FollowupsSection() {
   const { user } = useCampaign();
   const [utenti, setUtenti] = useState<Utente[]>([]);
-  const [soloMiei, setSoloMiei] = useState(false);
+  // "Assegnati a me" già attivo se si arriva da una notifica o dall'email di assegnazione.
+  const [soloMiei, setSoloMiei] = useState(() => {
+    let v = new URLSearchParams(window.location.search).get('miei') === '1';
+    try { if (sessionStorage.getItem('gem_followups_miei') === '1') { v = true; sessionStorage.removeItem('gem_followups_miei'); } } catch { /* niente */ }
+    return v;
+  });
+  // Notifica aperta mentre questa pagina è già visibile.
+  useEffect(() => {
+    const on = () => { setSoloMiei(true); try { sessionStorage.removeItem('gem_followups_miei'); } catch { /* niente */ } };
+    window.addEventListener('gem:followups-miei', on);
+    return () => window.removeEventListener('gem:followups-miei', on);
+  }, []);
   const [aperto, setAperto] = useState<number | null>(null);
   useEffect(() => {
     authFetch('/api/utenti/nomi').then(r => r.json()).then(d => { if (d?.ok) setUtenti(d.utenti || []); }).catch(() => {});
@@ -238,7 +254,7 @@ export function FollowupsSection() {
               )}
              </div>
               {aperto === f.id && (
-                <DettaglioFollowup f={f} utenti={utenti}
+                <DettaglioFollowup f={f} utenti={utenti} io={user?.username}
                   onSaved={nf => { setItems(prev => prev.map(x => (x.id === nf.id ? { ...x, ...nf } : x))); setAperto(null); }} />
               )}
             </li>
