@@ -21,6 +21,7 @@ interface StatsResponse {
   registroCampagneDal: string | null;
   perVoicebot?: Confronto[];
   perFascia?: (Confronto & { ora: number })[];
+  esitiFollowup?: { totale: number; positivi: number; perEsito: { esito: string; label: string; n: number }[]; perPersona: { persona: string; chiusi: number; positivi: number }[] };
 }
 
 // Confronto tra voicebot e tra fasce orarie (chiamate delle campagne del sito).
@@ -190,6 +191,7 @@ export function StatsDashboard() {
       Interrotte: v.interrotte, 'Non raggiunti': v.nonRaggiunte, 'Interessati o appuntamenti': v.interessati,
       'Durata media': formatDurata(v.durataMediaMs),
     })), [28, 10, 10, 12, 10, 14, 24, 14]);
+    if (stats.esitiFollowup?.totale) add('Esiti follow-up', stats.esitiFollowup.perEsito.map(x => ({ Esito: x.label, 'Follow-up chiusi': x.n })), [28, 16]);
     add('Per fascia oraria', (stats.perFascia || []).map(f => ({
       Ora: `${String(f.ora).padStart(2, '0')}:00–${String(f.ora + 1).padStart(2, '0')}:00`, Chiamate: f.chiamate, Risposte: f.risposte,
       'Risposte (%)': pct(f.risposte, f.chiamate), 'Interessati o appuntamenti': f.interessati,
@@ -400,6 +402,53 @@ export function StatsDashboard() {
           })()}
         </Card>
       </div>
+
+      {/* Com'è finita: esito dei follow-up chiusi */}
+      <Card title={`Esito dei follow-up chiusi — ${periodLabel}`}>
+        {loading ? <div className="h-32" /> : !stats?.esitiFollowup?.totale ? (
+          <Empty text="Nessun follow-up chiuso con esito nel periodo. Quando premi Fatto scegli com'è andata." />
+        ) : (() => {
+          const e = stats.esitiFollowup!;
+          const max = Math.max(1, ...e.perEsito.map(x => x.n));
+          const colore: Record<string, string> = { venduto: '#16a34a', appuntamento: '#059669', preventivo: '#2563eb', non_interessato: '#94a3b8', non_raggiungibile: '#d97706', altro: '#94a3b8', non_indicato: '#cbd5e1' };
+          return (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <div className="space-y-2">
+                <p className="text-sm text-slate-600 dark:text-slate-300">
+                  <strong className="text-2xl font-bold text-slate-900 dark:text-white tabular-nums">{pct(e.positivi, e.totale)}%</strong>
+                  <span className="ml-2">chiusi con vendita o appuntamento ({e.positivi} su {e.totale})</span>
+                </p>
+                {e.perEsito.map(x => (
+                  <div key={x.esito} className="flex items-center gap-3 text-sm">
+                    <span className="w-44 shrink-0 text-slate-600 dark:text-slate-300 truncate">{x.label}</span>
+                    <div className="flex-1 h-2.5 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
+                      <div className="h-full rounded-full" style={{ width: `${(x.n / max) * 100}%`, background: colore[x.esito] || '#94a3b8' }} />
+                    </div>
+                    <span className="w-10 shrink-0 text-right text-xs font-semibold text-slate-700 dark:text-slate-200 tabular-nums">{x.n}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="text-xs text-slate-500 uppercase">
+                    <tr><th className="text-left py-2">Persona</th><th className="text-right">Chiusi</th><th className="text-right">Vendite + appunt.</th><th className="text-right">%</th></tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-slate-700 dark:text-slate-300">
+                    {e.perPersona.map(p => (
+                      <tr key={p.persona}>
+                        <td className="py-1.5">{p.persona}</td>
+                        <td className="text-right tabular-nums">{p.chiusi}</td>
+                        <td className="text-right tabular-nums">{p.positivi}</td>
+                        <td className="text-right tabular-nums font-semibold">{pct(p.positivi, p.chiusi)}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          );
+        })()}
+      </Card>
 
       {/* Registro accessi (solo Admin) */}
       {isAdmin && (

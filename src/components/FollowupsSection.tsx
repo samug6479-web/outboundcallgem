@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { BellRing, CheckCircle2, Loader2, Phone, RefreshCw, Download, StickyNote, UserCircle2, Search, UserPlus, X } from 'lucide-react';
+import { BellRing, CheckCircle2, Loader2, Phone, RefreshCw, Download, StickyNote, UserCircle2, Search, UserPlus, X, CalendarClock } from 'lucide-react';
+import { ESITI_FINALI, EsitoFinale, esitoFinale, perInputLocale, scorciatoieRichiamo, statoRichiamo } from '../lib/followup';
 import { useCampaign } from '../context/CampaignContext';
 import * as XLSX from 'xlsx';
 import { authFetch } from '../lib/authFetch';
@@ -17,6 +18,10 @@ interface Followup {
   assegnato_a?: string | null;
   aggiornato_at?: string | null;
   aggiornato_da?: string | null;
+  richiamare_at?: string | null;
+  esito_finale?: string | null;
+  chiuso_at?: string | null;
+  chiuso_da?: string | null;
 }
 
 interface Utente { username: string; nome: string }
@@ -38,6 +43,7 @@ function motivoClass(motivo: string) {
 function DettaglioFollowup({ f, utenti, io, onSaved }: { f: Followup; utenti: Utente[]; io?: string; onSaved: (f: Followup) => void }) {
   const [nota, setNota] = useState(f.nota || '');
   const [assegnato, setAssegnato] = useState(f.assegnato_a || '');
+  const [richiamo, setRichiamo] = useState(perInputLocale(f.richiamare_at));
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState('');
   const salva = async () => {
@@ -46,7 +52,7 @@ function DettaglioFollowup({ f, utenti, io, onSaved }: { f: Followup; utenti: Ut
     try {
       const res = await authFetch(`/api/followups/${f.id}`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nota, assegnato_a: assegnato || null }),
+        body: JSON.stringify({ nota, assegnato_a: assegnato || null, richiamare_at: richiamo ? new Date(richiamo).toISOString() : null }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.ok) throw new Error(data.error || 'Non salvato');
@@ -71,6 +77,20 @@ function DettaglioFollowup({ f, utenti, io, onSaved }: { f: Followup; utenti: Ut
           </span>
         )}
       </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <label htmlFor={`ric-${f.id}`} className="text-xs font-semibold text-slate-500 inline-flex items-center gap-1"><CalendarClock className="w-3.5 h-3.5" />Richiamare il</label>
+        <input id={`ric-${f.id}`} type="datetime-local" value={richiamo} onChange={e => setRichiamo(e.target.value)}
+          className="text-xs px-2 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 dark:text-white" />
+        {scorciatoieRichiamo().map(s => (
+          <button key={s.label} type="button" onClick={() => setRichiamo(perInputLocale(s.data.toISOString()))}
+            className="text-[11px] font-semibold px-2 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-900">
+            {s.label}
+          </button>
+        ))}
+        {richiamo && <button type="button" onClick={() => setRichiamo('')} className="text-[11px] font-semibold text-slate-400 hover:text-red-600">Togli</button>}
+      </div>
+      {richiamo && !assegnato && <p className="text-[11px] text-amber-700 dark:text-amber-400">Assegnalo a qualcuno: il promemoria arriva a chi ha il follow-up in carico.</p>}
+      {richiamo && assegnato && <p className="text-[11px] text-slate-500">{utenti.find(u => u.username === assegnato)?.nome || assegnato} riceve un promemoria nel sito e per email 15 minuti prima.</p>}
       <textarea value={nota} onChange={e => setNota(e.target.value)} rows={2} placeholder="Nota (es. richiamato, vuole un preventivo)" aria-label="Nota"
         className="w-full text-sm px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-brand-500" />
       <div className="flex items-center gap-2">
@@ -116,6 +136,9 @@ export function FollowupsSection() {
   const [msg, setMsg] = useState('');
   const [motivo, setMotivo] = useState('tutti');
   const [cerca, setCerca] = useState('');
+  const [quando, setQuando] = useState<'tutti' | 'scaduti' | 'oggi' | 'programmati' | 'senza'>('tutti');
+  // Chiusura con esito: id del follow-up che si sta chiudendo (o 'bulk' per i selezionati).
+  const [chiudendo, setChiudendo] = useState<number | 'bulk' | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
 
   // Selezione multipla (Admin ed Editor)
@@ -141,10 +164,11 @@ export function FollowupsSection() {
 
   useEffect(() => { load(stato); setMotivo('tutti'); setSelezionati(new Set()); }, [stato]);
 
-  const markDone = async (id: number) => {
+  const markDone = async (id: number, esito: EsitoFinale | null) => {
     setBusyId(id);
+    setChiudendo(null);
     try {
-      const res = await authFetch(`/api/followups/${id}/done`, { method: 'POST' });
+      const res = await authFetch(`/api/followups/${id}/done`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ esito }) });
       if (res.ok) { setItems(prev => prev.filter(f => f.id !== id)); setSelezionati(prev => { const n = new Set(prev); n.delete(id); return n; }); }
       else setError('Impossibile aggiornare il follow-up.');
     } catch {
@@ -159,7 +183,11 @@ export function FollowupsSection() {
   const visible = items
     .filter(f => motivo === 'tutti' || f.motivo === motivo)
     .filter(f => chi === 'tutti' ? true : chi === 'miei' ? assegnatoA(f) === io : chi === 'nessuno' ? !f.assegnato_a : assegnatoA(f) === chi.toLowerCase())
-    .filter(f => !q || [f.nome, f.numero, f.nota, f.motivo].some(v => (v || '').toLowerCase().includes(q)));
+    .filter(f => !q || [f.nome, f.numero, f.nota, f.motivo].some(v => (v || '').toLowerCase().includes(q)))
+    .filter(f => quando === 'tutti' ? true : quando === 'senza' ? !f.richiamare_at : statoRichiamo(f.richiamare_at)?.tipo === (quando === 'programmati' ? 'futuro' : quando === 'scaduti' ? 'scaduto' : 'oggi'));
+  // Con un filtro sulle richiamate, prima le più vicine.
+  if (quando !== 'tutti' && quando !== 'senza') visible.sort((a, b) => new Date(a.richiamare_at!).getTime() - new Date(b.richiamare_at!).getTime());
+  const contaRichiamo = (t: 'scaduto' | 'oggi' | 'futuro') => items.filter(f => statoRichiamo(f.richiamare_at)?.tipo === t).length;
   const mieiCount = items.filter(f => assegnatoA(f) === io).length;
   const nessunoCount = items.filter(f => !f.assegnato_a).length;
   const perPersona = utenti.map(u => ({ ...u, n: items.filter(f => assegnatoA(f) === u.username.toLowerCase()).length })).filter(u => u.n > 0);
@@ -170,7 +198,7 @@ export function FollowupsSection() {
   const toggle = (id: number) => setSelezionati(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
   const toggleTutti = () => setSelezionati(tuttiSelezionati ? new Set() : new Set(visible.map(f => f.id)));
 
-  const bulk = async (azione: 'assegna' | 'fatto') => {
+  const bulk = async (azione: 'assegna' | 'fatto', esito: EsitoFinale | null = null) => {
     const ids = selVisibili.map(f => f.id);
     if (ids.length === 0) return;
     setBusyBulk(true);
@@ -179,13 +207,14 @@ export function FollowupsSection() {
     try {
       const res = await authFetch('/api/followups/bulk', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(azione === 'fatto' ? { azione, ids } : { azione, ids, assegnato_a: assegnaA || null, messaggio: messaggio.trim() || undefined }),
+        body: JSON.stringify(azione === 'fatto' ? { azione, ids, esito } : { azione, ids, assegnato_a: assegnaA || null, messaggio: messaggio.trim() || undefined }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.ok) throw new Error(data.error || 'Operazione non riuscita');
       if (azione === 'fatto') {
         setItems(prev => prev.filter(f => !ids.includes(f.id)));
-        setMsg(`${data.aggiornati} follow-up segnati come fatti.`);
+        setMsg(`${data.aggiornati} follow-up segnati come fatti${esito ? ` (${esitoFinale(esito)?.label})` : ''}.`);
+        setChiudendo(null);
       } else {
         const nuovi = new Map<number, Followup>((data.followups || []).map((f: Followup) => [f.id, f]));
         setItems(prev => prev.map(f => nuovi.get(f.id) ? { ...f, ...nuovi.get(f.id)! } : f));
@@ -212,6 +241,9 @@ export function FollowupsSection() {
       Data: new Date(f.created_at).toLocaleString('it-IT'),
       'Assegnato a': nomeUtente(f.assegnato_a),
       Nota: f.nota || '',
+      'Richiamare il': f.richiamare_at ? new Date(f.richiamare_at).toLocaleString('it-IT') : '',
+      'Esito': esitoFinale(f.esito_finale)?.label || '',
+      'Chiuso il': f.chiuso_at ? new Date(f.chiuso_at).toLocaleString('it-IT') : '',
       'ID chiamata': f.call_id,
     }));
     const ws = XLSX.utils.json_to_sheet(rows);
@@ -267,6 +299,15 @@ export function FollowupsSection() {
             <option value="nessuno">Non assegnati ({nessunoCount})</option>
             {perPersona.filter(u => u.username.toLowerCase() !== io).map(u => <option key={u.username} value={u.username}>{u.nome} ({u.n})</option>)}
           </select>
+          {stato === 'pending' && (
+            <select value={quando} onChange={e => setQuando(e.target.value as any)} aria-label="Filtra per data di richiamo" className={sel}>
+              <option value="tutti">Ogni richiamata</option>
+              <option value="scaduti">Scadute ({contaRichiamo('scaduto')})</option>
+              <option value="oggi">Da richiamare oggi ({contaRichiamo('oggi')})</option>
+              <option value="programmati">Programmate ({contaRichiamo('futuro')})</option>
+              <option value="senza">Senza data</option>
+            </select>
+          )}
           {motivi.length > 1 && (
             <select value={motivo} onChange={e => setMotivo(e.target.value)} aria-label="Filtra per motivo" className={sel}>
               <option value="tutti">Tutti i motivi</option>
@@ -309,6 +350,8 @@ export function FollowupsSection() {
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-sm font-semibold text-slate-900 dark:text-white truncate">{f.nome || f.numero || 'Contatto sconosciuto'}</span>
                   <span className={cn('text-[11px] font-bold px-2 py-0.5 rounded-full', motivoClass(f.motivo))}>{f.motivo}</span>
+                  {stato === 'pending' && (() => { const r = statoRichiamo(f.richiamare_at); return r && <span className={cn('text-[11px] font-bold px-2 py-0.5 rounded-full inline-flex items-center gap-1', r.cls)}><CalendarClock className="w-3 h-3" />{r.testo}</span>; })()}
+                  {stato === 'done' && (() => { const e = esitoFinale(f.esito_finale); return e && <span className={cn('text-[11px] font-bold px-2 py-0.5 rounded-full', e.cls)}>{e.label}</span>; })()}
                 </div>
                 <div className="text-xs text-slate-500 mt-0.5 flex items-center gap-2 flex-wrap">
                   {f.numero && (
@@ -322,6 +365,7 @@ export function FollowupsSection() {
                     : <span className="text-slate-400">Non assegnato</span>}
                 </div>
                 {f.nota && aperto !== f.id && <p className="text-xs text-slate-600 dark:text-slate-300 mt-1 italic">“{f.nota}”</p>}
+                {stato === 'done' && f.chiuso_at && <p className="text-[11px] text-slate-400 mt-0.5">Chiuso {new Date(f.chiuso_at).toLocaleString('it-IT', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}{f.chiuso_da ? ` da ${nomeUtente(f.chiuso_da)}` : ''}</p>}
               </div>
               {puoGestire && <button onClick={() => setAperto(aperto === f.id ? null : f.id)} aria-expanded={aperto === f.id}
                 className={cn('shrink-0 inline-flex items-center gap-1 text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-colors',
@@ -329,13 +373,24 @@ export function FollowupsSection() {
                 <StickyNote className="w-3.5 h-3.5" /> {f.nota ? 'Nota' : 'Aggiungi nota'}
               </button>}
               {stato === 'pending' && puoGestire && (
-                <button onClick={() => markDone(f.id)} disabled={busyId === f.id}
+                <button onClick={() => setChiudendo(chiudendo === f.id ? null : f.id)} disabled={busyId === f.id} aria-expanded={chiudendo === f.id}
                   className="shrink-0 inline-flex items-center gap-1 text-xs font-semibold text-green-700 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/20 px-2.5 py-1.5 rounded-lg transition-colors disabled:opacity-50">
                   {busyId === f.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
                   Fatto
                 </button>
               )}
              </div>
+              {chiudendo === f.id && (
+                <div className="mt-2 p-3 rounded-xl bg-green-50/60 dark:bg-green-900/10 border border-green-200 dark:border-green-900/40">
+                  <p className="text-xs font-semibold text-slate-700 dark:text-slate-200 mb-2">Com'è andata?</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {ESITI_FINALI.map(e => (
+                      <button key={e.id} onClick={() => markDone(f.id, e.id)} className={cn('text-xs font-semibold px-2.5 py-1.5 rounded-lg hover:ring-2 hover:ring-brand-500/40', e.cls)}>{e.label}</button>
+                    ))}
+                    <button onClick={() => markDone(f.id, null)} className="text-xs font-semibold px-2.5 py-1.5 rounded-lg text-slate-500 hover:bg-white dark:hover:bg-slate-800">Chiudi senza esito</button>
+                  </div>
+                </div>
+              )}
               {aperto === f.id && puoGestire && (
                 <DettaglioFollowup f={f} utenti={utenti} io={user?.username}
                   onSaved={nf => { setItems(prev => prev.map(x => (x.id === nf.id ? { ...x, ...nf } : x))); setAperto(null); }} />
@@ -366,10 +421,19 @@ export function FollowupsSection() {
           className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-brand-600 hover:bg-brand-700 text-white disabled:opacity-50">
           {busyBulk ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <UserPlus className="w-3.5 h-3.5" />} Assegna
         </button>
-        <button onClick={() => bulk('fatto')} disabled={busyBulk}
+        <button onClick={() => setChiudendo(chiudendo === 'bulk' ? null : 'bulk')} disabled={busyBulk} aria-expanded={chiudendo === 'bulk'}
           className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold text-green-700 dark:text-green-400 border border-green-200 dark:border-green-900/50 hover:bg-green-50 dark:hover:bg-green-900/20 disabled:opacity-50">
           <CheckCircle2 className="w-3.5 h-3.5" /> Segna fatti
         </button>
+        {chiudendo === 'bulk' && (
+          <div className="w-full flex flex-wrap items-center gap-1.5 pt-2 border-t border-slate-100 dark:border-slate-800">
+            <span className="text-xs font-semibold text-slate-600 dark:text-slate-300 mr-1">Com'è andata?</span>
+            {ESITI_FINALI.map(e => (
+              <button key={e.id} onClick={() => bulk('fatto', e.id)} disabled={busyBulk} className={cn('text-xs font-semibold px-2.5 py-1.5 rounded-lg hover:ring-2 hover:ring-brand-500/40 disabled:opacity-50', e.cls)}>{e.label}</button>
+            ))}
+            <button onClick={() => bulk('fatto', null)} disabled={busyBulk} className="text-xs font-semibold px-2.5 py-1.5 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800">Senza esito</button>
+          </div>
+        )}
         <button onClick={() => setSelezionati(new Set())} aria-label="Annulla selezione" title="Annulla selezione"
           className="ml-auto p-1.5 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 rounded-lg">
           <X className="w-4 h-4" />

@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useCampaign } from '../context/CampaignContext';
 import { GemLogo } from './Icons';
-import { LogIn, Loader2, AlertCircle, KeyRound, ArrowLeft } from 'lucide-react';
+import { LogIn, Loader2, AlertCircle, KeyRound, ArrowLeft, CheckCircle2 } from 'lucide-react';
 import { cn } from '../lib/utils';
 
 export function Login() {
@@ -16,6 +16,43 @@ export function Login() {
   const [setup2FA, setSetup2FA] = useState(false);
   const [qrUrl, setQrUrl] = useState('');
   const [otpToken, setOtpToken] = useState('');
+
+  // Invito: ?invito=... nell'indirizzo (link dell'email). Si sceglie la password.
+  const [invito, setInvito] = useState(() => new URLSearchParams(window.location.search).get('invito') || '');
+  const [invitato, setInvitato] = useState<{ nome: string; username: string } | null>(null);
+  const [pw2, setPw2] = useState('');
+  const [fatto, setFatto] = useState('');
+  useEffect(() => {
+    if (!invito) return;
+    setLoading(true);
+    fetch(`/api/invito/${encodeURIComponent(invito)}`).then(r => r.json())
+      .then(d => { if (d?.ok) setInvitato({ nome: d.nome, username: d.username }); else setError(d?.error || 'Link non valido o scaduto.'); })
+      .catch(() => setError('Errore di rete'))
+      .finally(() => setLoading(false));
+  }, [invito]);
+  const lasciaInvito = () => {
+    window.history.replaceState(null, '', window.location.pathname);
+    setInvito(''); setInvitato(null); setPassword(''); setPw2('');
+  };
+  const confermaInvito = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    if (password.length < 8) { setError('La password deve avere almeno 8 caratteri.'); return; }
+    if (password !== pw2) { setError('Le due password non coincidono.'); return; }
+    setLoading(true);
+    try {
+      const res = await fetch('/api/invito', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: invito, password }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || !d.ok) throw new Error(d.error || 'Non riuscito');
+      const u = d.username || invitato?.username || '';
+      lasciaInvito();
+      setUsername(u);
+      setFatto('Password impostata. Ora accedi con il tuo nome utente e la nuova password.');
+    } catch (err: any) {
+      setError(err?.message || 'Errore di rete');
+    }
+    setLoading(false);
+  };
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -36,7 +73,8 @@ export function Login() {
       setOtpToken(res.otpToken || '');
       setError('');
     } else if (res && res.ok) {
-      const loggedUser = { username: res.username, nome: res.nome, role: res.role, isAdmin: res.isAdmin, canSchedule: res.canSchedule, email: res.email || '', telefono: res.telefono || '', twoFactorEnabled: res.twoFactorEnabled, twoFactorRequired: res.twoFactorRequired };
+      const loggedUser = { username: res.username, nome: res.nome, role: res.role, isAdmin: res.isAdmin, canSchedule: res.canSchedule, email: res.email || '', telefono: res.telefono || '', twoFactorEnabled: res.twoFactorEnabled, twoFactorRequired: res.twoFactorRequired,
+        soloPropriFollowup: res.soloPropriFollowup === true, puoEsportare: res.puoEsportare !== false, limiteNumeri: res.limiteNumeri ?? null };
       setUser(loggedUser);
       sessionStorage.setItem('gem_session', JSON.stringify(loggedUser));
       if (res.token) sessionStorage.setItem('gem_token', res.token);
@@ -76,10 +114,45 @@ export function Login() {
 
         <div className="text-center mb-8">
           <h1 className="text-2xl font-bold font-serif text-slate-900 dark:text-white mb-2 tracking-tight">Accesso Sistema</h1>
-          <p className="text-sm font-medium text-slate-500 uppercase tracking-widest">{isOtpStep ? 'Verifica in due passaggi' : 'Campagne Outbound'}</p>
+          <p className="text-sm font-medium text-slate-500 uppercase tracking-widest">{invito ? 'Scegli la tua password' : isOtpStep ? 'Verifica in due passaggi' : 'Campagne Outbound'}</p>
         </div>
 
-        {isOtpStep ? (
+        {fatto && !invito && (
+          <div className="mb-5 p-3 bg-green-50 dark:bg-green-900/20 text-green-800 dark:text-green-300 border border-green-100 dark:border-green-900/50 rounded-xl text-xs font-medium flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 shrink-0" /><span>{fatto}</span>
+          </div>
+        )}
+        {invito ? (
+          <form onSubmit={confermaInvito} className="space-y-5 animate-in fade-in duration-300">
+            {invitato ? (
+              <>
+                <p className="text-sm text-slate-600 dark:text-slate-300 text-center">
+                  Ciao <strong>{invitato.nome}</strong>, il tuo nome utente è <strong className="font-mono">{invitato.username}</strong>. Scegli una password di almeno 8 caratteri.
+                </p>
+                <div className="space-y-2">
+                  <label htmlFor="inv-pw" className="block text-xs font-bold text-slate-500 uppercase tracking-wider">Nuova password</label>
+                  <input id="inv-pw" type="password" autoComplete="new-password" value={password} onChange={e => setPassword(e.target.value)}
+                    className="w-full px-4 py-3.5 bg-slate-50 dark:bg-slate-950/50 border border-slate-200 dark:border-slate-800 rounded-xl text-sm focus:outline-none focus:ring-1 focus:ring-slate-900 dark:focus:ring-slate-100 text-slate-900 dark:text-slate-100" />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="inv-pw2" className="block text-xs font-bold text-slate-500 uppercase tracking-wider">Ripeti la password</label>
+                  <input id="inv-pw2" type="password" autoComplete="new-password" value={pw2} onChange={e => setPw2(e.target.value)}
+                    className="w-full px-4 py-3.5 bg-slate-50 dark:bg-slate-950/50 border border-slate-200 dark:border-slate-800 rounded-xl text-sm focus:outline-none focus:ring-1 focus:ring-slate-900 dark:focus:ring-slate-100 text-slate-900 dark:text-slate-100" />
+                </div>
+                <button type="submit" disabled={loading}
+                  className={cn("w-full py-4 bg-slate-900 dark:bg-brand-500 text-white font-bold rounded-xl text-sm shadow-md flex items-center justify-center gap-2", loading && "opacity-70 pointer-events-none")}>
+                  {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <KeyRound className="w-5 h-5" />} Salva la password
+                </button>
+              </>
+            ) : loading ? (
+              <div className="flex justify-center py-6 text-slate-400"><Loader2 className="w-6 h-6 animate-spin" /></div>
+            ) : null}
+            <button type="button" onClick={() => { lasciaInvito(); setError(''); }}
+              className="w-full flex items-center justify-center gap-2 text-sm font-bold text-slate-500 hover:text-slate-800 dark:hover:text-slate-200">
+              <ArrowLeft className="w-4 h-4" /> Vai all'accesso
+            </button>
+          </form>
+        ) : isOtpStep ? (
           <form onSubmit={handleVerifyOtp} className="space-y-6 animate-in fade-in slide-in-from-right-4 duration-300">
             {setup2FA ? (
               <div className="bg-brand-50 dark:bg-brand-900/20 border border-brand-100 dark:border-brand-800/50 p-6 rounded-xl text-center mb-6 flex flex-col items-center">

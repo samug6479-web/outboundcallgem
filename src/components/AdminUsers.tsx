@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { useCampaign } from '../context/CampaignContext';
 import {
   Users, Trash2, Plus, Loader2, Pencil, X, ShieldCheck, ShieldOff, ShieldAlert, Search, Mail, Phone,
-  CalendarClock, KeyRound, Copy, Check, AlertTriangle, BellRing,
+  CalendarClock, KeyRound, Copy, Check, AlertTriangle, BellRing, Send, Hourglass,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { ConfirmModal } from './ConfirmModal';
@@ -25,6 +25,7 @@ interface Utente {
   soloPropriFollowup: boolean;
   puoEsportare: boolean;
   limiteNumeri: number | null;
+  invitoInAttesa?: boolean;
 }
 
 interface Modulo {
@@ -39,6 +40,7 @@ interface Modulo {
   soloPropriFollowup: boolean;
   puoEsportare: boolean;
   limiteNumeri: string;
+  invito: boolean;
 }
 
 const RUOLI: { id: Ruolo; descr: string }[] = [
@@ -92,7 +94,8 @@ export function AdminUsers() {
   const [modulo, setModulo] = useState<Modulo | null>(null);
   const [salvando, setSalvando] = useState(false);
   const [errore, setErrore] = useState('');
-  const [creato, setCreato] = useState<{ username: string; password: string } | null>(null);
+  const [creato, setCreato] = useState<{ username: string; password: string; invitoA?: string; invitoInviato?: boolean } | null>(null);
+  const [invitando, setInvitando] = useState<string | null>(null);
   const [copiato, setCopiato] = useState(false);
   const [msg, setMsg] = useState('');
   const [daEliminare, setDaEliminare] = useState<Utente | null>(null);
@@ -123,12 +126,12 @@ export function AdminUsers() {
 
   const apriNuovo = () => {
     setErrore(''); setCreato(null); setCopiato(false);
-    setModulo({ nuovo: true, username: '', nome: '', email: '', telefono: '', role: 'Editor', canSchedule: true, password: generaPassword(), soloPropriFollowup: false, puoEsportare: true, limiteNumeri: '' });
+    setModulo({ nuovo: true, username: '', nome: '', email: '', telefono: '', role: 'Editor', canSchedule: true, password: generaPassword(), soloPropriFollowup: false, puoEsportare: true, limiteNumeri: '', invito: true });
   };
   const apriModifica = (u: Utente) => {
     setErrore(''); setCreato(null); setCopiato(false);
     setModulo({ nuovo: false, username: u.username, nome: u.nome, email: u.email, telefono: u.telefono, role: u.role, canSchedule: u.canSchedule, password: '',
-      soloPropriFollowup: u.soloPropriFollowup, puoEsportare: u.puoEsportare, limiteNumeri: u.limiteNumeri ? String(u.limiteNumeri) : '' });
+      soloPropriFollowup: u.soloPropriFollowup, puoEsportare: u.puoEsportare, limiteNumeri: u.limiteNumeri ? String(u.limiteNumeri) : '', invito: false });
   };
   const chiudi = () => { setModulo(null); setCreato(null); };
 
@@ -152,7 +155,9 @@ export function AdminUsers() {
     e.preventDefault();
     if (!modulo) return;
     setErrore('');
-    if (!modulo.nome.trim() || (modulo.nuovo && (!modulo.username.trim() || !modulo.password))) { setErrore('Compila nome, username e password.'); return; }
+    const conInvito = modulo.nuovo && modulo.invito;
+    if (conInvito && !modulo.email.trim()) { setErrore("Per mandare l'invito serve l'email. Oppure togli l'invito e scegli tu la password."); return; }
+    if (!modulo.nome.trim() || (modulo.nuovo && (!modulo.username.trim() || (!conInvito && !modulo.password)))) { setErrore('Compila nome, username e password.'); return; }
     setSalvando(true);
     try {
       const body = {
@@ -160,8 +165,8 @@ export function AdminUsers() {
         email: modulo.email.trim(), telefono: modulo.telefono.trim(),
         soloPropriFollowup: modulo.soloPropriFollowup, puoEsportare: modulo.puoEsportare,
         limiteNumeri: modulo.limiteNumeri.trim() ? parseInt(modulo.limiteNumeri, 10) || null : null,
-        password: modulo.password || undefined,
-        ...(modulo.nuovo ? { username: modulo.username.trim() } : {}),
+        password: conInvito ? undefined : modulo.password || undefined,
+        ...(modulo.nuovo ? { username: modulo.username.trim(), invito: conInvito } : {}),
       };
       const res = await authFetch(modulo.nuovo ? '/api/users' : `/api/users/${encodeURIComponent(modulo.username)}`, {
         method: modulo.nuovo ? 'POST' : 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -169,7 +174,9 @@ export function AdminUsers() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.ok) throw new Error(data.error || 'Salvataggio non riuscito');
       await carica();
-      if (modulo.nuovo || modulo.password) {
+      if (conInvito) {
+        setCreato({ username: modulo.username.trim(), password: '', invitoA: modulo.email.trim(), invitoInviato: data.invitoInviato === true });
+      } else if (modulo.nuovo || modulo.password) {
         setCreato({ username: modulo.username.trim(), password: modulo.password });
       } else {
         setMsg(`Modifiche a ${modulo.nome} salvate.`);
@@ -194,6 +201,21 @@ export function AdminUsers() {
     } catch (err: any) {
       alert(err?.message || 'Errore di rete');
     }
+  };
+
+  // Manda (o rimanda) il link per scegliere la password.
+  const invita = async (u: Utente) => {
+    setInvitando(u.username);
+    try {
+      const res = await authFetch(`/api/users/${encodeURIComponent(u.username)}/invito`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Invio non riuscito');
+      setMsg(`Link per scegliere la password mandato a ${data.email}. Vale 72 ore.`);
+      await carica();
+    } catch (err: any) {
+      alert(err?.message || 'Errore di rete');
+    }
+    setInvitando(null);
   };
 
   const elimina = async (u: Utente) => {
@@ -286,6 +308,7 @@ export function AdminUsers() {
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-semibold text-slate-900 dark:text-white">{u.nome}</span>
                       {tu && <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">tu</span>}
+                      {u.invitoInAttesa && <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 dark:bg-amber-900/20 dark:text-amber-300"><Hourglass className="w-3 h-3" />Invito in attesa</span>}
                       <span className={cn('text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full', ruoloCls(u.role))}>{u.role}</span>
                     </div>
                     <div className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5">
@@ -313,6 +336,13 @@ export function AdminUsers() {
                       className="px-2.5 py-1.5 rounded-lg text-xs font-semibold text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800">
                       {u.twoFactorRequired ? 'Spegni 2FA' : 'Richiedi 2FA'}
                     </button>
+                    {u.email && !tu && (
+                      <button onClick={() => invita(u)} disabled={invitando === u.username}
+                        title={u.invitoInAttesa ? "Rimanda l'invito" : 'Manda un link per scegliere una nuova password'} aria-label={`Manda link password a ${u.nome}`}
+                        className="p-2 rounded-lg text-slate-400 hover:text-brand-600 hover:bg-brand-50 dark:hover:bg-brand-900/30 disabled:opacity-50">
+                        {invitando === u.username ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                      </button>
+                    )}
                     <button onClick={() => apriModifica(u)} aria-label={`Modifica ${u.nome}`} title="Modifica"
                       className="p-2 rounded-lg text-slate-400 hover:text-brand-600 hover:bg-brand-50 dark:hover:bg-brand-900/30">
                       <Pencil className="w-4 h-4" />
@@ -341,7 +371,18 @@ export function AdminUsers() {
               <button onClick={chiudi} aria-label="Chiudi" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"><X className="w-5 h-5" /></button>
             </div>
 
-            {creato ? (
+            {creato?.invitoA ? (
+              <div className="p-5 space-y-4 overflow-y-auto">
+                <div className={cn('flex items-start gap-2 p-3 rounded-xl text-sm', creato.invitoInviato ? 'bg-green-50 text-green-800 dark:bg-green-900/20 dark:text-green-300' : 'bg-amber-50 text-amber-800 dark:bg-amber-900/20 dark:text-amber-300')}>
+                  {creato.invitoInviato ? <Check className="w-4 h-4 mt-0.5 shrink-0" /> : <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />}
+                  <span>{creato.invitoInviato
+                    ? <>Utente creato. Abbiamo mandato l'invito a <strong>{creato.invitoA}</strong>: con il link sceglie la sua password (vale 72 ore).</>
+                    : <>Utente creato, ma l'email non è partita. Riprova dal pulsante con l'aereo di carta sulla sua riga.</>}</span>
+                </div>
+                <p className="text-sm text-slate-600 dark:text-slate-300">Nome utente: <strong className="font-mono">{creato.username}</strong></p>
+                <button onClick={chiudi} className="w-full px-4 py-2 rounded-lg text-sm font-semibold border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">Chiudi</button>
+              </div>
+            ) : creato ? (
               <div className="p-5 space-y-4 overflow-y-auto">
                 <div className="flex items-start gap-2 p-3 rounded-xl bg-green-50 text-green-800 dark:bg-green-900/20 dark:text-green-300 text-sm">
                   <Check className="w-4 h-4 mt-0.5 shrink-0" />
@@ -438,7 +479,16 @@ export function AdminUsers() {
                     </fieldset>
                   )}
 
-                  <div>
+                  {modulo.nuovo && (
+                    <label className="flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-200 dark:border-slate-700 cursor-pointer">
+                      <span>
+                        <span className="block text-sm font-semibold text-slate-900 dark:text-white">Manda invito via email</span>
+                        <span className="block text-xs text-slate-500">Riceve un link e sceglie lui la password. Serve l'email.</span>
+                      </span>
+                      <input type="checkbox" checked={modulo.invito} onChange={e => setModulo({ ...modulo, invito: e.target.checked })} className="w-4 h-4 text-brand-600 rounded focus:ring-brand-500" />
+                    </label>
+                  )}
+                  {!(modulo.nuovo && modulo.invito) && <div>
                     <label className={etichetta} htmlFor="u-pw">{modulo.nuovo ? 'Password' : 'Nuova password'}</label>
                     <div className="flex gap-2">
                       <input id="u-pw" value={modulo.password} onChange={e => setModulo({ ...modulo, password: e.target.value })} className={cn(campo, 'font-mono')}
@@ -448,14 +498,15 @@ export function AdminUsers() {
                         <KeyRound className="w-3.5 h-3.5" /> Genera
                       </button>
                     </div>
-                  </div>
+                    {!modulo.nuovo && modulo.email && <p className="text-[11px] text-slate-400 mt-1">Oppure chiudi e usa l'aereo di carta sulla riga: gli arriva un link per sceglierla lui.</p>}
+                  </div>}
 
                   {errore && <div className="flex items-start gap-2 p-3 rounded-xl bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-300 text-sm"><AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />{errore}</div>}
                 </div>
                 <div className="p-4 border-t border-slate-200 dark:border-slate-800 flex gap-2">
                   <button type="submit" disabled={salvando}
                     className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-bold bg-brand-600 hover:bg-brand-700 text-white disabled:opacity-60">
-                    {salvando && <Loader2 className="w-4 h-4 animate-spin" />}{modulo.nuovo ? 'Crea utente' : 'Salva modifiche'}
+                    {salvando && <Loader2 className="w-4 h-4 animate-spin" />}{modulo.nuovo ? (modulo.invito ? 'Crea e manda invito' : 'Crea utente') : 'Salva modifiche'}
                   </button>
                   <button type="button" onClick={chiudi} className="px-4 py-2.5 rounded-lg text-sm font-semibold border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">Annulla</button>
                 </div>

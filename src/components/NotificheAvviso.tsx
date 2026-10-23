@@ -50,7 +50,15 @@ export function NotificheAvviso({ onApriFollowup }: { onApriFollowup: () => void
       <BellRing className="w-5 h-5 text-brand-600 dark:text-brand-300 mt-0.5 shrink-0" />
       <div className="flex-1 min-w-0">
         <p className="text-sm font-semibold text-slate-900 dark:text-white">
-          {notifiche.length === 1 ? 'Hai un nuovo follow-up assegnato' : `Hai ${notifiche.length} nuovi follow-up assegnati`}
+          {(() => {
+            const pm = notifiche.filter(n => n.tipo === 'followup_promemoria').length;
+            const as = notifiche.length - pm;
+            const parti = [
+              pm ? (pm === 1 ? '1 contatto da richiamare adesso' : `${pm} contatti da richiamare adesso`) : '',
+              as ? (as === 1 ? '1 nuovo follow-up assegnato' : `${as} nuovi follow-up assegnati`) : '',
+            ].filter(Boolean);
+            return `Hai ${parti.join(' e ')}`;
+          })()}
         </p>
         <ul className="mt-1 space-y-0.5">
           {visibili.map(n => (

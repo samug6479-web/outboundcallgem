@@ -405,6 +405,16 @@ async function createFollowup(entry: { callId: string; numero: string | null; no
   }
 }
 
+// Esito con cui si chiude un follow-up (pulsante Fatto).
+const ESITI_FINALI = ["venduto", "appuntamento", "preventivo", "non_interessato", "non_raggiungibile", "altro"];
+const ESITO_FINALE_LABEL: Record<string, string> = {
+  venduto: "Venduto", appuntamento: "Appuntamento fissato", preventivo: "Preventivo / info inviate",
+  non_interessato: "Non interessato", non_raggiungibile: "Non raggiungibile", altro: "Altro",
+};
+const esitoFinaleValido = (v: any): string | null => (typeof v === "string" && ESITI_FINALI.includes(v) ? v : null);
+// Minuti di anticipo del promemoria rispetto all'ora di richiamata.
+const PROMEMORIA_ANTICIPO_MIN = 15;
+
 // Follow-up: note e persona assegnata (colonne aggiunte dopo).
 let followupsExtraReady: Promise<void> | null = null;
 function ensureFollowupsExtra(): Promise<void> {
@@ -414,6 +424,13 @@ function ensureFollowupsExtra(): Promise<void> {
       await sql!`ALTER TABLE followups ADD COLUMN IF NOT EXISTS assegnato_a TEXT`;
       await sql!`ALTER TABLE followups ADD COLUMN IF NOT EXISTS aggiornato_at TIMESTAMPTZ`;
       await sql!`ALTER TABLE followups ADD COLUMN IF NOT EXISTS aggiornato_da TEXT`;
+      // Data e ora in cui richiamare, e quando è partito il promemoria.
+      await sql!`ALTER TABLE followups ADD COLUMN IF NOT EXISTS richiamare_at TIMESTAMPTZ`;
+      await sql!`ALTER TABLE followups ADD COLUMN IF NOT EXISTS promemoria_at TIMESTAMPTZ`;
+      // Com'è finita quando è stato chiuso (Fatto).
+      await sql!`ALTER TABLE followups ADD COLUMN IF NOT EXISTS esito_finale TEXT`;
+      await sql!`ALTER TABLE followups ADD COLUMN IF NOT EXISTS chiuso_at TIMESTAMPTZ`;
+      await sql!`ALTER TABLE followups ADD COLUMN IF NOT EXISTS chiuso_da TEXT`;
     })().catch(err => { followupsExtraReady = null; throw err; });
   }
   return followupsExtraReady;
@@ -564,7 +581,9 @@ app.post("/api/followups/bulk", requireAuth, express.json(), async (req: any, re
       if (miei.length !== ids.length) return res.status(403).json({ ok: false, error: "Puoi gestire solo i follow-up assegnati a te" });
     }
     if (b.azione === "fatto") {
-      const r = (await sql`UPDATE followups SET stato = 'done', aggiornato_at = now(), aggiornato_da = ${req.session.username} WHERE id = ANY(${ids}::int[]) AND stato = 'pending' RETURNING id`) as any[];
+      const esito = esitoFinaleValido(b.esito);
+      const r = (await sql`UPDATE followups SET stato = 'done', esito_finale = ${esito}, chiuso_at = now(), chiuso_da = ${req.session.username},
+        aggiornato_at = now(), aggiornato_da = ${req.session.username} WHERE id = ANY(${ids}::int[]) AND stato = 'pending' RETURNING id`) as any[];
       return res.json({ ok: true, aggiornati: r.length });
     }
     if (b.azione !== "assegna") return res.status(400).json({ ok: false, error: "Azione non valida" });
@@ -608,6 +627,16 @@ app.put("/api/followups/:id", requireAuth, express.json(), async (req: any, res)
       assegnato = u.username;
     }
   }
+  // Data di richiamo: ISO, oppure null/"" per toglierla.
+  let richiamare: string | null | undefined = undefined;
+  if (body.richiamare_at !== undefined) {
+    if (body.richiamare_at === null || body.richiamare_at === "") richiamare = null;
+    else {
+      const t = new Date(String(body.richiamare_at));
+      if (isNaN(t.getTime())) return res.status(400).json({ ok: false, error: "Data di richiamo non valida" });
+      richiamare = t.toISOString();
+    }
+  }
   try {
     await ensureFollowupsExtra();
     const prima = ((await sql`SELECT assegnato_a FROM followups WHERE id = ${id}`) as any[])[0];
@@ -615,6 +644,8 @@ app.put("/api/followups/:id", requireAuth, express.json(), async (req: any, res)
       UPDATE followups SET
         nota = CASE WHEN ${nota !== undefined}::boolean THEN ${nota ?? null} ELSE nota END,
         assegnato_a = CASE WHEN ${assegnato !== undefined}::boolean THEN ${assegnato ?? null} ELSE assegnato_a END,
+        promemoria_at = CASE WHEN ${richiamare !== undefined}::boolean AND richiamare_at IS DISTINCT FROM ${richiamare ?? null}::timestamptz THEN NULL ELSE promemoria_at END,
+        richiamare_at = CASE WHEN ${richiamare !== undefined}::boolean THEN ${richiamare ?? null}::timestamptz ELSE richiamare_at END,
         aggiornato_at = now(), aggiornato_da = ${req.session.username}
       WHERE id = ${id}
       RETURNING *
@@ -626,6 +657,7 @@ app.put("/api/followups/:id", requireAuth, express.json(), async (req: any, res)
         && assegnato.toLowerCase() !== String(req.session.username).toLowerCase()) {
       avvisato = await avvisaAssegnazione(r[0], assegnato, req.session.username);
     }
+    if (richiamare) aggiornaSveglia().catch(() => {});
     res.json({ ok: true, followup: r[0], avvisato });
   } catch (err) {
     console.error("Errore aggiornamento follow-up:", err);
@@ -876,11 +908,96 @@ async function avvisaAssegnazioni(fs: any[], username: string, daUsername: strin
   }
 }
 
+// Promemoria dei follow-up con data di richiamo: avviso nel sito ed email a chi
+// li ha in carico, PROMEMORIA_ANTICIPO_MIN minuti prima. Parte dal timer (sveglia
+// Make) e, per sicurezza, anche quando qualcuno apre il sito.
+async function inviaPromemoriaFollowup(): Promise<number> {
+  if (!sql) return 0;
+  try {
+    await ensureFollowupsExtra();
+    await ensureNotifiche();
+    // Si "prende" il promemoria prima di mandarlo: nessun doppione anche con più richieste insieme.
+    const dovuti = (await sql`
+      UPDATE followups SET promemoria_at = now()
+      WHERE id IN (
+        SELECT id FROM followups
+        WHERE stato = 'pending' AND assegnato_a IS NOT NULL AND promemoria_at IS NULL AND richiamare_at IS NOT NULL
+          AND richiamare_at <= now() + make_interval(mins => ${PROMEMORIA_ANTICIPO_MIN}::int)
+        ORDER BY richiamare_at LIMIT 200
+      ) AND promemoria_at IS NULL
+      RETURNING id, nome, numero, motivo, nota, richiamare_at, assegnato_a
+    `) as any[];
+    if (!dovuti.length) return 0;
+    const perUtente = new Map<string, any[]>();
+    for (const f of dovuti) {
+      const u = String(f.assegnato_a).toLowerCase();
+      const ora = new Date(f.richiamare_at).toLocaleString("it-IT", { timeZone: "Europe/Rome", hour: "2-digit", minute: "2-digit" });
+      const chi = f.nome || f.numero || "Contatto";
+      await sql`DELETE FROM notifiche WHERE username = ${u} AND followup_id = ${f.id} AND tipo = 'followup_promemoria' AND letta_at IS NULL`;
+      await sql`
+        INSERT INTO notifiche (username, tipo, titolo, testo, followup_id, creata_da)
+        VALUES (${u}, 'followup_promemoria', ${`Promemoria: richiamare ${chi} alle ${ora}`}, ${[f.motivo, f.numero, f.nota].filter(Boolean).join(" · ") || null}, ${f.id}, 'promemoria')
+      `;
+      perUtente.set(u, [...(perUtente.get(u) || []), f]);
+    }
+    if (process.env.SMTP_USER) {
+      const appUrl = (process.env.APP_URL || "https://outboundcallgem.vercel.app").replace(/\/$/, "");
+      const transporter = nodemailer.createTransport({
+        host: process.env.SMTP_HOST || "smtp.gmail.com",
+        port: parseInt(process.env.SMTP_PORT || "587"),
+        secure: process.env.SMTP_SECURE === "true",
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      });
+      for (const [u, fs] of perUtente) {
+        try {
+          const dest = await findSessionUser(u).catch(() => null);
+          if (!dest?.email || !EMAIL_VALIDA_RE.test(dest.email)) continue;
+          if ((await preferenzeDi(u)).emailAssegnazioni === false) continue;
+          const oraDi = (f: any) => new Date(f.richiamare_at).toLocaleString("it-IT", { timeZone: "Europe/Rome", hour: "2-digit", minute: "2-digit" });
+          const righe = fs.map((f, i) => {
+            const border = i < fs.length - 1 ? "border-bottom:1px solid #eef1f6;" : "";
+            return `<tr><td style="padding:10px 0;${border}font-size:14px;color:#0f172a;font-weight:600;">${escapeHtml(f.nome || f.numero || "Contatto")}${f.numero ? `<br><a href="tel:${escapeHtml(f.numero)}" style="font-size:13px;color:#1e3dc8;font-weight:500;text-decoration:none;">${escapeHtml(f.numero)}</a>` : ""}${f.nota ? `<br><span style="font-size:13px;color:#64748b;font-weight:400;">${escapeHtml(f.nota)}</span>` : ""}</td>
+              <td style="padding:10px 0;${border}font-size:15px;color:#1e3dc8;font-weight:700;text-align:right;vertical-align:top;">${oraDi(f)}</td></tr>`;
+          }).join("");
+          const nome = (dest.nome || "").split(" ")[0];
+          await transporter.sendMail({
+            from: `"GEM Outbound" <${process.env.SMTP_USER}>`,
+            to: dest.email,
+            subject: fs.length === 1 ? `Promemoria: richiamare ${fs[0].nome || fs[0].numero} alle ${oraDi(fs[0])}` : `Promemoria: ${fs.length} contatti da richiamare`,
+            text: [`Ciao${nome ? ` ${nome}` : ""}, è ora di richiamare:`, "", ...fs.map(f => `- ${oraDi(f)} ${f.nome || f.numero}${f.numero && f.nome ? ` (${f.numero})` : ""}${f.nota ? ` · ${f.nota}` : ""}`), "", `${appUrl}/?tab=followups&miei=1`].join("\n"),
+            html: `
+<div style="background:#eef1f6;padding:28px 12px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0;">
+  <tr><td style="padding:28px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+    <td><img src="${appUrl}/gem-logo-color.png" width="96" alt="GEM Group" style="display:block;width:96px;height:auto;"></td>
+    <td style="text-align:right;"><span style="display:inline-block;background:#ede9fe;color:#5b21b6;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;">&#9679; Promemoria</span></td></tr></table></td></tr>
+  <tr><td style="padding:26px 40px 6px;font-size:24px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">${fs.length === 1 ? "È ora di richiamare" : `${fs.length} contatti da richiamare`}</td></tr>
+  <tr><td style="padding:0 40px 20px;font-size:15px;color:#475569;line-height:1.6;">Ciao${nome ? ` ${escapeHtml(nome)}` : ""}, ecco ${fs.length === 1 ? "il contatto che hai in programma" : "i contatti che hai in programma"} a breve.</td></tr>
+  <tr><td style="padding:0 40px 8px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border-radius:10px;"><tr><td style="padding:6px 20px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${righe}</table></td></tr></table></td></tr>
+  <tr><td style="padding:20px 40px 34px;"><a href="${appUrl}/?tab=followups&miei=1" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:14px 20px;border-radius:9px;">Apri i miei follow-up</a></td></tr>
+  <tr><td style="padding:18px 40px;border-top:1px solid #eef1f6;font-size:12px;color:#94a3b8;line-height:1.6;">GEM Group &middot; Email automatica inviata da GEM Outbound. Puoi disattivarla da Il Mio Profilo &rsaquo; Avvisi.</td></tr>
+</table></div>`,
+          });
+        } catch (err) {
+          console.error("Errore email promemoria:", err);
+        }
+      }
+    }
+    return dovuti.length;
+  } catch (err) {
+    console.error("Errore promemoria follow-up:", err);
+    return 0;
+  }
+}
+const EMAIL_VALIDA_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 // Notifiche non lette dell'utente collegato.
 app.get("/api/notifiche", requireAuth, async (req: any, res) => {
   if (!sql) return res.json({ ok: true, notifiche: [] });
   try {
     await ensureNotifiche();
+    await inviaPromemoriaFollowup();
     const r = (await sql`
       SELECT id, tipo, titolo, testo, followup_id, creata_da, creata_at FROM notifiche
       WHERE username = ${String(req.session.username).toLowerCase()} AND letta_at IS NULL
@@ -909,6 +1026,65 @@ app.post("/api/notifiche/lette", requireAuth, express.json(), async (req: any, r
   }
 });
 
+// "La mia giornata": i miei follow-up (con le richiamate di oggi e quelle
+// scadute), i clienti caldi di oggi, le campagne in corso e i numeri del giorno.
+app.get("/api/giornata", requireAuth, async (req: any, res) => {
+  if (!sql) return res.json({ ok: true });
+  const me = await findSessionUser(req.session.username);
+  if (!me) return res.status(401).json({ ok: false });
+  const io = String(me.username).toLowerCase();
+  const solo = permessiUtente(me).soloPropriFollowup;
+  const safe = async <T,>(fn: () => Promise<T>, fb: T): Promise<T> => { try { return await fn(); } catch (err) { console.error("Errore giornata:", err); return fb; } };
+  try {
+    await ensureFollowupsExtra();
+    await inviaPromemoriaFollowup();
+    const inizioGiorno = ((await sql`SELECT (date_trunc('day', now() AT TIME ZONE 'Europe/Rome') AT TIME ZONE 'Europe/Rome') AS t`) as any[])[0].t;
+    const fineGiorno = new Date(new Date(inizioGiorno).getTime() + 86_400_000).toISOString();
+    const miei = await safe(async () => (await sql`
+      SELECT id, nome, numero, motivo, nota, richiamare_at, created_at FROM followups
+      WHERE stato = 'pending' AND lower(assegnato_a) = ${io}
+      ORDER BY richiamare_at ASC NULLS LAST, created_at DESC LIMIT 200`) as any[], [] as any[]);
+    const scaduti = miei.filter(f => f.richiamare_at && new Date(f.richiamare_at).getTime() < Date.now());
+    const oggi = miei.filter(f => f.richiamare_at && new Date(f.richiamare_at).getTime() >= Date.now() && new Date(f.richiamare_at).getTime() < new Date(fineGiorno).getTime());
+    const senzaData = miei.filter(f => !f.richiamare_at);
+    const caldi = await safe(async () => (await sql`
+      SELECT id, nome, numero, motivo, assegnato_a, created_at FROM followups
+      WHERE created_at >= ${inizioGiorno} AND motivo IN ('Cliente interessato', 'Appuntamento fissato')
+        AND (${solo}::boolean = false OR lower(assegnato_a) = ${io})
+      ORDER BY created_at DESC LIMIT 20`) as any[], [] as any[]);
+    const daAssegnare = solo || me.role === "Viewer" ? 0 : await safe(async () => ((await sql`
+      SELECT count(*)::int AS n FROM followups WHERE stato = 'pending' AND assegnato_a IS NULL`) as any[])[0]?.n || 0, 0);
+    await ensureLiveSchema();
+    const campagne = await safe(async () => (await sql`
+      SELECT c.id, c.voicebot_nome, c.operatore, c.tipo_campagna, c.created_at, c.in_pausa, count(*)::int AS totale,
+        count(*) FILTER (WHERE l.stato NOT IN ('in_coda', 'avviata'))::int AS gestite,
+        count(*) FILTER (WHERE l.stato = 'risposta')::int AS risposte
+      FROM live_campaigns c JOIN live_calls l ON l.campaign_id = c.id
+      WHERE c.fermata_at IS NULL AND c.created_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int)
+      GROUP BY c.id HAVING count(*) FILTER (WHERE l.stato IN ('in_coda', 'avviata')) > 0
+      ORDER BY c.created_at DESC LIMIT 10`) as any[], [] as any[]);
+    const numeri = await safe(async () => ((await sql`
+      SELECT count(*) FILTER (WHERE stato IN ('risposta', 'interrotta', 'non_risposta', 'non_partita', 'errore'))::int AS chiamate,
+             count(*) FILTER (WHERE stato = 'risposta')::int AS risposte
+      FROM live_calls WHERE updated_at >= ${inizioGiorno}`) as any[])[0] || { chiamate: 0, risposte: 0 }, { chiamate: 0, risposte: 0 });
+    const chiusiOggi = await safe(async () => ((await sql`
+      SELECT count(*)::int AS n FROM followups WHERE stato = 'done' AND chiuso_at >= ${inizioGiorno} AND lower(chiuso_da) = ${io}`) as any[])[0]?.n || 0, 0);
+    const users = await readUsers().catch(() => [] as any[]);
+    const nomeDi = (u?: string | null) => (u ? users.find((x: any) => x.username.toLowerCase() === u.toLowerCase())?.nome || u : null);
+    res.json({
+      ok: true,
+      followup: { totale: miei.length, scaduti, oggi, senzaData: senzaData.slice(0, 10), senzaDataTotale: senzaData.length, chiusiOggi },
+      caldi: caldi.map(c => ({ ...c, assegnato_nome: nomeDi(c.assegnato_a) })),
+      daAssegnare,
+      campagne,
+      numeri: { ...numeri, caldi: caldi.length },
+    });
+  } catch (err) {
+    console.error("Errore /api/giornata:", err);
+    res.status(500).json({ ok: false, error: "Errore caricamento" });
+  }
+});
+
 // Nomi degli utenti (per assegnare i follow-up). Niente dati riservati.
 app.get("/api/utenti/nomi", requireAuth, async (_req, res) => {
   const users = await readUsers();
@@ -920,7 +1096,11 @@ app.post("/api/followups/:id/done", requireAuth, express.json(), async (req, res
   if (!sql || !(fid > 0)) return res.status(400).json({ ok: false });
   if (!(await puoModificareFollowup(req, res, fid))) return;
   try {
-    await sql`UPDATE followups SET stato = 'done' WHERE id = ${parseInt(req.params.id)}`;
+    await ensureFollowupsExtra();
+    const esito = esitoFinaleValido(req.body?.esito);
+    const user = (req as any).session.username;
+    await sql`UPDATE followups SET stato = 'done', esito_finale = ${esito}, chiuso_at = now(), chiuso_da = ${user},
+      aggiornato_at = now(), aggiornato_da = ${user} WHERE id = ${fid}`;
     res.json({ ok: true });
   } catch (err) {
     console.error("Error updating followup:", err);
@@ -976,6 +1156,33 @@ app.get("/api/stats", requireAuth, async (req, res) => {
               AT TIME ZONE 'Europe/Rome') AS da
     `) as any[];
     const da = from[0].da;
+
+    // Com'è finita: follow-up chiusi nel periodo, per esito e per persona.
+    const esitiFollowup = await safe(async () => {
+      await ensureFollowupsExtra();
+      const righe = (await sql`
+        SELECT COALESCE(esito_finale, 'non_indicato') AS esito, lower(COALESCE(chiuso_da, '')) AS chi, COUNT(*)::int AS n
+        FROM followups WHERE stato = 'done' AND chiuso_at >= ${da}
+        GROUP BY 1, 2`) as any[];
+      const users = await readUsers().catch(() => [] as any[]);
+      const nomeDi = (u: string) => users.find((x: any) => x.username.toLowerCase() === u)?.nome || u || "—";
+      const perEsito = new Map<string, number>();
+      const perPersona = new Map<string, { chiusi: number; positivi: number }>();
+      for (const r of righe) {
+        perEsito.set(r.esito, (perEsito.get(r.esito) || 0) + r.n);
+        const p = perPersona.get(r.chi) || { chiusi: 0, positivi: 0 };
+        p.chiusi += r.n;
+        if (["venduto", "appuntamento"].includes(r.esito)) p.positivi += r.n;
+        perPersona.set(r.chi, p);
+      }
+      const totale = [...perEsito.values()].reduce((a, b) => a + b, 0);
+      const positivi = (perEsito.get("venduto") || 0) + (perEsito.get("appuntamento") || 0);
+      return {
+        totale, positivi,
+        perEsito: [...ESITI_FINALI, "non_indicato"].map(e => ({ esito: e, label: ESITO_FINALE_LABEL[e] || "Non indicato", n: perEsito.get(e) || 0 })).filter(x => x.n > 0),
+        perPersona: [...perPersona.entries()].map(([u, v]) => ({ persona: nomeDi(u), ...v })).sort((a, b) => b.chiusi - a.chiusi),
+      };
+    }, { totale: 0, positivi: 0, perEsito: [], perPersona: [] });
 
     const [chiamate, perGiorno, followupAperti, campagne, perOperatore, pianificateInAttesa] = await Promise.all([
       safe(async () => ((await sql`
@@ -1064,6 +1271,7 @@ app.get("/api/stats", requireAuth, async (req, res) => {
       registroCampagneDal: logStart,
       perVoicebot: confronto.perVoicebot,
       perFascia: confronto.perFascia,
+      esitiFollowup,
     });
   } catch (err) {
     console.error("Errore /api/stats:", err);
@@ -1747,7 +1955,12 @@ app.get("/api/users", requireAuth, requireAdmin, async (req, res) => {
   // Ultimo accesso e follow-up aperti assegnati: aiutano l'Admin a capire chi usa il sito.
   const accessi = new Map<string, string>();
   const followup = new Map<string, number>();
+  const inviti = new Set<string>();
   if (sql) {
+    try {
+      await ensureInviti();
+      for (const r of (await sql`SELECT DISTINCT lower(username) AS u FROM inviti WHERE usato_at IS NULL AND scade_at > now()`) as any[]) inviti.add(r.u);
+    } catch { /* niente */ }
     try {
       for (const r of (await sql`SELECT lower(username) AS u, max(ts) AS ts FROM access_logs WHERE action = 'login' GROUP BY 1`) as any[]) accessi.set(r.u, r.ts);
     } catch { /* registro non disponibile */ }
@@ -1768,6 +1981,7 @@ app.get("/api/users", requireAuth, requireAdmin, async (req, res) => {
     telefono: u.telefono || "",
     ultimoAccesso: accessi.get(String(u.username).toLowerCase()) || null,
     soloPropriFollowup: u.soloPropriFollowup === true,
+    invitoInAttesa: inviti.has(String(u.username).toLowerCase()),
     puoEsportare: u.puoEsportare !== false,
     limiteNumeri: parseInt(u.limiteNumeri, 10) > 0 ? parseInt(u.limiteNumeri, 10) : null,
     followupAperti: followup.get(String(u.username).toLowerCase()) || 0,
@@ -1795,24 +2009,157 @@ app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
   const email = String(req.body.email || "").trim().toLowerCase();
   const telefono = String(req.body.telefono || "").trim().slice(0, 40);
 
-  if (!username || !password || !nome || !role) {
+  const invito = req.body.invito === true;
+  if (!username || (!password && !invito) || !nome || !role) {
     return res.status(400).json({ error: "Dati mancanti" });
   }
   if (!RUOLI.includes(role)) return res.status(400).json({ error: "Ruolo non valido" });
   if (!/^[a-zA-Z0-9._-]{2,40}$/.test(String(username))) return res.status(400).json({ error: "Username: solo lettere, numeri, punto, trattino (2-40 caratteri)" });
-  if (String(password).length < 8) return res.status(400).json({ error: "La password deve avere almeno 8 caratteri" });
+  if (password && String(password).length < 8) return res.status(400).json({ error: "La password deve avere almeno 8 caratteri" });
   if (email && !EMAIL_VALIDA.test(email)) return res.status(400).json({ error: "Email non valida" });
+  if (invito && !email) return res.status(400).json({ error: "Per mandare l'invito serve l'email" });
 
   const users = await readUsers();
   if (users.find((u: any) => u.username.toLowerCase() === username.toLowerCase())) {
     return res.status(400).json({ error: "Username già esistente" });
   }
 
-  const hashed = await bcrypt.hash(password, 12);
+  // Con l'invito la password la sceglie la persona: intanto una casuale che nessuno conosce.
+  const hashed = await bcrypt.hash(password || crypto.randomBytes(24).toString("hex"), 12);
   users.push({ username, password: hashed, nome, role, isAdmin: role === 'Admin', canSchedule: canSchedule === true, twoFactorRequired: false, twoFactorEnabled: false, ...(email ? { email } : {}), ...(telefono ? { telefono } : {}), ...leggiPermessi(req.body) });
   await writeUsers(users);
 
+  if (invito) {
+    const inviato = await creaEInviaInvito(username, (req as any).session.username).catch(err => { console.error("Errore invito:", err); return false; });
+    return res.json({ ok: true, invitoInviato: inviato });
+  }
   res.json({ ok: true });
+});
+
+// ── Inviti: la persona riceve un'email con un link per scegliere la password ──
+const INVITO_ORE = 72;
+let invitiReady: Promise<void> | null = null;
+function ensureInviti(): Promise<void> {
+  if (!invitiReady) {
+    invitiReady = sql!`
+      CREATE TABLE IF NOT EXISTS inviti (
+        token_hash TEXT PRIMARY KEY,
+        username   TEXT NOT NULL,
+        creato_da  TEXT,
+        creato_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        scade_at   TIMESTAMPTZ NOT NULL,
+        usato_at   TIMESTAMPTZ
+      )
+    `.then(() => undefined).catch(err => { invitiReady = null; throw err; });
+  }
+  return invitiReady;
+}
+const hashToken = (t: string) => crypto.createHash("sha256").update(t).digest("hex");
+
+// Crea un link nuovo (quelli vecchi non usati smettono di valere) e lo manda per email.
+async function creaEInviaInvito(username: string, daUsername: string): Promise<boolean> {
+  if (!sql) return false;
+  const users = await readUsers();
+  const u = users.find((x: any) => x.username.toLowerCase() === username.toLowerCase());
+  if (!u?.email || !EMAIL_VALIDA.test(u.email)) return false;
+  await ensureInviti();
+  await sql`UPDATE inviti SET usato_at = now() WHERE lower(username) = ${u.username.toLowerCase()} AND usato_at IS NULL`;
+  const token = crypto.randomBytes(32).toString("base64url");
+  await sql`INSERT INTO inviti (token_hash, username, creato_da, scade_at) VALUES (${hashToken(token)}, ${u.username}, ${daUsername}, now() + make_interval(hours => ${INVITO_ORE}::int))`;
+  if (!process.env.SMTP_USER) return false;
+  const da = await findSessionUser(daUsername).catch(() => null);
+  const daNome = da?.nome || daUsername;
+  const appUrl = (process.env.APP_URL || "https://outboundcallgem.vercel.app").replace(/\/$/, "");
+  const link = `${appUrl}/?invito=${token}`;
+  const nome = String(u.nome || "").split(" ")[0];
+  const ruolo = ruoloDi(u);
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || "smtp.gmail.com",
+    port: parseInt(process.env.SMTP_PORT || "587"),
+    secure: process.env.SMTP_SECURE === "true",
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  });
+  await transporter.sendMail({
+    from: `"GEM Outbound" <${process.env.SMTP_USER}>`,
+    to: u.email,
+    subject: `${daNome} ti ha dato accesso a GEM Outbound`,
+    text: [`Ciao${nome ? ` ${nome}` : ""}, ${daNome} ti ha dato accesso a GEM Outbound.`, "", `Il tuo nome utente: ${u.username}`, `Ruolo: ${ruolo}`, "", `Scegli la tua password da qui (il link vale ${INVITO_ORE} ore):`, link].join("\n"),
+    html: `
+<div style="background:#eef1f6;padding:28px 12px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0;">
+  <tr><td style="padding:28px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+    <td><img src="${appUrl}/gem-logo-color.png" width="96" alt="GEM Group" style="display:block;width:96px;height:auto;"></td>
+    <td style="text-align:right;"><span style="display:inline-block;background:#dcfce7;color:#166534;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;">&#9679; Invito</span></td></tr></table></td></tr>
+  <tr><td style="padding:26px 40px 6px;font-size:24px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">Benvenuto in GEM Outbound</td></tr>
+  <tr><td style="padding:0 40px 20px;font-size:15px;color:#475569;line-height:1.6;">Ciao${nome ? ` ${escapeHtml(nome)}` : ""}, <strong style="color:#0f172a;">${escapeHtml(daNome)}</strong> ti ha dato accesso alla piattaforma delle campagne di chiamate con Wilma.</td></tr>
+  <tr><td style="padding:0 40px 8px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border-radius:10px;"><tr><td style="padding:6px 20px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr><td style="padding:11px 0;border-bottom:1px solid #eef1f6;font-size:14px;color:#64748b;">Nome utente</td><td style="padding:11px 0;border-bottom:1px solid #eef1f6;font-size:14px;color:#0f172a;font-weight:700;text-align:right;font-family:monospace;">${escapeHtml(u.username)}</td></tr>
+      <tr><td style="padding:11px 0;font-size:14px;color:#64748b;">Ruolo</td><td style="padding:11px 0;font-size:14px;color:#0f172a;font-weight:600;text-align:right;">${escapeHtml(ruolo)}</td></tr>
+    </table></td></tr></table></td></tr>
+  <tr><td style="padding:20px 40px 8px;"><a href="${link}" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:14px 20px;border-radius:9px;">Scegli la tua password</a></td></tr>
+  <tr><td style="padding:4px 40px 30px;font-size:13px;color:#64748b;line-height:1.5;text-align:center;">Il link vale ${INVITO_ORE} ore e si può usare una volta sola.</td></tr>
+  <tr><td style="padding:18px 40px;border-top:1px solid #eef1f6;font-size:12px;color:#94a3b8;line-height:1.6;">GEM Group &middot; Soluzioni di comunicazione e automazione AI su tecnologia Wildix<br>Se non aspettavi questa email puoi ignorarla.</td></tr>
+</table></div>`,
+  });
+  return true;
+}
+
+// Admin: manda (o rimanda) l'invito, anche per far reimpostare la password.
+app.post("/api/users/:username/invito", requireAuth, requireAdmin, async (req: any, res) => {
+  const users = await readUsers();
+  const u = users.find((x: any) => x.username.toLowerCase() === String(req.params.username).toLowerCase());
+  if (!u) return res.status(404).json({ ok: false, error: "Utente non trovato" });
+  if (!u.email) return res.status(400).json({ ok: false, error: "Questo utente non ha l'email: aggiungila prima" });
+  try {
+    const ok = await creaEInviaInvito(u.username, req.session.username);
+    if (!ok) return res.status(500).json({ ok: false, error: "Email non inviata: controlla la configurazione email del sito" });
+    res.json({ ok: true, email: u.email });
+  } catch (err) {
+    console.error("Errore invito:", err);
+    res.status(500).json({ ok: false, error: "Invio non riuscito" });
+  }
+});
+
+// Pubblico: dati dell'invito (per mostrare a chi è) e scelta della password.
+async function invitoValido(token: string): Promise<any | null> {
+  if (!sql || !token || token.length > 100) return null;
+  await ensureInviti();
+  const r = (await sql`SELECT username FROM inviti WHERE token_hash = ${hashToken(token)} AND usato_at IS NULL AND scade_at > now()`) as any[];
+  return r[0] || null;
+}
+app.get("/api/invito/:token", async (req, res) => {
+  try {
+    const inv = await invitoValido(String(req.params.token));
+    if (!inv) return res.status(404).json({ ok: false, error: "Link non valido o scaduto. Chiedi all'Admin di mandarne un altro." });
+    const u = (await readUsers()).find((x: any) => x.username.toLowerCase() === inv.username.toLowerCase());
+    if (!u) return res.status(404).json({ ok: false, error: "Utente non più presente" });
+    res.json({ ok: true, username: u.username, nome: u.nome });
+  } catch (err) {
+    console.error("Errore lettura invito:", err);
+    res.status(500).json({ ok: false, error: "Errore" });
+  }
+});
+app.post("/api/invito", async (req, res) => {
+  const token = String(req.body?.token || "");
+  const password = String(req.body?.password || "");
+  if (password.length < 8) return res.status(400).json({ ok: false, error: "La password deve avere almeno 8 caratteri" });
+  try {
+    const inv = await invitoValido(token);
+    if (!inv) return res.status(404).json({ ok: false, error: "Link non valido o scaduto. Chiedi all'Admin di mandarne un altro." });
+    // Il link si consuma subito, prima di cambiare la password.
+    const preso = (await sql!`UPDATE inviti SET usato_at = now() WHERE token_hash = ${hashToken(token)} AND usato_at IS NULL RETURNING username`) as any[];
+    if (!preso.length) return res.status(409).json({ ok: false, error: "Link già usato" });
+    const users = await readUsers();
+    const i = users.findIndex((x: any) => x.username.toLowerCase() === inv.username.toLowerCase());
+    if (i === -1) return res.status(404).json({ ok: false, error: "Utente non più presente" });
+    users[i] = { ...users[i], password: await bcrypt.hash(password, 12) };
+    await writeUsers(users);
+    res.json({ ok: true, username: users[i].username });
+  } catch (err) {
+    console.error("Errore conferma invito:", err);
+    res.status(500).json({ ok: false, error: "Errore" });
+  }
 });
 
 app.put("/api/users/:username", requireAuth, requireAdmin, async (req, res) => {
@@ -3560,6 +3907,15 @@ async function prossimaSveglia(): Promise<Date | null> {
       }
     }
   }
+  // Promemoria dei follow-up con data di richiamo.
+  try {
+    await ensureFollowupsExtra();
+    const pm = (await sql!`
+      SELECT min(richiamare_at) AS t FROM followups
+      WHERE stato = 'pending' AND assegnato_a IS NOT NULL AND promemoria_at IS NULL AND richiamare_at IS NOT NULL
+    `) as any[];
+    if (pm[0]?.t) candidati.push(new Date(pm[0].t).getTime() - PROMEMORIA_ANTICIPO_MIN * 60_000);
+  } catch { /* niente */ }
   if (!candidati.length) return null;
   // Make ha bisogno di un orario nel futuro.
   return new Date(Math.max(Math.min(...candidati), Date.now() + 90_000));
@@ -3649,6 +4005,7 @@ async function handleTick(req: any, res: any) {
     await dispatchDueCampaigns();
     const code = await pumpAllQueues();
     await controllaFineCampagne();
+    await inviaPromemoriaFollowup();
     // ?s=1 / ?s=2: quale dei due scenari sveglia sta chiamando.
     const n = parseInt(String(req.query?.s || ""), 10);
     const chiamante = n >= 1 && n <= MAKE_TIMER_SCENARI.length ? MAKE_TIMER_SCENARI[n - 1] : null;

@@ -20,8 +20,9 @@ import { ConfirmModal } from './ConfirmModal';
 import { NonChiamareSection } from './NonChiamareSection';
 import { ImpostazioniSection } from './ImpostazioniSection';
 import { NotificheAvviso } from './NotificheAvviso';
+import { GiornataSection } from './GiornataSection';
 
-type Tab = 'live' | 'campaign' | 'appointments' | 'lists' | 'dnc' | 'history' | 'callresults' | 'followups' | 'profile' | 'support' | 'stats' | 'users' | 'voicebots' | 'settings';
+type Tab = 'home' | 'live' | 'campaign' | 'appointments' | 'lists' | 'dnc' | 'history' | 'callresults' | 'followups' | 'profile' | 'support' | 'stats' | 'users' | 'voicebots' | 'settings';
 
 interface NavItem {
   id: Tab;
@@ -42,6 +43,12 @@ interface NavGroup {
 // Menu diviso per scopo: preparare e lanciare, seguire le chiamate, analizzare,
 // amministrare. Profilo e Assistenza stanno nella scheda utente in fondo.
 const NAV_GROUPS: NavGroup[] = [
+  {
+    label: '',
+    items: [
+      { id: 'home' as Tab, label: 'La mia giornata', icon: Sun },
+    ]
+  },
   {
     label: 'Campagne',
     items: [
@@ -84,6 +91,7 @@ const TAB_META: Record<Tab, { title: string; subtitle: string }> = {
   dnc: { title: 'Non chiamare', subtitle: 'Numeri che nessuna campagna chiama mai: chi lo ha chiesto, clienti attivi, numeri sbagliati.' },
   settings: { title: 'Impostazioni', subtitle: 'Orari in cui le campagne possono chiamare.' },
   history: { title: 'Storico Campagne', subtitle: 'Le campagne lanciate da tutti gli operatori, con i report da scaricare.' },
+  home: { title: 'La mia giornata', subtitle: 'Chi richiamare oggi, i clienti caldi e le campagne in corso.' },
   live: { title: 'In diretta', subtitle: 'Le chiamate delle campagne in corso, aggiornate ogni pochi secondi.' },
   followups: { title: 'Follow-up', subtitle: 'Contatti da richiamare o gestire a mano: chiamate non risposte, rifiuti, disdette e trasferimenti.' },
   callresults: { title: 'Esiti Chiamate', subtitle: 'Esito, trascrizione e riassunto AI di ogni chiamata gestita dal voicebot.' },
@@ -145,7 +153,7 @@ export function Dashboard() {
   const viewerHiddenTabs: Tab[] = ['campaign', 'appointments', 'lists', 'dnc'];
   const linkTab = urlTab && urlTab in TAB_META && !(isViewer && viewerHiddenTabs.includes(urlTab)) ? urlTab : null;
   const savedTab = sessionStorage.getItem('gem_active_tab') as Tab | null;
-  const [activeTab, setActiveTab] = useState<Tab>(linkTab || savedTab || (isViewer ? 'callresults' : 'campaign'));
+  const [activeTab, setActiveTab] = useState<Tab>(linkTab || savedTab || 'home');
 
   // Tolto ?tab= dall'indirizzo dopo l'apertura, così un ricaricamento non lo riapplica.
   React.useEffect(() => {
@@ -296,7 +304,7 @@ export function Dashboard() {
               if (!visibleItems.length) return null;
               return (
                 <div key={group.label}>
-                  <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2">{group.label}</div>
+                  {group.label && <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2">{group.label}</div>}
                   <div className="space-y-0.5">
                     {visibleItems.map(item => {
                       const Icon = item.icon;
@@ -359,7 +367,7 @@ export function Dashboard() {
             <div className="grid grid-cols-3 gap-1">
               {/* Guida utente in PDF (file in public/) */}
               <a
-                href="/guida-gem-outbound.pdf?v=2026-10-23i"
+                href="/guida-gem-outbound.pdf?v=2026-10-23j"
                 download="GEM-Outbound-Guida-utente.pdf"
                 title="Scarica la guida utente (PDF)"
                 className="flex flex-col items-center justify-center gap-1 py-2 text-[11px] font-semibold text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
@@ -532,6 +540,8 @@ export function Dashboard() {
           {activeTab === 'followups' && (
             <FollowupsSection />
           )}
+
+          {activeTab === 'home' && <GiornataSection />}
 
           {activeTab === 'live' && (
             <LiveSection />
