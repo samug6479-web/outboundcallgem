@@ -6,7 +6,7 @@ import { ConfirmModal } from './ConfirmModal';
 import { SkeletonRow, EmptyState } from './Skeleton';
 import { authFetch } from '../lib/authFetch';
 
-function FormRow({ label, field, placeholder, type = 'text', form, setForm }: any) {
+function FormRow({ label, field, placeholder, type = 'text', form, setForm, hint }: any) {
   return (
     <div>
       <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">{label}</label>
@@ -17,6 +17,7 @@ function FormRow({ label, field, placeholder, type = 'text', form, setForm }: an
         placeholder={placeholder}
         className="w-full px-3 py-2 text-sm bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-lg focus:outline-none focus:border-brand-500 dark:text-white"
       />
+      {hint && <p className="text-[11px] text-slate-400 mt-1">{hint}</p>}
     </div>
   );
 }
@@ -152,7 +153,7 @@ export function AdminVoicebots() {
                 <FormRow label="Interno Wildix (exten)" field="exten" placeholder="Es. 8000" type="number" form={form} setForm={setForm} />
                 {isAdmin && <FormRow label="Contesto (context)" field="context" placeholder="outbound-voicebot" form={form} setForm={setForm} />}
                 <FormRow label="Descrizione (facoltativa)" field="descrizione" placeholder="Es. Sondaggio post-vendita" form={form} setForm={setForm} />
-                {isAdmin && <FormRow label="Webhook esiti (facoltativo)" field="webhookEsiti" placeholder="https://hook.eu1.make.com/..." form={form} setForm={setForm} />}
+                {isAdmin && <FormRow label="Webhook esiti di questo voicebot (facoltativo)" field="webhookEsiti" placeholder="https://hook.eu1.make.com/..." form={form} setForm={setForm} hint="Ogni voicebot ha il suo foglio: incolla il webhook dello scenario Make che scrive nel foglio esiti di QUESTO voicebot. Vuoto = gli esiti non riusciti non vanno in nessun foglio." />}
               </div>
               <div className="flex gap-2">
                 <button onClick={handleSaveNew} className="flex items-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold rounded-xl transition-colors">
@@ -186,7 +187,7 @@ export function AdminVoicebots() {
                         <FormRow label="Interno (exten)" field="exten" placeholder="8000" type="number" form={form} setForm={setForm} />
                         {isAdmin && <FormRow label="Contesto" field="context" placeholder="outbound-voicebot" form={form} setForm={setForm} />}
                         <FormRow label="Descrizione" field="descrizione" placeholder="Facoltativa" form={form} setForm={setForm} />
-                        {isAdmin && <FormRow label="Webhook esiti" field="webhookEsiti" placeholder="https://hook.eu1.make.com/... (facoltativo)" form={form} setForm={setForm} />}
+                        {isAdmin && <FormRow label="Webhook esiti di questo voicebot" field="webhookEsiti" placeholder="https://hook.eu1.make.com/... (facoltativo)" form={form} setForm={setForm} hint="Ogni voicebot ha il suo foglio: incolla il webhook dello scenario Make che scrive nel foglio esiti di QUESTO voicebot. Vuoto = gli esiti non riusciti non vanno in nessun foglio." />}
                       </div>
                       <div className="flex gap-2">
                         <button onClick={() => handleSaveEdit(bot.id)} className="flex items-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold rounded-xl transition-colors">
@@ -213,7 +214,7 @@ export function AdminVoicebots() {
                           Interno: <span className="font-mono font-semibold">{bot.exten}</span>
                           {isAdmin && <><span className="mx-2">·</span>Context: <span className="font-mono">{bot.context}</span></>}
                           {bot.descrizione && <><span className="mx-2">·</span>{bot.descrizione}</>}
-                          {isAdmin && bot.webhookEsiti && <><span className="mx-2">·</span>Esiti non riusciti nello Sheets</>}
+                          {isAdmin && <><span className="mx-2">·</span>{bot.webhookEsiti ? 'Esiti nel suo foglio Sheets' : 'Nessun foglio esiti'}</>}
                         </div>
                       </div>
                       <div className="flex items-center gap-1">
