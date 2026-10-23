@@ -2075,19 +2075,32 @@ const ESITO_LABEL: Record<string, { label: string; bg: string; fg: string }> = {
   avviata: { label: "Senza esito", bg: "#f1f5f9", fg: "#64748b" },
 };
 
-async function inviaRiepilogoCampagna(c: any): Promise<void> {
-  const righe = (await sql!`
-    SELECT l.nome, l.numero, l.stato, l.errore, l.durata_ms,
-      COALESCE(
-        (SELECT r.riassunto FROM call_results r WHERE r.call_id = l.call_id AND r.riassunto IS NOT NULL LIMIT 1),
-        CASE WHEN l.stato IN ('risposta', 'interrotta') THEN
-          (SELECT r.riassunto FROM call_results r
-           WHERE r.numero = l.numero AND r.riassunto IS NOT NULL AND r.ts::timestamptz > ${c.created_at}
-           ORDER BY r.ts::timestamptz ASC LIMIT 1)
-        END
-      ) AS riassunto
-    FROM live_calls l WHERE l.campaign_id = ${c.id} ORDER BY l.id
+// Tutte le chiamate di una campagna con il riassunto e la trascrizione di
+// Wilma: prima per call_id, altrimenti (risposte e interrotte) il primo
+// risultato dello stesso numero arrivato dopo il lancio della campagna.
+async function chiamateCampagna(campaignId: number, createdAt: any): Promise<any[]> {
+  return (await sql!`
+    SELECT l.id, l.nome, l.numero, l.stato, l.errore, l.durata_ms, l.queued_at, l.updated_at,
+      r.riassunto, r.trascrizione
+    FROM live_calls l
+    LEFT JOIN LATERAL (
+      SELECT x.riassunto, x.trascrizione FROM (
+        (SELECT r1.riassunto, r1.trascrizione, 0 AS prio, now() AS t FROM call_results r1
+         WHERE l.call_id IS NOT NULL AND r1.call_id = l.call_id
+           AND (r1.riassunto IS NOT NULL OR r1.trascrizione IS NOT NULL) LIMIT 1)
+        UNION ALL
+        (SELECT r2.riassunto, r2.trascrizione, 1 AS prio, r2.ts::timestamptz AS t FROM call_results r2
+         WHERE l.stato IN ('risposta', 'interrotta') AND r2.numero = l.numero
+           AND (r2.riassunto IS NOT NULL OR r2.trascrizione IS NOT NULL) AND r2.ts::timestamptz > ${createdAt}
+         ORDER BY r2.ts::timestamptz ASC LIMIT 1)
+      ) x ORDER BY x.prio, x.t LIMIT 1
+    ) r ON true
+    WHERE l.campaign_id = ${campaignId} ORDER BY l.id
   `) as any[];
+}
+
+async function inviaRiepilogoCampagna(c: any): Promise<void> {
+  const righe = await chiamateCampagna(c.id, c.created_at);
   if (righe.length === 0) return;
 
   const conta = (stati: string[]) => righe.filter(r => stati.includes(r.stato)).length;
@@ -2873,6 +2886,47 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
   } catch (err) {
     console.error("Errore /api/live:", err);
     res.status(500).json({ ok: false, error: "Errore caricamento dati in diretta" });
+  }
+});
+
+// Dettaglio di una campagna della pagina "In diretta": tutti i numeri con
+// esito, durata e riassunto di Wilma. Solo Editor e Admin.
+app.get("/api/live/campaigns/:id", requireAuth, async (req: any, res) => {
+  const user = await findSessionUser(req.session.username);
+  if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
+  if (user.role === "Viewer") return res.status(403).json({ ok: false, error: "Non autorizzato" });
+  const id = parseInt(String(req.params.id), 10);
+  if (!sql || !(id > 0)) return res.status(404).json({ ok: false, error: "Campagna non trovata" });
+  try {
+    await ensureLiveSchema();
+    const c = ((await sql`
+      SELECT id, created_at, operatore, tipo_campagna, voicebot_nome, voicebot_exten, totale, scheduled_id
+      FROM live_campaigns WHERE id = ${id}
+    `) as any[])[0];
+    if (!c) return res.status(404).json({ ok: false, error: "Campagna non trovata" });
+    const limiteSenzaEsito = Date.now() - LIVE_SENZA_ESITO_MIN * 60000;
+    const leggi = (v: any) => {
+      if (v == null) return null;
+      if (typeof v !== "string") return v;
+      try { return JSON.parse(v); } catch { return { testo: v }; }
+    };
+    const calls = (await chiamateCampagna(id, c.created_at)).map(r => {
+      return {
+        id: r.id,
+        nome: r.nome,
+        numero: r.numero,
+        stato: r.stato === "avviata" && new Date(r.updated_at).getTime() <= limiteSenzaEsito ? "senza_esito" : r.stato,
+        errore: r.errore,
+        durata_ms: r.durata_ms,
+        updated_at: r.updated_at,
+        riassunto: leggi(r.riassunto),
+        trascrizione: typeof r.trascrizione === "string" ? r.trascrizione : null,
+      };
+    });
+    res.json({ ok: true, campaign: c, calls });
+  } catch (err) {
+    console.error("Errore /api/live/campaigns/:id:", err);
+    res.status(500).json({ ok: false, error: "Errore caricamento campagna" });
   }
 });
 

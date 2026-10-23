@@ -1,8 +1,10 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Radio, RefreshCw, AlertTriangle, PhoneCall, PhoneOff, PhoneMissed, PhoneForwarded, Phone, Clock, XCircle, ChevronDown } from 'lucide-react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Radio, RefreshCw, AlertTriangle, PhoneCall, PhoneMissed, Phone, Clock, XCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { authFetch } from '../lib/authFetch';
 import { useCampaign } from '../context/CampaignContext';
 import { cn } from '../lib/utils';
+import { STATI, Stato } from './liveStati';
+import { CampaignDetail } from './CampaignDetail';
 
 interface LiveCampaign {
   id: number;
@@ -40,26 +42,12 @@ interface LiveEvent {
   voicebot_nome: string | null;
 }
 
-type Stato = 'in_coda' | 'avviata' | 'senza_esito' | 'risposta' | 'interrotta' | 'non_risposta' | 'non_partita' | 'errore';
-
 const POLL_MS = 4000;
 // Oltre questi minuti senza avanzamenti la coda viene segnalata come ferma.
 const CODA_FERMA_MIN = 10;
 // Una chiamata avviata da più di tanti minuti senza esito viene segnalata.
 const SENZA_ESITO_MIN = 15;
 
-const STATI: Record<Stato, { label: string; color: string; bar: string; icon: React.ElementType }> = {
-  in_coda: { label: 'In coda', color: 'text-slate-500', bar: 'bg-slate-200 dark:bg-slate-700', icon: Clock },
-  avviata: { label: 'In corso', color: 'text-blue-600 dark:text-blue-400', bar: 'bg-blue-500', icon: PhoneCall },
-  risposta: { label: 'Risposto', color: 'text-green-600 dark:text-green-400', bar: 'bg-green-500', icon: Phone },
-  interrotta: { label: 'Interrotta', color: 'text-amber-600 dark:text-amber-400', bar: 'bg-amber-500', icon: PhoneOff },
-  non_risposta: { label: 'Non risposto', color: 'text-slate-500 dark:text-slate-400', bar: 'bg-slate-400', icon: PhoneMissed },
-  // Wildix non ha completato la chiamata: rifiutata, occupato, nessuna risposta o numero non raggiungibile
-  non_partita: { label: 'Non partita', color: 'text-orange-600 dark:text-orange-400', bar: 'bg-orange-400', icon: PhoneForwarded },
-  errore: { label: 'Errore', color: 'text-red-600 dark:text-red-400', bar: 'bg-red-500', icon: XCircle },
-  // Wildix ha accettato la chiamata ma da oltre 30 minuti non è arrivato l'evento di fine
-  senza_esito: { label: 'Senza esito', color: 'text-slate-500 dark:text-slate-400', bar: 'bg-slate-300 dark:bg-slate-600', icon: AlertTriangle },
-};
 
 const minutiDa = (iso: string | null, now: number) => (iso ? (now - new Date(iso).getTime()) / 60000 : Infinity);
 const ora = (iso: string) => new Date(iso).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -83,6 +71,8 @@ export function LiveSection() {
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [now, setNow] = useState(Date.now());
   const [showDiag, setShowDiag] = useState(false);
+  const [aperta, setAperta] = useState<number | null>(null);
+  const chiudiDettaglio = useCallback(() => setAperta(null), []);
   const timer = useRef<number | null>(null);
 
   const load = async (h = hours) => {
@@ -159,6 +149,7 @@ export function LiveSection() {
 
   return (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-300">
+      {aperta !== null && <CampaignDetail campaignId={aperta} onClose={chiudiDettaglio} />}
       {/* Barra superiore */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2 text-sm text-slate-500">
@@ -229,7 +220,10 @@ export function LiveSection() {
             ];
             const finita = c.in_coda === 0 && c.avviate === 0;
             return (
-              <div key={c.id} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-soft">
+              <div key={c.id} role="button" tabIndex={0} onClick={() => setAperta(c.id)}
+                onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setAperta(c.id); } }}
+                title="Apri l'elenco dei numeri con esiti e riassunti"
+                className="group block w-full text-left bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-soft hover:border-brand-300 dark:hover:border-brand-700 hover:shadow-md transition focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500">
                 <div className="flex flex-wrap items-start justify-between gap-2 mb-3">
                   <div className="min-w-0">
                     <div className="font-semibold text-slate-900 dark:text-white truncate">
@@ -263,6 +257,9 @@ export function LiveSection() {
                       {STATI[s].label} <span className="font-semibold tabular-nums">{n}</span>
                     </span>
                   ))}
+                </div>
+                <div className="mt-3 pt-3 border-t border-slate-100 dark:border-slate-800 text-xs font-semibold text-brand-600 dark:text-brand-400 inline-flex items-center gap-1">
+                  Vedi numeri e riassunti <ChevronRight className="w-3.5 h-3.5 transition-transform group-hover:translate-x-0.5" />
                 </div>
               </div>
             );
