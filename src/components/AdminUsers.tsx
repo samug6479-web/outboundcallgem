@@ -1,484 +1,433 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useCampaign } from '../context/CampaignContext';
-import { Users, Trash2, Plus, Loader2, Edit2, X, Save, ShieldCheck, ShieldOff } from 'lucide-react';
+import {
+  Users, Trash2, Plus, Loader2, Pencil, X, ShieldCheck, ShieldOff, ShieldAlert, Search, Mail, Phone,
+  CalendarClock, KeyRound, Copy, Check, AlertTriangle, BellRing,
+} from 'lucide-react';
 import { cn } from '../lib/utils';
 import { ConfirmModal } from './ConfirmModal';
-import { SkeletonUserRow, EmptyState } from './Skeleton';
 import { authFetch } from '../lib/authFetch';
 
-interface EditingState {
+type Ruolo = 'Admin' | 'Editor' | 'Viewer';
+
+interface Utente {
   username: string;
   nome: string;
-  password?: string; // vuoto = non cambiare la password esistente
-  role: string;
+  role: Ruolo;
   canSchedule: boolean;
+  twoFactorEnabled: boolean;
+  twoFactorRequired: boolean;
+  email: string;
+  telefono: string;
+  ultimoAccesso: string | null;
+  followupAperti: number;
+}
+
+interface Modulo {
+  nuovo: boolean;
+  username: string;
+  nome: string;
+  email: string;
+  telefono: string;
+  role: Ruolo;
+  canSchedule: boolean;
+  password: string;
+}
+
+const RUOLI: { id: Ruolo; descr: string }[] = [
+  { id: 'Admin', descr: 'Tutto, più utenti, voicebot e impostazioni.' },
+  { id: 'Editor', descr: 'Carica liste, lancia campagne, gestisce follow-up e Non chiamare.' },
+  { id: 'Viewer', descr: 'Solo lettura: esiti, follow-up e statistiche.' },
+];
+
+const ruoloCls = (r: Ruolo) =>
+  r === 'Admin' ? 'bg-red-50 text-red-600 dark:bg-red-900/20 dark:text-red-400'
+  : r === 'Viewer' ? 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'
+  : 'bg-brand-50 text-brand-600 dark:bg-brand-900/20 dark:text-brand-400';
+
+const quandoFa = (iso: string | null) => {
+  if (!iso) return 'mai';
+  const min = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (min < 2) return 'adesso';
+  if (min < 60) return `${min} min fa`;
+  const ore = Math.round(min / 60);
+  if (ore < 24) return `${ore} ore fa`;
+  const g = Math.round(ore / 24);
+  if (g === 1) return 'ieri';
+  if (g < 30) return `${g} giorni fa`;
+  return new Date(iso).toLocaleDateString('it-IT', { day: '2-digit', month: 'short', year: 'numeric' });
+};
+
+// Password casuale leggibile (senza caratteri ambigui).
+const generaPassword = () => {
+  const c = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const a = new Uint32Array(12);
+  crypto.getRandomValues(a);
+  return Array.from(a, n => c[n % c.length]).join('');
+};
+
+const campo = 'w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20';
+const etichetta = 'block text-xs font-semibold text-slate-500 mb-1';
+
+function Stato2FA({ u }: { u: Utente }) {
+  if (!u.twoFactorRequired) return <span className="inline-flex items-center gap-1 text-slate-400"><ShieldOff className="w-3.5 h-3.5" />2FA spento</span>;
+  if (u.twoFactorEnabled) return <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400"><ShieldCheck className="w-3.5 h-3.5" />2FA attivo</span>;
+  return <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400"><ShieldAlert className="w-3.5 h-3.5" />2FA da configurare</span>;
 }
 
 export function AdminUsers() {
   const { user } = useCampaign();
-  const [users, setUsers] = useState<any[]>([]);
+  const io = (user?.username || '').toLowerCase();
+  const [utenti, setUtenti] = useState<Utente[]>([]);
   const [loading, setLoading] = useState(true);
-  
-  const [newUsername, setNewUsername] = useState('');
-  const [newPassword, setNewPassword] = useState('');
-  const [newNome, setNewNome] = useState('');
-  const [newRole, setNewRole] = useState('Editor');
-  const [newCanSchedule, setNewCanSchedule] = useState(true);
-  const [isAdding, setIsAdding] = useState(false);
-  const [error, setError] = useState('');
-  const [searchTerm, setSearchTerm] = useState('');
+  const [cerca, setCerca] = useState('');
+  const [filtro, setFiltro] = useState<'tutti' | Ruolo | 'senza2fa' | 'senzaemail'>('tutti');
+  const [modulo, setModulo] = useState<Modulo | null>(null);
+  const [salvando, setSalvando] = useState(false);
+  const [errore, setErrore] = useState('');
+  const [creato, setCreato] = useState<{ username: string; password: string } | null>(null);
+  const [copiato, setCopiato] = useState(false);
+  const [msg, setMsg] = useState('');
+  const [daEliminare, setDaEliminare] = useState<Utente | null>(null);
 
-  const [editingUser, setEditingUser] = useState<EditingState | null>(null);
-  const [confirmDeleteUser, setConfirmDeleteUser] = useState<string | null>(null);
-
-  const fetchUsers = async () => {
+  const carica = async () => {
+    setLoading(true);
     try {
-      setLoading(true);
       const res = await authFetch('/api/users');
-      if (res.ok) {
-        const data = await res.json();
-        setUsers(data);
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
+      if (res.ok) setUtenti(await res.json());
+    } catch { /* niente */ }
+    setLoading(false);
   };
+  useEffect(() => { if (user?.isAdmin) carica(); }, [user]);
 
+  const conta = useMemo(() => ({
+    Admin: utenti.filter(u => u.role === 'Admin').length,
+    Editor: utenti.filter(u => u.role === 'Editor').length,
+    Viewer: utenti.filter(u => u.role === 'Viewer').length,
+    senza2fa: utenti.filter(u => !u.twoFactorRequired || !u.twoFactorEnabled).length,
+    senzaemail: utenti.filter(u => !u.email).length,
+  }), [utenti]);
+
+  const q = cerca.trim().toLowerCase();
+  const visibili = utenti
+    .filter(u => filtro === 'tutti' ? true : filtro === 'senza2fa' ? (!u.twoFactorRequired || !u.twoFactorEnabled) : filtro === 'senzaemail' ? !u.email : u.role === filtro)
+    .filter(u => !q || [u.nome, u.username, u.email, u.telefono].some(v => (v || '').toLowerCase().includes(q)))
+    .sort((a, b) => a.nome.localeCompare(b.nome, 'it'));
+
+  const apriNuovo = () => {
+    setErrore(''); setCreato(null); setCopiato(false);
+    setModulo({ nuovo: true, username: '', nome: '', email: '', telefono: '', role: 'Editor', canSchedule: true, password: generaPassword() });
+  };
+  const apriModifica = (u: Utente) => {
+    setErrore(''); setCreato(null); setCopiato(false);
+    setModulo({ nuovo: false, username: u.username, nome: u.nome, email: u.email, telefono: u.telefono, role: u.role, canSchedule: u.canSchedule, password: '' });
+  };
+  const chiudi = () => { setModulo(null); setCreato(null); };
+
+  // Esc chiude il pannello
   useEffect(() => {
-    if (user?.isAdmin) {
-      fetchUsers();
-    }
-  }, [user]);
+    if (!modulo) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') chiudi(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [modulo]);
 
-  const handleDelete = async (username: string) => {
-    setConfirmDeleteUser(null);
-    try {
-      const res = await authFetch(`/api/users/${username}`, { method: 'DELETE' });
-      if (res.ok) {
-        fetchUsers();
-      } else {
-        const data = await res.json();
-        alert(data.error || 'Errore durante l\'eliminazione');
-      }
-    } catch (err) {
-      console.error(err);
-      alert('Errore di rete');
-    }
+  // Suggerisce lo username dal nome ("Mario Rossi" → "mario.rossi") finché non lo si tocca.
+  const [usernameToccato, setUsernameToccato] = useState(false);
+  const cambiaNome = (nome: string) => {
+    if (!modulo) return;
+    const sugg = nome.trim().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '.').replace(/^\.|\.$/g, '');
+    setModulo({ ...modulo, nome, ...(modulo.nuovo && !usernameToccato ? { username: sugg } : {}) });
   };
 
-  const handleToggle2FA = async (username: string, currentlyRequired: boolean) => {
-    const nextEnabled = !currentlyRequired;
-    // Aggiornamento ottimistico
-    setUsers(prev => prev.map(u => u.username === username ? { ...u, twoFactorRequired: nextEnabled, twoFactorEnabled: nextEnabled ? false : u.twoFactorEnabled } : u));
-    try {
-      const res = await authFetch(`/api/users/${username}/2fa`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled: nextEnabled })
-      });
-      if (!res.ok) {
-        const data = await res.json();
-        alert(data.error || 'Errore durante la modifica del 2FA');
-        fetchUsers(); // rollback
-      }
-    } catch (err) {
-      console.error(err);
-      alert('Errore di rete');
-      fetchUsers(); // rollback
-    }
-  };
-
-  const handleEditStart = (u: any) => {
-    setEditingUser({
-      username: u.username,
-      nome: u.nome,
-      password: '', // vuoto = mantieni la password esistente
-      role: u.role || (u.isAdmin ? 'Admin' : 'Editor'),
-      canSchedule: u.canSchedule === true
-    });
-  };
-
-  const handleEditCancel = () => {
-    setEditingUser(null);
-  };
-
-  const handleEditSave = async (e: React.FormEvent) => {
+  const salva = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!editingUser) return;
-    if (!editingUser.nome || !editingUser.role) {
-       alert("Compila tutti i campi");
-       return;
-    }
-
+    if (!modulo) return;
+    setErrore('');
+    if (!modulo.nome.trim() || (modulo.nuovo && (!modulo.username.trim() || !modulo.password))) { setErrore('Compila nome, username e password.'); return; }
+    setSalvando(true);
     try {
-      const res = await authFetch(`/api/users/${editingUser.username}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          nome: editingUser.nome,
-          password: editingUser.password || undefined, // vuoto = non cambiare
-          role: editingUser.role,
-          canSchedule: editingUser.canSchedule
-        })
+      const body = {
+        nome: modulo.nome.trim(), role: modulo.role, canSchedule: modulo.canSchedule,
+        email: modulo.email.trim(), telefono: modulo.telefono.trim(),
+        password: modulo.password || undefined,
+        ...(modulo.nuovo ? { username: modulo.username.trim() } : {}),
+      };
+      const res = await authFetch(modulo.nuovo ? '/api/users' : `/api/users/${encodeURIComponent(modulo.username)}`, {
+        method: modulo.nuovo ? 'POST' : 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       });
-
-      const data = await res.json();
-      if (res.ok && data.ok) {
-        setEditingUser(null);
-        fetchUsers();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Salvataggio non riuscito');
+      await carica();
+      if (modulo.nuovo || modulo.password) {
+        setCreato({ username: modulo.username.trim(), password: modulo.password });
       } else {
-        alert(data.error || 'Errore durante la modifica');
+        setMsg(`Modifiche a ${modulo.nome} salvate.`);
+        chiudi();
       }
-    } catch (err) {
-      console.error(err);
-      alert('Errore di rete');
+    } catch (err: any) {
+      setErrore(err?.message || 'Errore di rete');
+    }
+    setSalvando(false);
+  };
+
+  const cambia2FA = async (u: Utente) => {
+    const attiva = !u.twoFactorRequired;
+    try {
+      const res = await authFetch(`/api/users/${encodeURIComponent(u.username)}/2fa`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: attiva }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Non riuscito');
+      setMsg(attiva ? `${u.nome} dovrà configurare il 2FA al prossimo accesso.` : `2FA spento per ${u.nome}.`);
+      await carica();
+    } catch (err: any) {
+      alert(err?.message || 'Errore di rete');
     }
   };
 
-  const handleAdd = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newUsername || !newPassword || !newNome || !newRole) {
-      setError('Compila tutti i campi');
-      return;
-    }
-    
-    setError('');
-    setIsAdding(true);
-    
+  const elimina = async (u: Utente) => {
+    setDaEliminare(null);
     try {
-      const res = await authFetch('/api/users', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          username: newUsername, 
-          password: newPassword, 
-          nome: newNome, 
-          role: newRole,
-          canSchedule: newCanSchedule
-        })
-      });
-      
-      const data = await res.json();
-      if (res.ok && data.ok) {
-        setNewUsername('');
-        setNewPassword('');
-        setNewNome('');
-        setNewRole('Editor');
-        setNewCanSchedule(true);
-        fetchUsers();
-      } else {
-        setError(data.error || "Errore durante la creazione");
-      }
-    } catch (err) {
-      setError('Errore di rete');
-    } finally {
-      setIsAdding(false);
+      const res = await authFetch(`/api/users/${encodeURIComponent(u.username)}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Eliminazione non riuscita');
+      setMsg(`${u.nome} eliminato.`);
+      await carica();
+    } catch (err: any) {
+      setMsg('');
+      alert(err?.message || 'Errore di rete');
     }
+  };
+
+  const testoAccesso = creato
+    ? `Accesso a GEM Outbound\nSito: ${window.location.origin}\nUtente: ${creato.username}\nPassword: ${creato.password}`
+    : '';
+  const copia = async () => {
+    try { await navigator.clipboard.writeText(testoAccesso); setCopiato(true); setTimeout(() => setCopiato(false), 2500); } catch { /* niente */ }
   };
 
   if (!user?.isAdmin) return null;
 
+  const chip = (id: typeof filtro, label: string, n: number, warn = false) => (
+    <button key={id} onClick={() => setFiltro(filtro === id ? 'tutti' : id)} aria-pressed={filtro === id}
+      className={cn('inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1.5 rounded-lg border transition-colors',
+        filtro === id ? 'bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-slate-900 dark:border-white'
+          : warn && n > 0 ? 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/10 dark:text-amber-300'
+          : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800')}>
+      {label} <span className="tabular-nums opacity-70">{n}</span>
+    </button>
+  );
+
   return (
     <>
-    <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-soft overflow-hidden mb-8 animate-in fade-in slide-in-from-bottom-4 duration-300">
-      <div className="p-5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-800/30">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-full bg-brand-100 dark:bg-brand-700/50 text-brand-700 dark:text-brand-300 flex items-center justify-center">
-            <Users className="w-4 h-4" />
-          </div>
-          <h2 className="text-lg font-bold text-slate-900 dark:text-white font-display">Gestione Utenti</h2>
-        </div>
-        <div className="relative">
-          <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-            <Users className="h-4 w-4 text-slate-400" />
-          </div>
-          <input
-            type="text"
-            placeholder="Cerca utente..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="pl-9 pr-4 py-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-sm focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500 text-slate-900 dark:text-slate-100"
-          />
-        </div>
-      </div>
-
-      <div className="p-4 lg:p-6 grid grid-cols-1 lg:grid-cols-3 gap-8">
-        <div className="lg:col-span-2">
-          {loading ? (
-            <div className="divide-y divide-slate-100 dark:divide-slate-800">
-              {[...Array(4)].map((_, i) => <SkeletonUserRow key={i} />)}
+      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-soft overflow-hidden animate-in fade-in slide-in-from-bottom-4 duration-300">
+        <div className="p-5 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/30 space-y-3">
+          <div className="flex flex-wrap items-center gap-3 justify-between">
+            <div className="flex items-center gap-2">
+              <Users className="w-4 h-4 text-brand-600" />
+              <h2 className="text-base font-bold text-slate-900 dark:text-white font-display">
+                Utenti {!loading && <span className="ml-1 text-sm font-semibold text-slate-400">{utenti.length}</span>}
+              </h2>
             </div>
-          ) : (
-            <div className="border border-slate-200 dark:border-slate-700 rounded-xl overflow-hidden">
-              <div className="grid grid-cols-[2fr_2fr_1.4fr_2fr_1fr_auto] bg-slate-50 dark:bg-slate-800/80 p-3 border-b border-slate-200 dark:border-slate-700 gap-3 text-xs font-bold text-slate-500 uppercase tracking-wider">
-                <span>Nome</span>
-                <span>Username</span>
-                <span>2FA</span>
-                <span>Ruolo</span>
-                <span className="text-center" title="Schedulazione Campagna">Sched.</span>
-                <span></span>
+            <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+              <div className="relative flex-1 sm:w-64 sm:flex-none">
+                <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input value={cerca} onChange={e => setCerca(e.target.value)} placeholder="Cerca nome, username, email..." aria-label="Cerca utente"
+                  className="w-full pl-8 pr-3 py-1.5 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-brand-500" />
               </div>
-              <div className="max-h-[300px] overflow-y-auto">
-                {users
-                  .filter(u => 
-                    u.nome.toLowerCase().includes(searchTerm.toLowerCase()) || 
-                    u.username.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                    (u.role || '').toLowerCase().includes(searchTerm.toLowerCase())
-                  )
-                  .map((u) => {
-                  const isEditing = editingUser?.username === u.username;
-                  
-                  if (isEditing) {
-                    return (
-                      <div key={u.username} className="bg-brand-50 dark:bg-brand-900/10 border-b border-brand-100 dark:border-brand-800 p-4 last:border-0">
-                        <form onSubmit={handleEditSave} className="space-y-3">
-                          {/* Nome + Username */}
-                          <div className="grid grid-cols-2 gap-3">
-                            <div>
-                              <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Nome</label>
-                              <input 
-                                type="text" 
-                                required
-                                value={editingUser.nome}
-                                onChange={e => setEditingUser({...editingUser, nome: e.target.value})}
-                                className="w-full px-2.5 py-1.5 text-sm bg-white dark:bg-slate-900 border border-brand-300 dark:border-brand-700 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:border-brand-500"
-                              />
-                            </div>
-                            <div>
-                              <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Username</label>
-                              <div className="px-2.5 py-1.5 text-sm text-slate-500 truncate">{u.username}</div>
-                            </div>
-                          </div>
+              <button onClick={apriNuovo}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-bold bg-brand-600 hover:bg-brand-700 text-white shrink-0">
+                <Plus className="w-4 h-4" /> Nuovo utente
+              </button>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Filtra utenti">
+            {chip('tutti', 'Tutti', utenti.length)}
+            {chip('Admin', 'Admin', conta.Admin)}
+            {chip('Editor', 'Editor', conta.Editor)}
+            {chip('Viewer', 'Viewer', conta.Viewer)}
+            {chip('senza2fa', 'Senza 2FA attivo', conta.senza2fa, true)}
+            {chip('senzaemail', 'Senza email', conta.senzaemail, true)}
+          </div>
+        </div>
 
-                          {/* Ruolo + Nuova password */}
-                          <div className="grid grid-cols-2 gap-3">
-                            <div>
-                              <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Ruolo</label>
-                              <select 
-                                value={editingUser.role}
-                                onChange={e => setEditingUser({...editingUser, role: e.target.value})}
-                                className="w-full px-2.5 py-1.5 text-sm bg-white dark:bg-slate-900 border border-brand-300 dark:border-brand-700 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:border-brand-500"
-                              >
-                                <option value="Admin">Admin</option>
-                                <option value="Editor">Editor</option>
-                                <option value="Viewer">Viewer</option>
-                              </select>
-                            </div>
-                            <div>
-                              <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Nuova password</label>
-                              <input 
-                                type="text" 
-                                placeholder="lascia vuoto per non cambiare"
-                                title="Lascia vuoto per non cambiare la password"
-                                value={editingUser.password}
-                                onChange={e => setEditingUser({...editingUser, password: e.target.value})}
-                                className="w-full px-2.5 py-1.5 text-sm bg-white dark:bg-slate-900 border border-brand-300 dark:border-brand-700 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:border-brand-500 placeholder:text-slate-400 placeholder:italic placeholder:text-xs"
-                              />
-                            </div>
-                          </div>
+        {msg && (
+          <p className="mx-5 mt-4 px-3 py-2 rounded-lg text-sm bg-green-50 text-green-800 dark:bg-green-900/20 dark:text-green-300 flex items-center gap-2">
+            <Check className="w-4 h-4 shrink-0" /><span className="flex-1">{msg}</span>
+            <button onClick={() => setMsg('')} aria-label="Chiudi" className="text-green-700/60 hover:text-green-800"><X className="w-4 h-4" /></button>
+          </p>
+        )}
 
-                          {/* 2FA (sola lettura qui: si gestisce dalla riga normale) + Sched + azioni */}
-                          <div className="flex items-center justify-between gap-3 pt-1">
-                            <div className="flex items-center gap-4">
-                              <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500">
-                                {u.twoFactorRequired === false ? (
-                                  <ShieldOff className="w-4 h-4 text-slate-300 dark:text-slate-600" />
-                                ) : u.twoFactorEnabled ? (
-                                  <ShieldCheck className="w-4 h-4 text-emerald-500" />
-                                ) : (
-                                  <ShieldCheck className="w-4 h-4 text-amber-500" />
-                                )}
-                                2FA: {u.twoFactorRequired === false ? 'disattivato' : u.twoFactorEnabled ? 'attivo' : 'da configurare'}
-                              </span>
-                              <label className="flex items-center gap-2 text-xs font-semibold text-slate-600 dark:text-slate-300 cursor-pointer">
-                                <input 
-                                  type="checkbox" 
-                                  checked={editingUser.canSchedule}
-                                  onChange={e => setEditingUser({...editingUser, canSchedule: e.target.checked})}
-                                  className="w-4 h-4 text-brand-600 rounded focus:ring-brand-500"
-                                />
-                                Schedulazione
-                              </label>
-                            </div>
-                            <div className="flex items-center gap-1">
-                              <button type="submit" className="w-8 h-8 flex items-center justify-center text-green-600 bg-green-50 dark:bg-green-900/30 hover:bg-green-100 dark:hover:bg-green-900/50 rounded-lg transition-colors">
-                                <Save className="w-4 h-4" />
-                              </button>
-                              <button type="button" onClick={handleEditCancel} className="w-8 h-8 flex items-center justify-center text-slate-500 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg transition-colors">
-                                <X className="w-4 h-4" />
-                              </button>
-                            </div>
-                          </div>
-                        </form>
-                      </div>
-                    );
-                  }
-
-                  const hasSchedule = u.canSchedule === true;
-
-                  return (
-                    <div key={u.username} className="grid grid-cols-[2fr_2fr_1.4fr_2fr_1fr_auto] gap-3 p-3 items-center border-b border-slate-100 dark:border-slate-800/50 last:border-0 hover:bg-slate-50 dark:hover:bg-slate-800/30 text-sm">
-                      <span className="font-medium text-slate-900 dark:text-slate-200 truncate" title={u.nome}>{u.nome}</span>
-                      <span className="text-slate-500 truncate" title={u.username}>{u.username}</span>
-                      <button
-                        onClick={() => handleToggle2FA(u.username, u.twoFactorRequired !== false)}
-                        title={
-                          u.twoFactorRequired === false
-                            ? 'Clicca per RICHIEDERE il 2FA a questo utente (dovrà rifare il setup)'
-                            : u.twoFactorEnabled
-                              ? 'Clicca per DISATTIVARE il 2FA (l\'utente accederà con solo utente/password)'
-                              : '2FA richiesto ma non ancora configurato dall\'utente — clicca per disattivarlo'
-                        }
-                        className={cn(
-                          "inline-flex items-center gap-1.5 w-fit px-2 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border transition-colors cursor-pointer",
-                          u.twoFactorRequired === false
-                            ? "bg-slate-100 text-slate-500 border-slate-200 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700"
-                            : u.twoFactorEnabled
-                              ? "bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100 dark:bg-emerald-900/20 dark:text-emerald-400 dark:border-emerald-800"
-                              : "bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100 dark:bg-amber-900/20 dark:text-amber-400 dark:border-amber-800"
-                        )}
-                      >
-                        {u.twoFactorRequired === false ? (
-                          <ShieldOff className="w-3.5 h-3.5" />
-                        ) : (
-                          <ShieldCheck className="w-3.5 h-3.5" />
-                        )}
-                        {u.twoFactorRequired === false ? 'Off' : u.twoFactorEnabled ? 'On' : 'Da fare'}
-                      </button>
-                      <span className={cn(
-                        "text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full w-fit",
-                        u.role === 'Admin' || u.isAdmin ? "bg-red-50 text-red-600 dark:bg-red-900/20 dark:text-red-400" :
-                        u.role === 'Viewer' ? "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400" :
-                        "bg-brand-50 text-brand-600 dark:bg-brand-900/20 dark:text-brand-400"
-                      )}>
-                        {u.role || (u.isAdmin ? 'Admin' : 'Editor')}
-                      </span>
-                      <div className="flex justify-center">
-                        <div className={cn(
-                          "w-2 h-2 rounded-full",
-                          hasSchedule ? "bg-green-500" : "bg-slate-300 dark:bg-slate-600"
-                        )} title={hasSchedule ? 'Abilitato' : 'Disabilitato'} />
-                      </div>
-                      <div className="flex justify-end gap-1">
-                        <button 
-                          onClick={() => handleEditStart(u)}
-                          className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-brand-500 hover:bg-brand-50 dark:hover:bg-brand-900/30 rounded-lg transition-colors"
-                        >
-                          <Edit2 className="w-4 h-4" />
-                        </button>
-                        {u.username.toLowerCase() !== 'admin' && (
-                          <button 
-                            onClick={() => setConfirmDeleteUser(u.username)}
-                            className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-colors"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        )}
-                      </div>
+        {loading ? (
+          <div className="p-10 flex justify-center text-slate-400"><Loader2 className="w-5 h-5 animate-spin" /></div>
+        ) : visibili.length === 0 ? (
+          <div className="p-10 text-center text-sm text-slate-500">Nessun utente con questi filtri.</div>
+        ) : (
+          <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+            {visibili.map(u => {
+              const tu = u.username.toLowerCase() === io;
+              return (
+                <li key={u.username} className="px-5 py-4 flex flex-wrap sm:flex-nowrap items-center gap-4 hover:bg-slate-50/60 dark:hover:bg-slate-800/30">
+                  <div className="w-10 h-10 rounded-xl bg-brand-100 dark:bg-brand-500/25 flex items-center justify-center text-base font-extrabold text-brand-600 dark:text-brand-200 shrink-0">
+                    {u.nome.charAt(0).toUpperCase()}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-semibold text-slate-900 dark:text-white">{u.nome}</span>
+                      {tu && <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">tu</span>}
+                      <span className={cn('text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full', ruoloCls(u.role))}>{u.role}</span>
                     </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="lg:col-span-1">
-          <form onSubmit={handleAdd} className="bg-slate-50 dark:bg-slate-800/50 p-4 border border-slate-200 dark:border-slate-700 rounded-xl space-y-4">
-            <h3 className="font-bold text-slate-900 dark:text-white text-sm">Nuovo Utente</h3>
-            
-            <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-500 uppercase">Nome</label>
-              <input 
-                type="text" 
-                value={newNome}
-                onChange={e => setNewNome(e.target.value)}
-                className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg text-sm focus:border-brand-500 dark:focus:border-brand-400 focus:ring-2 focus:ring-brand-500/20 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none transition-all"
-                placeholder="Mario Rossi"
-              />
-            </div>
-
-            <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-500 uppercase">Username</label>
-              <input 
-                type="text" 
-                value={newUsername}
-                onChange={e => setNewUsername(e.target.value)}
-                className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg text-sm focus:border-brand-500 dark:focus:border-brand-400 focus:ring-2 focus:ring-brand-500/20 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none transition-all"
-                placeholder="mario.rossi"
-              />
-            </div>
-
-            <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-500 uppercase">Password</label>
-              <input 
-                type="text" 
-                value={newPassword}
-                onChange={e => setNewPassword(e.target.value)}
-                className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg text-sm focus:border-brand-500 dark:focus:border-brand-400 focus:ring-2 focus:ring-brand-500/20 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none transition-all"
-                placeholder="Password"
-              />
-            </div>
-
-            <div className="space-y-3">
-              <div className="space-y-1">
-                <label className="text-xs font-semibold text-slate-500 uppercase">Ruolo</label>
-                <select 
-                  value={newRole}
-                  onChange={e => setNewRole(e.target.value)}
-                  className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg text-sm focus:border-brand-500 dark:focus:border-brand-400 focus:ring-2 focus:ring-brand-500/20 text-slate-900 dark:text-slate-100 focus:outline-none transition-all"
-                >
-                  <option value="Admin">Admin</option>
-                  <option value="Editor">Editor</option>
-                  <option value="Viewer">Viewer</option>
-                </select>
-              </div>
-
-              {/* Role Descriptions */}
-              <div className="text-xs text-slate-500 dark:text-slate-400 bg-white dark:bg-slate-900/50 p-3 rounded-lg border border-slate-200 dark:border-slate-700">
-                {newRole === 'Admin' && <p><strong>Admin:</strong> Gestione utenti completa e controllo su tutte le campagne.</p>}
-                {newRole === 'Editor' && <p><strong>Editor:</strong> Può caricare contatti e lanciare campagne.</p>}
-                {newRole === 'Viewer' && <p><strong>Viewer:</strong> Sola lettura per lo storico delle campagne.</p>}
-              </div>
-
-              <div className="flex items-center gap-2 pt-2">
-                <input 
-                  type="checkbox" 
-                  id="canSchedule"
-                  checked={newCanSchedule}
-                  onChange={e => setNewCanSchedule(e.target.checked)}
-                  className="w-4 h-4 text-brand-600 rounded focus:ring-brand-500 border-slate-300"
-                />
-                <label htmlFor="canSchedule" className="text-sm font-medium text-slate-700 dark:text-slate-300">
-                  Abilita Schedulazione Campagne
-                </label>
-              </div>
-            </div>
-
-            {error && <div className="text-red-500 text-xs font-medium">{error}</div>}
-
-            <button 
-              type="submit"
-              disabled={isAdding}
-              className="w-full py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg font-semibold text-sm flex items-center justify-center gap-2 transition-colors disabled:opacity-70 mt-2"
-            >
-              {isAdding ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-              {isAdding ? 'Aggiunta in corso...' : 'Aggiungi'}
-            </button>
-          </form>
-        </div>
+                    <div className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                      <span>@{u.username}</span>
+                      {u.email
+                        ? <a href={`mailto:${u.email}`} className="inline-flex items-center gap-1 hover:text-brand-600"><Mail className="w-3 h-3" />{u.email}</a>
+                        : <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400"><AlertTriangle className="w-3 h-3" />manca l'email</span>}
+                      {u.telefono && <a href={`tel:${u.telefono}`} className="inline-flex items-center gap-1 hover:text-brand-600"><Phone className="w-3 h-3" />{u.telefono}</a>}
+                    </div>
+                    <div className="text-xs mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-slate-500">
+                      <Stato2FA u={u} />
+                      <span className={cn('inline-flex items-center gap-1', u.canSchedule ? 'text-slate-600 dark:text-slate-300' : 'text-slate-400')}>
+                        <CalendarClock className="w-3.5 h-3.5" />{u.canSchedule ? 'Può pianificare' : 'Non pianifica'}
+                      </span>
+                      <span>Ultimo accesso: <strong className="font-semibold text-slate-600 dark:text-slate-300">{quandoFa(u.ultimoAccesso)}</strong></span>
+                      {u.followupAperti > 0 && <span className="inline-flex items-center gap-1"><BellRing className="w-3.5 h-3.5" />{u.followupAperti} follow-up aperti</span>}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0 ml-auto">
+                    <button onClick={() => cambia2FA(u)}
+                      title={u.twoFactorRequired ? 'Spegni il 2FA (accederà con solo utente e password)' : 'Richiedi il 2FA (al prossimo accesso dovrà configurarlo)'}
+                      className="px-2.5 py-1.5 rounded-lg text-xs font-semibold text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800">
+                      {u.twoFactorRequired ? 'Spegni 2FA' : 'Richiedi 2FA'}
+                    </button>
+                    <button onClick={() => apriModifica(u)} aria-label={`Modifica ${u.nome}`} title="Modifica"
+                      className="p-2 rounded-lg text-slate-400 hover:text-brand-600 hover:bg-brand-50 dark:hover:bg-brand-900/30">
+                      <Pencil className="w-4 h-4" />
+                    </button>
+                    {!tu && (
+                      <button onClick={() => setDaEliminare(u)} aria-label={`Elimina ${u.nome}`} title="Elimina"
+                        className="p-2 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30">
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
       </div>
-    </div>
-    <ConfirmModal
-      open={!!confirmDeleteUser}
-      title="Elimina utente"
-      message={`Vuoi eliminare l'utente "${confirmDeleteUser}"? Questa azione non può essere annullata.`}
-      confirmLabel="Elimina"
-      onConfirm={() => confirmDeleteUser && handleDelete(confirmDeleteUser)}
-      onCancel={() => setConfirmDeleteUser(null)}
-    />
+
+      {modulo && createPortal(
+        <div className="fixed inset-0 z-50 flex justify-end">
+          <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-[1px]" onClick={chiudi} />
+          <aside role="dialog" aria-modal="true" aria-label={modulo.nuovo ? 'Nuovo utente' : `Modifica ${modulo.nome}`}
+            className="relative w-full max-w-md h-full bg-white dark:bg-slate-900 shadow-2xl flex flex-col animate-in slide-in-from-right duration-200">
+            <div className="px-5 py-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+              <h3 className="text-base font-bold text-slate-900 dark:text-white">{modulo.nuovo ? 'Nuovo utente' : `Modifica ${modulo.nome}`}</h3>
+              <button onClick={chiudi} aria-label="Chiudi" className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"><X className="w-5 h-5" /></button>
+            </div>
+
+            {creato ? (
+              <div className="p-5 space-y-4 overflow-y-auto">
+                <div className="flex items-start gap-2 p-3 rounded-xl bg-green-50 text-green-800 dark:bg-green-900/20 dark:text-green-300 text-sm">
+                  <Check className="w-4 h-4 mt-0.5 shrink-0" />
+                  <span>{modulo.nuovo ? `${modulo.nome} può entrare con questi dati.` : `Nuova password salvata per ${modulo.nome}.`} Copiali e mandali tu: la password non sarà più visibile.</span>
+                </div>
+                <pre className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-sm text-slate-800 dark:text-slate-100 whitespace-pre-wrap font-mono">{testoAccesso}</pre>
+                <div className="flex gap-2">
+                  <button onClick={copia} className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-bold bg-brand-600 hover:bg-brand-700 text-white">
+                    {copiato ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}{copiato ? 'Copiato' : 'Copia dati di accesso'}
+                  </button>
+                  <button onClick={chiudi} className="px-4 py-2 rounded-lg text-sm font-semibold border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">Chiudi</button>
+                </div>
+              </div>
+            ) : (
+              <form onSubmit={salva} className="flex-1 flex flex-col min-h-0">
+                <div className="p-5 space-y-4 overflow-y-auto flex-1">
+                  <div>
+                    <label className={etichetta} htmlFor="u-nome">Nome e cognome</label>
+                    <input id="u-nome" value={modulo.nome} onChange={e => cambiaNome(e.target.value)} className={campo} placeholder="Mario Rossi" autoFocus />
+                  </div>
+                  <div>
+                    <label className={etichetta} htmlFor="u-user">Username</label>
+                    {modulo.nuovo
+                      ? <input id="u-user" value={modulo.username} onChange={e => { setUsernameToccato(true); setModulo({ ...modulo, username: e.target.value.trim() }); }} className={campo} placeholder="mario.rossi" />
+                      : <div className="px-3 py-2 text-sm text-slate-500 bg-slate-50 dark:bg-slate-800/50 rounded-lg">@{modulo.username}</div>}
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className={etichetta} htmlFor="u-email">Email</label>
+                      <input id="u-email" type="email" value={modulo.email} onChange={e => setModulo({ ...modulo, email: e.target.value })} className={campo} placeholder="mario@azienda.it" />
+                    </div>
+                    <div>
+                      <label className={etichetta} htmlFor="u-tel">Telefono</label>
+                      <input id="u-tel" type="tel" value={modulo.telefono} onChange={e => setModulo({ ...modulo, telefono: e.target.value })} className={campo} placeholder="+39 ..." />
+                    </div>
+                  </div>
+                  <p className="text-[11px] text-slate-400 -mt-2">All'email arrivano riepiloghi delle campagne e avvisi dei follow-up.</p>
+
+                  <fieldset>
+                    <legend className={etichetta}>Ruolo</legend>
+                    <div className="space-y-2">
+                      {RUOLI.map(r => (
+                        <label key={r.id} className={cn('flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors',
+                          modulo.role === r.id ? 'border-brand-500 bg-brand-50/60 dark:bg-brand-500/10' : 'border-slate-200 dark:border-slate-700 hover:border-slate-300')}>
+                          <input type="radio" name="ruolo" checked={modulo.role === r.id} onChange={() => setModulo({ ...modulo, role: r.id })} className="mt-0.5 text-brand-600 focus:ring-brand-500" />
+                          <span>
+                            <span className="block text-sm font-semibold text-slate-900 dark:text-white">{r.id}</span>
+                            <span className="block text-xs text-slate-500">{r.descr}</span>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
+
+                  <label className="flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-200 dark:border-slate-700 cursor-pointer">
+                    <span>
+                      <span className="block text-sm font-semibold text-slate-900 dark:text-white">Può pianificare campagne</span>
+                      <span className="block text-xs text-slate-500">Lanciarle a una data e ora future.</span>
+                    </span>
+                    <input type="checkbox" checked={modulo.canSchedule} onChange={e => setModulo({ ...modulo, canSchedule: e.target.checked })} className="w-4 h-4 text-brand-600 rounded focus:ring-brand-500" />
+                  </label>
+
+                  <div>
+                    <label className={etichetta} htmlFor="u-pw">{modulo.nuovo ? 'Password' : 'Nuova password'}</label>
+                    <div className="flex gap-2">
+                      <input id="u-pw" value={modulo.password} onChange={e => setModulo({ ...modulo, password: e.target.value })} className={cn(campo, 'font-mono')}
+                        placeholder={modulo.nuovo ? 'almeno 8 caratteri' : 'lascia vuoto per non cambiarla'} autoComplete="new-password" />
+                      <button type="button" onClick={() => setModulo({ ...modulo, password: generaPassword() })} title="Genera una password"
+                        className="shrink-0 inline-flex items-center gap-1.5 px-3 rounded-lg text-xs font-semibold border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">
+                        <KeyRound className="w-3.5 h-3.5" /> Genera
+                      </button>
+                    </div>
+                  </div>
+
+                  {errore && <div className="flex items-start gap-2 p-3 rounded-xl bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-300 text-sm"><AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />{errore}</div>}
+                </div>
+                <div className="p-4 border-t border-slate-200 dark:border-slate-800 flex gap-2">
+                  <button type="submit" disabled={salvando}
+                    className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-bold bg-brand-600 hover:bg-brand-700 text-white disabled:opacity-60">
+                    {salvando && <Loader2 className="w-4 h-4 animate-spin" />}{modulo.nuovo ? 'Crea utente' : 'Salva modifiche'}
+                  </button>
+                  <button type="button" onClick={chiudi} className="px-4 py-2.5 rounded-lg text-sm font-semibold border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">Annulla</button>
+                </div>
+              </form>
+            )}
+          </aside>
+        </div>,
+        document.body,
+      )}
+
+      <ConfirmModal
+        open={!!daEliminare}
+        title="Elimina utente"
+        message={daEliminare ? `Vuoi eliminare ${daEliminare.nome} (@${daEliminare.username})? Non potrà più entrare.${daEliminare.followupAperti ? ` Ha ${daEliminare.followupAperti} follow-up aperti assegnati: riassegnali prima.` : ''}` : ''}
+        confirmLabel="Elimina"
+        onConfirm={() => daEliminare && elimina(daEliminare)}
+        onCancel={() => setDaEliminare(null)}
+      />
     </>
   );
 }

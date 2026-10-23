@@ -1715,24 +1715,50 @@ app.post("/api/verify-otp", async (req, res) => {
 
 app.get("/api/users", requireAuth, requireAdmin, async (req, res) => {
   const users = await readUsers();
+  // Ultimo accesso e follow-up aperti assegnati: aiutano l'Admin a capire chi usa il sito.
+  const accessi = new Map<string, string>();
+  const followup = new Map<string, number>();
+  if (sql) {
+    try {
+      for (const r of (await sql`SELECT lower(username) AS u, max(ts) AS ts FROM access_logs WHERE action = 'login' GROUP BY 1`) as any[]) accessi.set(r.u, r.ts);
+    } catch { /* registro non disponibile */ }
+    try {
+      await ensureFollowupsExtra();
+      for (const r of (await sql`SELECT lower(assegnato_a) AS u, count(*)::int AS n FROM followups WHERE stato = 'pending' AND assegnato_a IS NOT NULL GROUP BY 1`) as any[]) followup.set(r.u, r.n);
+    } catch { /* niente */ }
+  }
   // Password e segreto 2FA non vengono mai esposti al client.
-  const safeUsers = users.map((u: any) => ({ 
-    username: u.username, 
-    nome: u.nome, 
+  const safeUsers = users.map((u: any) => ({
+    username: u.username,
+    nome: u.nome,
     role: u.role || (u.isAdmin ? 'Admin' : 'Editor'),
     canSchedule: u.canSchedule === true,
     twoFactorEnabled: u.twoFactorEnabled === true,
     twoFactorRequired: isTwoFactorRequired(u),
+    email: u.email || "",
+    telefono: u.telefono || "",
+    ultimoAccesso: accessi.get(String(u.username).toLowerCase()) || null,
+    followupAperti: followup.get(String(u.username).toLowerCase()) || 0,
   }));
   res.json(safeUsers);
 });
 
+const EMAIL_VALIDA = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const RUOLI = ["Admin", "Editor", "Viewer"];
+const ruoloDi = (u: any) => u.role || (u.isAdmin ? "Admin" : "Editor");
+
 app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
   const { username, password, nome, role, canSchedule } = req.body;
-  
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const telefono = String(req.body.telefono || "").trim().slice(0, 40);
+
   if (!username || !password || !nome || !role) {
     return res.status(400).json({ error: "Dati mancanti" });
   }
+  if (!RUOLI.includes(role)) return res.status(400).json({ error: "Ruolo non valido" });
+  if (!/^[a-zA-Z0-9._-]{2,40}$/.test(String(username))) return res.status(400).json({ error: "Username: solo lettere, numeri, punto, trattino (2-40 caratteri)" });
+  if (String(password).length < 8) return res.status(400).json({ error: "La password deve avere almeno 8 caratteri" });
+  if (email && !EMAIL_VALIDA.test(email)) return res.status(400).json({ error: "Email non valida" });
 
   const users = await readUsers();
   if (users.find((u: any) => u.username.toLowerCase() === username.toLowerCase())) {
@@ -1740,7 +1766,7 @@ app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
   }
 
   const hashed = await bcrypt.hash(password, 12);
-  users.push({ username, password: hashed, nome, role, isAdmin: role === 'Admin', canSchedule: canSchedule === true, twoFactorRequired: false, twoFactorEnabled: false });
+  users.push({ username, password: hashed, nome, role, isAdmin: role === 'Admin', canSchedule: canSchedule === true, twoFactorRequired: false, twoFactorEnabled: false, ...(email ? { email } : {}), ...(telefono ? { telefono } : {}) });
   await writeUsers(users);
 
   res.json({ ok: true });
@@ -1753,12 +1779,21 @@ app.put("/api/users/:username", requireAuth, requireAdmin, async (req, res) => {
   if (!nome || !role) {
     return res.status(400).json({ error: "Dati mancanti" });
   }
+  if (!RUOLI.includes(role)) return res.status(400).json({ error: "Ruolo non valido" });
+  if (password && String(password).trim() && String(password).trim().length < 8) return res.status(400).json({ error: "La password deve avere almeno 8 caratteri" });
+  const email = req.body.email === undefined ? undefined : String(req.body.email || "").trim().toLowerCase();
+  const telefono = req.body.telefono === undefined ? undefined : String(req.body.telefono || "").trim().slice(0, 40);
+  if (email && !EMAIL_VALIDA.test(email)) return res.status(400).json({ error: "Email non valida" });
 
   let users = await readUsers();
   const index = users.findIndex((u: any) => u.username.toLowerCase() === username.toLowerCase());
 
   if (index === -1) {
     return res.status(404).json({ error: "Utente non trovato" });
+  }
+  // Deve restare almeno un Admin.
+  if (ruoloDi(users[index]) === "Admin" && role !== "Admin" && users.filter((u: any) => ruoloDi(u) === "Admin").length <= 1) {
+    return res.status(400).json({ error: "Deve restare almeno un Admin" });
   }
 
   // La password è opzionale in modifica: se lasciata vuota, manteniamo
@@ -1772,17 +1807,26 @@ app.put("/api/users/:username", requireAuth, requireAdmin, async (req, res) => {
     nome, 
     role, 
     isAdmin: role === 'Admin',
-    canSchedule: canSchedule === true
+    canSchedule: canSchedule === true,
+    ...(email !== undefined ? { email } : {}),
+    ...(telefono !== undefined ? { telefono } : {}),
   };
   await writeUsers(users);
   
   res.json({ ok: true });
 });
 
-app.delete("/api/users/:username", requireAuth, requireAdmin, async (req, res) => {
+app.delete("/api/users/:username", requireAuth, requireAdmin, async (req: any, res) => {
   const { username } = req.params;
-  
+  if (String(username).toLowerCase() === String(req.session.username).toLowerCase()) {
+    return res.status(400).json({ error: "Non puoi eliminare il tuo account" });
+  }
+
   let users = await readUsers();
+  const target = users.find((u: any) => u.username.toLowerCase() === String(username).toLowerCase());
+  if (target && ruoloDi(target) === "Admin" && users.filter((u: any) => ruoloDi(u) === "Admin").length <= 1) {
+    return res.status(400).json({ error: "Deve restare almeno un Admin" });
+  }
   const initialLength = users.length;
   users = users.filter((u: any) => u.username.toLowerCase() !== username.toLowerCase());
 
