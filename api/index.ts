@@ -2312,6 +2312,7 @@ async function markLiveCallCompleted(numero: string | null, risposto: boolean, d
     // Chiamata finita: invia l'esito allo Sheets se serve e libera il posto in coda.
     await pumpCampaign(target.campaign_id);
     await controllaFineCampagne(target.campaign_id);
+    await aggiornaSveglia();
   } catch (err) {
     console.error("Errore aggiornamento chiamata in diretta (non bloccante):", err);
   }
@@ -2375,6 +2376,7 @@ app.post("/api/live/make-event", express.json({ limit: "20kb" }), express.urlenc
     if (updated.length > 0 && stato !== "avviata") {
       await pumpCampaign(updated[0].campaign_id);
       await controllaFineCampagne(updated[0].campaign_id);
+      await aggiornaSveglia();
     }
     // Nessuna corrispondenza: chiamata non partita da una campagna del sito
     // (es. "Testa chiamata singola"). Non la registriamo.
@@ -2412,12 +2414,119 @@ async function timerAttivo(): Promise<boolean> {
   if (!sql) return false;
   try {
     await ensureAppState();
+    // Sveglia Make configurata e ultima programmazione riuscita…
+    if (svegliaConfigurata()) {
+      const st = (await sql`SELECT value FROM app_state WHERE key = 'sveglia_stato'`) as any[];
+      if (st[0]?.value !== "errore") return true;
+    }
+    // …oppure un timer a intervalli che ha chiamato da poco.
     const rows = (await sql`
       SELECT 1 FROM app_state
       WHERE key = 'ultimo_tick' AND updated_at > now() - make_interval(mins => ${TIMER_ATTIVO_MIN}::int)
     `) as any[];
     return rows.length > 0;
   } catch { return false; }
+}
+
+// ── Sveglia Make ──
+// Invece di uno scenario che gira ogni 5 minuti (e consuma operazioni anche
+// quando non c'è niente da fare), il sito programma lo scenario "Timer
+// campagne" per UNA esecuzione all'orario che serve: la prossima campagna
+// pianificata, oppure il controllo di fine campagna. Quando suona, il tick fa
+// il lavoro e ricalcola la sveglia successiva. Le chiamate alle API di Make
+// non consumano operazioni. Serve MAKE_API_TOKEN (permesso scenarios:write).
+const MAKE_API_URL = (process.env.MAKE_API_URL || "https://eu1.make.com/api/v2").replace(/\/$/, "");
+const MAKE_TIMER_SCENARIO_ID = (process.env.MAKE_TIMER_SCENARIO_ID || "8130692").trim();
+function svegliaConfigurata(): boolean {
+  return !!process.env.MAKE_API_TOKEN && !!MAKE_TIMER_SCENARIO_ID;
+}
+
+async function makeApi(path: string, method: string, body?: unknown): Promise<{ ok: boolean; status: number; testo: string }> {
+  const r = await fetch(`${MAKE_API_URL}${path}`, {
+    method,
+    headers: { Authorization: `Token ${process.env.MAKE_API_TOKEN}`, "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(10000),
+  });
+  return { ok: r.ok, status: r.status, testo: (await r.text().catch(() => "")).slice(0, 300) };
+}
+
+// Il primo momento in cui serve il timer, o null se non serve.
+async function prossimaSveglia(): Promise<Date | null> {
+  const candidati: number[] = [];
+  await ensureScheduleSchema();
+  const pian = (await sql!`SELECT min(scheduled_at) AS t FROM scheduled_campaigns WHERE status = 'pending'`) as any[];
+  if (pian[0]?.t) candidati.push(new Date(pian[0].t).getTime());
+  await ensureLiveSchema();
+  // Campagne che aspettano l'email di fine: allo scadere dell'attesa dei
+  // riassunti (se le chiamate sono finite) o del limite di inattività.
+  const aperte = (await sql!`
+    SELECT max(l.updated_at) AS ultimo, count(*) FILTER (WHERE l.stato IN ('in_coda', 'avviata')) AS aperte
+    FROM live_campaigns c JOIN live_calls l ON l.campaign_id = c.id
+    WHERE c.riepilogo_inviato_at IS NULL AND c.created_at > now() - interval '24 hours'
+    GROUP BY c.id
+  `) as any[];
+  for (const a of aperte) {
+    const min = Number(a.aperte) === 0 ? FINE_ATTESA_RIASSUNTI_MIN : FINE_MAX_INATTIVITA_MIN;
+    candidati.push(new Date(a.ultimo).getTime() + (min + 1) * 60_000);
+  }
+  // Coda gestita dal sito: un controllo per le chiamate rimaste senza conferma.
+  if (isCodaSito()) {
+    const coda = (await sql!`
+      SELECT 1 FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
+      WHERE c.modalita_coda AND l.stato = 'in_coda' AND l.queued_at > now() - interval '24 hours' LIMIT 1
+    `) as any[];
+    if (coda.length) candidati.push(Date.now() + (CODA_ATTESA_MAKE_MIN + 1) * 60_000);
+  }
+  if (!candidati.length) return null;
+  // Make ha bisogno di un orario nel futuro.
+  return new Date(Math.max(Math.min(...candidati), Date.now() + 90_000));
+}
+
+// dopoTick: la sveglia è appena suonata, quindi va sempre riprogrammata (o
+// spenta). Negli altri casi si cambia solo se va anticipata: una sveglia in
+// anticipo costa al massimo un'esecuzione, poi il tick la sposta.
+async function aggiornaSveglia(opts: { dopoTick?: boolean } = {}): Promise<void> {
+  if (!sql || !svegliaConfigurata()) return;
+  try {
+    await ensureAppState();
+    const prossima = await prossimaSveglia();
+    const cur = ((await sql`SELECT value FROM app_state WHERE key = 'sveglia'`) as any[])[0]?.value || "spenta";
+    const curData = cur !== "spenta" ? new Date(cur) : null;
+    const curFutura = !!curData && curData.getTime() > Date.now();
+    const salva = (k: string, v: string) => sql!`
+      INSERT INTO app_state (key, value, updated_at) VALUES (${k}, ${v}, now())
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`;
+
+    if (!prossima) {
+      if (cur === "spenta" || (!opts.dopoTick && curFutura)) return;
+      const stop = await makeApi(`/scenarios/${MAKE_TIMER_SCENARIO_ID}/stop`, "POST");
+      if (!stop.ok && stop.status !== 400) console.error("Sveglia Make: stop non riuscito", stop.status, stop.testo);
+      await salva("sveglia", "spenta");
+      return;
+    }
+    const daCambiare = opts.dopoTick || !curFutura || prossima.getTime() < curData!.getTime() - 30_000;
+    if (!daCambiare) return;
+
+    const patch = await makeApi(`/scenarios/${MAKE_TIMER_SCENARIO_ID}`, "PATCH", {
+      scheduling: JSON.stringify({ type: "once", date: prossima.toISOString() }),
+    });
+    if (!patch.ok) {
+      console.error("Sveglia Make: programmazione non riuscita", patch.status, patch.testo);
+      await salva("sveglia_stato", "errore");
+      return;
+    }
+    // Avvia lo scenario (se è già attivo Make risponde con un errore innocuo).
+    const start = await makeApi(`/scenarios/${MAKE_TIMER_SCENARIO_ID}/start`, "POST");
+    if (!start.ok && !/already|attiv|active/i.test(start.testo)) {
+      console.error("Sveglia Make: avvio non riuscito", start.status, start.testo);
+    }
+    await salva("sveglia", prossima.toISOString());
+    await salva("sveglia_stato", "ok");
+  } catch (err) {
+    console.error("Errore sveglia Make (non bloccante):", err);
+    try { await sql`INSERT INTO app_state (key, value, updated_at) VALUES ('sveglia_stato', 'errore', now()) ON CONFLICT (key) DO UPDATE SET value = 'errore', updated_at = now()`; } catch { /* ignora */ }
+  }
 }
 
 function tickAutorizzato(req: any): boolean {
@@ -2441,6 +2550,7 @@ async function handleTick(req: any, res: any) {
     await dispatchDueCampaigns();
     const code = await pumpAllQueues();
     await controllaFineCampagne();
+    await aggiornaSveglia({ dopoTick: true });
     res.json({ ok: true, ...code });
   } catch (err) {
     console.error("Errore timer:", err);
@@ -2939,6 +3049,8 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
         scheduledAt: t.toISOString(), chunkSize, note: cleanNote, tipoCampagna: campaignType,
         voicebotNome: bot?.nome, contatti: contacts, test: isCallsDryRun(),
       });
+      // Programma la sveglia Make per l'orario della campagna (se è la prima).
+      await aggiornaSveglia();
       await sendCampaignEmail({
         operatore: user.nome,
         count: contacts.length,
@@ -2971,6 +3083,8 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
     contacts, campaignType, bot, chunkSize, note: cleanNote, operatore: user.nome, scheduledAt: null,
     username: user.username,
   });
+  // Sveglia per l'email di fine campagna, se nessuno avrà l'app aperta.
+  if (!result.dryRun) await aggiornaSveglia();
   await logCampaign({
     username: user.username,
     operatore: user.nome,

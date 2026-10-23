@@ -38,6 +38,7 @@ Copia `env.example` e configura i valori. Su Vercel vanno impostate nel pannello
 | `GITHUB_DATA_BRANCH` | ➖ | Branch per `users.json` / `voicebots.json`. Vuota = branch principale. Nelle anteprime Vercel, senza questa variabile, le scritture sono bloccate. |
 | `CAMPAIGN_QUEUE_MODE` | ➖ | `sito` = la coda delle chiamate la gestisce il sito: manda a Make un contatto per volta e al massimo N chiamate insieme per campagna (vedi sotto). Vuota = invio classico, tutta la lista a Make. |
 | `MAX_CHIAMATE_SIMULTANEE` | ➖ | Con `CAMPAIGN_QUEUE_MODE=sito`, quante chiamate al massimo per campagna (1–10, default 3). Va scelto in base ai canali del centralino e del voicebot. |
+| `MAKE_API_TOKEN` | ➖ | Token API di Make (permesso `scenarios:write`): il sito programma lo scenario "Timer campagne" solo quando serve (vedi "Timer del server"). |
 | `CRON_SECRET` | ➖ | Alternativa a `MAKE_WEBHOOK_SECRET` per il timer `/api/cron/tick` (header `Authorization: Bearer …`, formato di Vercel Cron). |
 
 `*` In produzione GitHub è di fatto necessario, perché su serverless il filesystem è effimero.
@@ -70,17 +71,25 @@ Per un test isolato dalla produzione, nelle variabili d'ambiente Vercel con targ
 2. `GITHUB_DATA_BRANCH` → un branch dedicato ai dati di test (es. `test-data`, creato da `main`). Senza, le modifiche a utenti e voicebot sono bloccate in anteprima.
 3. `CALLS_DRY_RUN` → lascia vuota (simulazione). Per provare una chiamata vera verso il tuo numero, impostala a `false` solo per il tempo del test.
 
-### Timer del server (campagne pianificate e code)
+### Timer del server: la "sveglia" Make
 
-Le campagne pianificate partono quando il server viene "svegliato". Senza timer lo fa l'app aperta su un dispositivo, ogni 30 secondi. Con il timer partono anche se nessuno ha l'app aperta.
+Le campagne pianificate partono quando il server viene "svegliato". Senza sveglia lo fa l'app aperta su un dispositivo, ogni 30 secondi.
 
-1. In Make crea uno scenario con un solo modulo **HTTP → Make a request**:
-   - URL `https://<dominio>/api/cron/tick`, metodo `POST`;
-   - header `x-gem-secret` = valore di `MAKE_WEBHOOK_SECRET`;
-   - programmazione **ogni 5 minuti**.
-2. Attivalo. Entro 15 minuti l'app smette di dire "parte solo se l'app è aperta".
+Con la sveglia il sito programma lo scenario Make **"GEM Outbound - Timer campagne (sveglia)"** (id 8130692) per **una sola esecuzione** all'orario che serve:
+- la prossima campagna pianificata;
+- oppure il controllo per l'email di fine campagna.
 
-Il timer fa anche ripartire le code ferme (vedi sotto). Lo stato si legge in `/api/config` (`timerAttivo`).
+Quando suona, lo scenario chiama `/api/cron/tick`. Il sito fa partire le campagne arrivate all'orario e programma la sveglia successiva. Se non c'è più niente in programma, la spegne.
+
+Con più campagne pianificate la sveglia è una sola, sulla prima. Una campagna pianificata prima di quella in programma la fa anticipare. Una campagna annullata può lasciare una sveglia "a vuoto", che costa una sola operazione.
+
+Le chiamate alle API di Make non consumano operazioni: si paga solo un'esecuzione quando c'è davvero qualcosa da fare.
+
+Per attivarla, su Vercel (Production):
+- `MAKE_API_TOKEN`: token API di Make (profilo → API → Add token) con permesso `scenarios:write`.
+- `MAKE_TIMER_SCENARIO_ID` (facoltativa, default `8130692`) e `MAKE_API_URL` (facoltativa, default `https://eu1.make.com/api/v2`).
+
+In alternativa, qualsiasi servizio può chiamare `/api/cron/tick` a intervalli fissi (header `x-gem-secret`), ma consuma un'esecuzione a ogni giro.
 
 ### Email di fine campagna
 
