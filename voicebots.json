@@ -37,7 +37,7 @@
     "exten": 9001,
     "context": "outbound-voicebot",
     "descrizione": "demo",
-    "attivo": true
+    "attivo": false
   },
   {
     "id": "vb1788874804666",
