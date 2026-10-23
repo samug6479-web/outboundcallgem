@@ -123,6 +123,17 @@ export function StatsDashboard() {
     try { localStorage.setItem('gem_stats_days', String(days)); } catch { /* storage non disponibile */ }
   }, [days]);
 
+  // Il periodo scelto è salvato anche sul server, così è uguale su ogni dispositivo.
+  useEffect(() => {
+    authFetch('/api/preferenze').then(r => r.ok ? r.json() : null)
+      .then(d => { const g = Number(d?.preferenze?.statsGiorni); if ([1, 7, 30, 90].includes(g)) setDays(g as Days); })
+      .catch(() => {});
+  }, []);
+  const scegliPeriodo = (d: Days) => {
+    setDays(d);
+    authFetch('/api/preferenze', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ statsGiorni: d }) }).catch(() => {});
+  };
+
   useEffect(() => {
     if (!isAdmin) return;
     authFetch('/api/access-logs').then(r => r.json()).then(d => setLogs(d.logs || [])).catch(() => setLogs([]));
@@ -199,7 +210,7 @@ export function StatsDashboard() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden text-sm font-semibold bg-white dark:bg-slate-900" role="tablist" aria-label="Periodo">
           {PERIODS.map(p => (
-            <button key={p.days} role="tab" aria-selected={days === p.days} onClick={() => setDays(p.days)}
+            <button key={p.days} role="tab" aria-selected={days === p.days} onClick={() => scegliPeriodo(p.days)}
               className={cn('px-4 py-2 transition-colors', days === p.days ? 'bg-brand-600 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800')}>
               {p.label}
             </button>

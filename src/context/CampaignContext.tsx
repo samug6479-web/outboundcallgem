@@ -415,11 +415,27 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const toggleTheme = () => {
-    const isDark = document.documentElement.classList.toggle('dark');
-    setDarkMode(isDark);
-    localStorage.setItem('gem_theme', isDark ? 'dark' : 'light');
+  const applicaTema = (dark: boolean) => {
+    document.documentElement.classList.toggle('dark', dark);
+    setDarkMode(dark);
+    try { localStorage.setItem('gem_theme', dark ? 'dark' : 'light'); } catch { /* storage non disponibile */ }
   };
+  // Il tema è salvato anche sul server, così è uguale su ogni dispositivo.
+  const toggleTheme = () => {
+    const isDark = !document.documentElement.classList.contains('dark');
+    applicaTema(isDark);
+    authFetch('/api/preferenze', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tema: isDark ? 'scuro' : 'chiaro' }),
+    }).catch(() => {});
+  };
+  useEffect(() => {
+    if (!user) return;
+    authFetch('/api/preferenze')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d?.preferenze?.tema) applicaTema(d.preferenze.tema === 'scuro'); })
+      .catch(() => {});
+  }, [user?.username]);
 
   // Contacts deduplication and validation logic
   const evaluateContacts = (raw: Contact[]) => {

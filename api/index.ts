@@ -663,10 +663,12 @@ app.get("/api/stats", requireAuth, async (req, res) => {
     // Confronto tra voicebot e tra fasce orarie, dalle chiamate delle campagne del sito.
     const confronto = await safe(async () => {
       await ensureLiveSchema();
+      await ensureEsitiVoicebot();
       const righe = (await sql`
         SELECT COALESCE(c.voicebot_nome, 'Voicebot predefinito') AS voicebot, l.stato, l.durata_ms,
                extract(hour FROM l.updated_at AT TIME ZONE 'Europe/Rome')::int AS ora,
-               r.riassunto
+               r.riassunto,
+               (SELECT e.esito FROM voicebot_esiti e WHERE e.live_call_id = l.id ORDER BY e.id LIMIT 1) AS lead_esito
         FROM live_calls l
         JOIN live_campaigns c ON c.id = l.campaign_id
         LEFT JOIN call_results r ON r.call_id = l.call_id
@@ -677,7 +679,7 @@ app.get("/api/stats", requireAuth, async (req, res) => {
       const perBot = new Map<string, ReturnType<typeof vuoto>>();
       const perOra = new Map<number, ReturnType<typeof vuoto>>();
       for (const r of righe) {
-        const ec = r.stato === "risposta" || r.stato === "interrotta" ? classificaEsitoCommerciale(r.riassunto) : null;
+        const ec = esitoCommercialeChiamata(r);
         for (const [m, k] of [[perBot, r.voicebot], [perOra, r.ora]] as [Map<any, ReturnType<typeof vuoto>>, any][]) {
           const a = m.get(k) || vuoto();
           a.chiamate++;
@@ -881,7 +883,15 @@ app.post(
           await aggiungiNonChiamare([{ numero, nome: nome || campagna?.nome }], "Chiesto durante la chiamata con il voicebot", "wilma", null)
             .catch(err => console.error("Errore aggiunta Non chiamare da Wilma:", err));
         }
-        if (campagna && campagna.tipo_campagna !== "appuntamenti" && !motivoFollowup) {
+        // Se Wilma ha già salvato l'esito con salva_lead, il follow-up è già stato creato da lì.
+        let haLead = false;
+        if (numero) {
+          try {
+            await ensureEsitiVoicebot();
+            haLead = ((await sql`SELECT 1 FROM voicebot_esiti WHERE numero = ${numero} AND ricevuto_at > now() - interval '2 hours' LIMIT 1`) as any[]).length > 0;
+          } catch { /* senza tabella si procede come prima */ }
+        }
+        if (campagna && campagna.tipo_campagna !== "appuntamenti" && !motivoFollowup && !haLead) {
           const nomeContatto = nome || campagna.nome || null;
           const motivoComm = esitoComm === "appuntamento" ? "Appuntamento fissato"
             : esitoComm === "interessato" ? "Cliente interessato"
@@ -2601,6 +2611,13 @@ function leggiRiassunto(v: any): any {
   try { return JSON.parse(v); } catch { return { testo: v }; }
 }
 
+// Esito commerciale di una chiamata: quello dichiarato da Wilma con salva_lead,
+// se c'è, altrimenti dalle regole sul riassunto.
+function esitoCommercialeChiamata(r: any): EsitoCommerciale | null {
+  if (r.stato !== "risposta" && r.stato !== "interrotta" && !r.lead_esito) return null;
+  return (r.lead_esito && ESITO_VOICEBOT_COMMERCIALE[r.lead_esito]) || classificaEsitoCommerciale(r.riassunto);
+}
+
 function classificaEsitoCommerciale(riassuntoRaw: any): EsitoCommerciale | null {
   const r = leggiRiassunto(riassuntoRaw);
   if (!r) return null;
@@ -2631,11 +2648,17 @@ const ESITO_LABEL: Record<string, { label: string; bg: string; fg: string }> = {
 // Wilma: prima per call_id, altrimenti (risposte e interrotte) il primo
 // risultato dello stesso numero arrivato dopo il lancio della campagna.
 async function chiamateCampagna(campaignId: number, createdAt: any): Promise<any[]> {
+  await ensureEsitiVoicebot();
   return (await sql!`
     SELECT l.id, l.nome, l.numero, l.stato, l.errore, l.durata_ms, l.queued_at, l.updated_at,
       l.tentativo, l.programmata_at, l.esito_precedente, l.inviata_at,
-      r.riassunto, r.trascrizione
+      r.riassunto, r.trascrizione,
+      v.esito AS lead_esito, v.nome AS lead_nome, v.azienda AS lead_azienda, v.ruolo AS lead_ruolo, v.fascia AS lead_fascia,
+      v.esigenza AS lead_esigenza, v.email AS lead_email, v.note AS lead_note, v.riepilogo AS lead_riepilogo
     FROM live_calls l
+    LEFT JOIN LATERAL (
+      SELECT * FROM voicebot_esiti e WHERE e.live_call_id = l.id ORDER BY e.id LIMIT 1
+    ) v ON true
     LEFT JOIN LATERAL (
       SELECT x.riassunto, x.trascrizione FROM (
         (SELECT r1.riassunto, r1.trascrizione, 0 AS prio, now() AS t FROM call_results r1
@@ -2663,7 +2686,7 @@ async function inviaRiepilogoCampagna(c: any): Promise<void> {
   const nonRisposte = conta(["non_risposta", "non_partita"]);
   const errori = conta(["errore"]);
   const senzaEsito = conta(["in_coda", "avviata"]);
-  const commerciale = (r: any) => (r.stato === "risposta" || r.stato === "interrotta") ? classificaEsitoCommerciale(r.riassunto) : null;
+  const commerciale = (r: any) => esitoCommercialeChiamata(r);
   const interessati = righe.filter(r => ["interessato", "appuntamento"].includes(commerciale(r) || "")).length;
   const durate = righe.filter(r => r.stato === "risposta" && r.durata_ms > 0).map(r => r.durata_ms / 1000);
   const durataMedia = durate.length ? Math.round(durate.reduce((a, b) => a + b, 0) / durate.length) : 0;
@@ -2762,11 +2785,12 @@ async function inviaRiepilogoCampagna(c: any): Promise<void> {
   // CSV per Excel in italiano: punto e virgola e BOM UTF-8.
   const cella = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""').replace(/\r?\n/g, " ")}"`;
   const csv = "﻿" + [
-    ["Nome", "Numero", "Esito", "Esito commerciale", "Tentativi", "Durata (secondi)", "Riassunto", "Dettaglio"].map(cella).join(";"),
+    ["Nome", "Numero", "Esito", "Esito commerciale", "Tentativi", "Durata (secondi)", "Riassunto", "Dettaglio", "Azienda", "Ruolo", "Quando richiamare", "Interesse", "Email"].map(cella).join(";"),
     ...ordinate.map(r => [
       r.nome || "", r.numero, (ESITO_LABEL[r.stato] || ESITO_LABEL.in_coda).label,
       commerciale(r) ? ESITO_COMMERCIALE_LABEL[commerciale(r)!].label : "", r.tentativo || 1,
-      r.durata_ms ? Math.round(r.durata_ms / 1000) : "", testoRiassunto(r), r.errore || "",
+      r.durata_ms ? Math.round(r.durata_ms / 1000) : "", testoRiassunto(r) || r.lead_riepilogo || "", r.errore || "",
+      r.lead_azienda || "", r.lead_ruolo || "", r.lead_fascia || "", r.lead_esigenza || "", r.lead_email || "",
     ].map(cella).join(";")),
   ].join("\r\n");
   const dataFile = new Date(c.created_at).toLocaleDateString("sv-SE", { timeZone: "Europe/Rome" });
@@ -3563,7 +3587,11 @@ app.get("/api/live/campaigns/:id", requireAuth, async (req: any, res) => {
         esito_precedente: r.esito_precedente,
         riassunto: leggi(r.riassunto),
         trascrizione: typeof r.trascrizione === "string" ? r.trascrizione : null,
-        esito_commerciale: r.stato === "risposta" || r.stato === "interrotta" ? classificaEsitoCommerciale(r.riassunto) : null,
+        esito_commerciale: esitoCommercialeChiamata(r),
+        lead: r.lead_esito ? {
+          esito: r.lead_esito, nome: r.lead_nome, azienda: r.lead_azienda, ruolo: r.lead_ruolo, fascia: r.lead_fascia,
+          esigenza: r.lead_esigenza, email: r.lead_email, note: r.lead_note, riepilogo: r.lead_riepilogo,
+        } : null,
       };
     });
     const dnc = await numeriNonChiamare(calls.map(x => x.numero));
@@ -3737,6 +3765,166 @@ app.put("/api/impostazioni/orari", requireAuth, requireAdmin, async (req: any, r
   } catch (err) {
     console.error("Errore salvataggio orari:", err);
     res.status(500).json({ ok: false, error: "Errore salvataggio" });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// DATI RACCOLTI DA WILMA (tool salva_lead)
+// Lo scenario Make che scrive il foglio esiti del voicebot li manda anche qui
+// (POST /api/voicebot/esito, header x-gem-secret): così nome, azienda, ruolo,
+// fascia, esigenza, email ed esito stanno nel database e si vedono nel
+// dettaglio campagna. Il foglio Google resta com'è.
+// ══════════════════════════════════════════════════════════════
+const ESITI_VOICEBOT = ["RICONTATTO", "EMAIL", "RICHIAMARE", "NON_INTERESSATO", "NON_CHIAMARE", "NESSUNA_RISPOSTA"];
+// Esito del voicebot → esito commerciale (più affidabile delle regole sul riassunto).
+const ESITO_VOICEBOT_COMMERCIALE: Record<string, EsitoCommerciale> = {
+  RICONTATTO: "interessato",
+  EMAIL: "interessato",
+  RICHIAMARE: "richiamare",
+  NON_INTERESSATO: "non_interessato",
+  NON_CHIAMARE: "non_chiamare",
+};
+
+let esitiVoicebotReady: Promise<void> | null = null;
+function ensureEsitiVoicebot(): Promise<void> {
+  if (!esitiVoicebotReady) {
+    esitiVoicebotReady = (async () => {
+      await sql!`
+        CREATE TABLE IF NOT EXISTS voicebot_esiti (
+          id             SERIAL PRIMARY KEY,
+          ricevuto_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+          esito          TEXT,
+          nome           TEXT,
+          azienda        TEXT,
+          ruolo          TEXT,
+          numero         TEXT,
+          fascia         TEXT,
+          esigenza       TEXT,
+          email          TEXT,
+          note           TEXT,
+          riepilogo      TEXT,
+          voicebot_exten TEXT,
+          campaign_id    INT,
+          live_call_id   INT
+        )
+      `;
+      await sql!`CREATE INDEX IF NOT EXISTS idx_voicebot_esiti_call ON voicebot_esiti (live_call_id)`;
+      await sql!`CREATE INDEX IF NOT EXISTS idx_voicebot_esiti_numero ON voicebot_esiti (numero, ricevuto_at DESC)`;
+    })().catch(err => { esitiVoicebotReady = null; throw err; });
+  }
+  return esitiVoicebotReady;
+}
+
+app.post("/api/voicebot/esito", express.urlencoded({ extended: false, limit: "50kb" }), async (req: any, res) => {
+  const secret = process.env.MAKE_WEBHOOK_SECRET;
+  const given = String(req.headers["x-gem-secret"] || "");
+  if (!secret || !safeEqual(given, secret)) return res.status(401).json({ ok: false });
+  if (!sql) return res.status(503).json({ ok: false });
+  const b = req.body || {};
+  const esito = String(b.esito || "").trim().toUpperCase().replace(/\s+/g, "_");
+  // Gli esiti "non raggiunto" ed "errore" li manda il sito stesso al foglio: qui non servono.
+  if (!ESITI_VOICEBOT.includes(esito)) return res.json({ ok: true, ignorato: true });
+  const testo = (k: string, max = 500) => {
+    const v = cleanText(b[k], max);
+    return v && !/^non indicato$/i.test(v) ? v : null;
+  };
+  const numero = normalizePhone(String(b.numero || "")) || null;
+  try {
+    await ensureEsitiVoicebot();
+    await ensureLiveSchema();
+    // Il tool a volte parte più volte nella stessa chiamata: si tiene il primo.
+    const doppio = numero ? (await sql`
+      SELECT 1 FROM voicebot_esiti WHERE numero = ${numero} AND esito = ${esito} AND ricevuto_at > now() - interval '10 minutes' LIMIT 1
+    `) as any[] : [];
+    if (doppio.length) return res.json({ ok: true, doppione: true });
+    // La chiamata del sito a cui appartiene: l'ultima inviata a quel numero nelle ultime ore.
+    const chiamata = numero ? ((await sql`
+      SELECT l.id, l.campaign_id, l.nome, c.tipo_campagna, c.username, c.voicebot_nome
+      FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
+      WHERE l.numero = ${numero} AND l.inviata_at > now() - interval '6 hours'
+      ORDER BY l.inviata_at DESC LIMIT 1
+    `) as any[])[0] : null;
+    const r = (await sql`
+      INSERT INTO voicebot_esiti (esito, nome, azienda, ruolo, numero, fascia, esigenza, email, note, riepilogo, voicebot_exten, campaign_id, live_call_id)
+      VALUES (${esito}, ${testo("nome", 200)}, ${testo("azienda", 200)}, ${testo("ruolo", 200)}, ${numero}, ${testo("fascia", 200)},
+              ${testo("esigenza", 300)}, ${(testo("email", 200) || "").toLowerCase() || null}, ${testo("note", 1000)}, ${testo("riepilogo", 2000)},
+              ${cleanText(b.voicebot_exten, 20) || null}, ${chiamata?.campaign_id ?? null}, ${chiamata?.id ?? null})
+      RETURNING id
+    `) as any[];
+    const nomeContatto = testo("nome", 200) || chiamata?.nome || null;
+    if (esito === "NON_CHIAMARE" && numero) {
+      await aggiungiNonChiamare([{ numero, nome: nomeContatto }], "Chiesto durante la chiamata con il voicebot", "wilma", null);
+    }
+    // Campagne standard: follow-up assegnato a chi l'ha lanciata, ed email subito se è interessato.
+    const comm = ESITO_VOICEBOT_COMMERCIALE[esito];
+    if (chiamata && chiamata.tipo_campagna !== "appuntamenti" && (comm === "interessato" || comm === "richiamare")) {
+      const motivo = comm === "interessato" ? "Cliente interessato" : "Da richiamare (chiesto dal cliente)";
+      const nuovo = await createFollowup({ callId: `lead-${r[0].id}`, numero, nome: nomeContatto, motivo, assegnatoA: chiamata.username || null });
+      if (nuovo) {
+        const dettagli = [testo("azienda", 200), testo("ruolo", 200), testo("fascia", 200) && `Quando: ${testo("fascia", 200)}`, testo("esigenza", 300) && `Interesse: ${testo("esigenza", 300)}`, testo("email", 200) && `Email: ${(testo("email", 200) || "").toLowerCase()}`].filter(Boolean) as string[];
+        await ensureFollowupsExtra();
+        if (dettagli.length) await sql`UPDATE followups SET nota = ${dettagli.join(" · ")} WHERE call_id = ${`lead-${r[0].id}`} AND nota IS NULL`;
+        if (comm === "interessato") {
+          await notificaClienteCaldo({
+            numero, nome: nomeContatto, esito: "interessato",
+            riassunto: { testo: testo("riepilogo", 2000), decisioni: dettagli },
+            campagna: chiamata,
+          });
+        }
+      }
+    }
+    res.json({ ok: true, id: r[0].id });
+  } catch (err) {
+    console.error("Errore /api/voicebot/esito:", err);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// ── Preferenze personali (tema, periodo delle statistiche): uguali su ogni dispositivo ──
+let preferenzeReady: Promise<void> | null = null;
+function ensurePreferenze(): Promise<void> {
+  if (!preferenzeReady) {
+    preferenzeReady = sql!`
+      CREATE TABLE IF NOT EXISTS preferenze_utente (
+        username      TEXT PRIMARY KEY,
+        valore        JSONB       NOT NULL DEFAULT '{}'::jsonb,
+        aggiornato_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `.then(() => undefined).catch(err => { preferenzeReady = null; throw err; });
+  }
+  return preferenzeReady;
+}
+
+app.get("/api/preferenze", requireAuth, async (req: any, res) => {
+  if (!sql) return res.json({ ok: true, preferenze: {} });
+  try {
+    await ensurePreferenze();
+    const r = (await sql`SELECT valore FROM preferenze_utente WHERE username = ${String(req.session.username).toLowerCase()}`) as any[];
+    res.json({ ok: true, preferenze: r[0]?.valore || {} });
+  } catch (err) {
+    console.error("Errore lettura preferenze:", err);
+    res.json({ ok: true, preferenze: {} });
+  }
+});
+
+app.put("/api/preferenze", requireAuth, async (req: any, res) => {
+  if (!sql) return res.status(503).json({ ok: false });
+  const b = req.body || {};
+  const nuove: Record<string, unknown> = {};
+  if (b.tema === "chiaro" || b.tema === "scuro") nuove.tema = b.tema;
+  if ([1, 7, 30, 90].includes(Number(b.statsGiorni))) nuove.statsGiorni = Number(b.statsGiorni);
+  if (Object.keys(nuove).length === 0) return res.status(400).json({ ok: false, error: "Nessuna preferenza valida" });
+  try {
+    await ensurePreferenze();
+    const r = (await sql`
+      INSERT INTO preferenze_utente (username, valore, aggiornato_at) VALUES (${String(req.session.username).toLowerCase()}, ${JSON.stringify(nuove)}::jsonb, now())
+      ON CONFLICT (username) DO UPDATE SET valore = preferenze_utente.valore || EXCLUDED.valore, aggiornato_at = now()
+      RETURNING valore
+    `) as any[];
+    res.json({ ok: true, preferenze: r[0]?.valore || nuove });
+  } catch (err) {
+    console.error("Errore salvataggio preferenze:", err);
+    res.status(500).json({ ok: false });
   }
 });
 

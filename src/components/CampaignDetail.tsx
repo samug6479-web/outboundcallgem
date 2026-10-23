@@ -31,6 +31,11 @@ interface Chiamata {
   trascrizione: string | null;
   esito_commerciale: EsitoCommerciale | null;
   non_chiamare: boolean;
+  // Dati raccolti da Wilma con salva_lead
+  lead: {
+    esito: string; nome: string | null; azienda: string | null; ruolo: string | null; fascia: string | null;
+    esigenza: string | null; email: string | null; note: string | null; riepilogo: string | null;
+  } | null;
 }
 
 interface Campagna {
@@ -65,7 +70,14 @@ function RigaChiamata({ c, onNonChiamare, busy }: { c: Chiamata; onNonChiamare: 
   const [open, setOpen] = useState(false);
   const st = STATI[c.stato] || STATI.in_coda;
   const Icon = st.icon;
-  const testo = c.riassunto?.testo || c.riassunto?.titolo || '';
+  const testo = c.riassunto?.testo || c.riassunto?.titolo || c.lead?.riepilogo || '';
+  const datiLead = c.lead ? [
+    c.lead.nome && c.lead.nome !== c.nome ? c.lead.nome : null,
+    [c.lead.azienda, c.lead.ruolo].filter(Boolean).join(', ') || null,
+    c.lead.fascia ? `Quando: ${c.lead.fascia}` : null,
+    c.lead.esigenza ? `Interesse: ${c.lead.esigenza}` : null,
+    c.lead.email,
+  ].filter(Boolean) as string[] : [];
   const decisioni = lista(c.riassunto?.decisioni);
   const argomenti = lista(c.riassunto?.argomenti);
   const problemi = lista(c.riassunto?.problemi);
@@ -97,6 +109,11 @@ function RigaChiamata({ c, onNonChiamare, busy }: { c: Chiamata; onNonChiamare: 
           {c.stato === 'programmata' && precedente && <p className="text-xs text-slate-500 mt-1">Tentativo prima: {precedente}{c.errore ? ` · ${c.errore}` : ''}</p>}
           {c.stato !== 'programmata' && c.errore && <p className="text-xs text-slate-500 mt-1">{c.errore}</p>}
           {testo && <p className="text-sm text-slate-600 dark:text-slate-300 mt-1.5 leading-relaxed">{testo}</p>}
+          {datiLead.length > 0 && (
+            <p className="text-xs text-slate-600 dark:text-slate-300 mt-1.5 px-2.5 py-1.5 rounded-lg bg-slate-50 dark:bg-slate-800/60 border border-slate-100 dark:border-slate-700">
+              <span className="font-semibold text-slate-500">Raccolto da Wilma: </span>{datiLead.join(' · ')}
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-1 shrink-0">
           {!c.non_chiamare && (
@@ -205,7 +222,7 @@ export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: 
     return chiamate
       .filter(c => filtro === 'tutte' || c.stato === filtro)
       .filter(c => filtroComm === 'tutti' || c.esito_commerciale === filtroComm)
-      .filter(c => !q || [c.nome, c.numero, c.riassunto?.testo, c.riassunto?.titolo, c.errore]
+      .filter(c => !q || [c.nome, c.numero, c.riassunto?.testo, c.riassunto?.titolo, c.errore, c.lead?.azienda, c.lead?.nome, c.lead?.riepilogo]
         .some(v => v && v.toLowerCase().includes(q)))
       .sort((a, b) => ORDINE.indexOf(a.stato) - ORDINE.indexOf(b.stato) || a.id - b.id);
   }, [chiamate, filtro, filtroComm, search]);
@@ -226,6 +243,12 @@ export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: 
       Decisioni: lista(c.riassunto?.decisioni).join('; '),
       Note: c.errore || '',
       'Non chiamare': c.non_chiamare ? 'Sì' : '',
+      'Esito Wilma': c.lead?.esito || '',
+      Azienda: c.lead?.azienda || '',
+      Ruolo: c.lead?.ruolo || '',
+      'Quando richiamare': c.lead?.fascia || '',
+      Interesse: c.lead?.esigenza || '',
+      Email: c.lead?.email || '',
     }));
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
