@@ -19,7 +19,22 @@ interface StatsResponse {
   perOperatore: { operatore: string; campagne: number; contatti: number }[];
   pianificateInAttesa: number;
   registroCampagneDal: string | null;
+  perVoicebot?: Confronto[];
+  perFascia?: (Confronto & { ora: number })[];
 }
+
+// Confronto tra voicebot e tra fasce orarie (chiamate delle campagne del sito).
+interface Confronto {
+  voicebot?: string;
+  chiamate: number;
+  risposte: number;
+  interrotte: number;
+  nonRaggiunte: number;
+  interessati: number;
+  durataMediaMs: number | null;
+}
+
+const pct = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 100) : 0);
 
 interface AccessLog { ts: string; username: string; nome: string; action: string }
 
@@ -159,6 +174,15 @@ export function StatsDashboard() {
     })), [12, 10, 14, 10]);
     add('Follow-up per motivo', stats.followupAperti.map(f => ({ Motivo: f.motivo, 'Da gestire': f.totale })), [34, 12]);
     add('Per operatore', stats.perOperatore.map(o => ({ Operatore: o.operatore, Campagne: o.campagne, Contatti: o.contatti })), [24, 10, 10]);
+    add('Per voicebot', (stats.perVoicebot || []).map(v => ({
+      Voicebot: v.voicebot, Chiamate: v.chiamate, Risposte: v.risposte, 'Risposte (%)': pct(v.risposte, v.chiamate),
+      Interrotte: v.interrotte, 'Non raggiunti': v.nonRaggiunte, 'Interessati o appuntamenti': v.interessati,
+      'Durata media': formatDurata(v.durataMediaMs),
+    })), [28, 10, 10, 12, 10, 14, 24, 14]);
+    add('Per fascia oraria', (stats.perFascia || []).map(f => ({
+      Ora: `${String(f.ora).padStart(2, '0')}:00–${String(f.ora + 1).padStart(2, '0')}:00`, Chiamate: f.chiamate, Risposte: f.risposte,
+      'Risposte (%)': pct(f.risposte, f.chiamate), 'Interessati o appuntamenti': f.interessati,
+    })), [14, 10, 10, 12, 24]);
     if (isAdmin) {
       add('Registro accessi', logs.map(l => ({
         Quando: new Date(l.ts).toLocaleString('it-IT'), Utente: l.nome || l.username, Username: l.username,
@@ -292,6 +316,77 @@ export function StatsDashboard() {
               Campagne registrate dal {new Date(stats.registroCampagneDal).toLocaleDateString('it-IT')}.
             </p>
           )}
+        </Card>
+      </div>
+
+      {/* Confronto voicebot e fasce orarie */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Card title={`Confronto voicebot — ${periodLabel}`}>
+          {loading ? <div className="h-40" /> : (stats?.perVoicebot?.length || 0) === 0 ? (
+            <Empty text="Nessuna chiamata delle campagne del sito nel periodo" />
+          ) : (
+            <div className="overflow-x-auto -mx-2">
+              <table className="w-full text-sm min-w-[26rem]">
+                <thead className="text-[11px] text-slate-500 uppercase tracking-wide">
+                  <tr>
+                    <th className="text-left font-semibold px-2 pb-2">Voicebot</th>
+                    <th className="text-right font-semibold px-2 pb-2">Chiamate</th>
+                    <th className="text-left font-semibold px-2 pb-2 w-36">Risposte</th>
+                    <th className="text-right font-semibold px-2 pb-2" title="Interessati o appuntamento fissato, dal riassunto di Wilma">Interessati</th>
+                    <th className="text-right font-semibold px-2 pb-2">Durata</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-slate-700 dark:text-slate-300">
+                  {stats!.perVoicebot!.map(v => (
+                    <tr key={v.voicebot}>
+                      <td className="px-2 py-2 font-semibold text-slate-900 dark:text-white min-w-[10rem]">{v.voicebot}</td>
+                      <td className="px-2 py-2 text-right tabular-nums">{v.chiamate}</td>
+                      <td className="px-2 py-2">
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 h-2 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
+                            <div className="h-full rounded-full" style={{ width: `${pct(v.risposte, v.chiamate)}%`, background: palette.risposte }} />
+                          </div>
+                          <span className="tabular-nums text-xs w-9 text-right">{pct(v.risposte, v.chiamate)}%</span>
+                        </div>
+                      </td>
+                      <td className="px-2 py-2 text-right tabular-nums">{v.interessati}</td>
+                      <td className="px-2 py-2 text-right tabular-nums">{formatDurata(v.durataMediaMs)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+
+        <Card title={`Risposte per fascia oraria — ${periodLabel}`}>
+          {loading ? <div className="h-40" /> : (stats?.perFascia?.length || 0) === 0 ? (
+            <Empty text="Nessuna chiamata delle campagne del sito nel periodo" />
+          ) : (() => {
+            const fasce = stats!.perFascia!;
+            // La fascia migliore si indica solo con abbastanza chiamate per essere affidabile.
+            const migliore = fasce.filter(f => f.chiamate >= 5).sort((a, b) => pct(b.risposte, b.chiamate) - pct(a.risposte, a.chiamate))[0];
+            return (
+              <div className="space-y-2">
+                {fasce.map(f => (
+                  <div key={f.ora} className="flex items-center gap-3 text-sm">
+                    <span className="w-24 shrink-0 tabular-nums text-slate-600 dark:text-slate-300">{String(f.ora).padStart(2, '0')}:00–{String(f.ora + 1).padStart(2, '0')}:00</span>
+                    <div className="flex-1 h-2.5 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
+                      <div className="h-full rounded-full" style={{ width: `${pct(f.risposte, f.chiamate)}%`, background: palette.risposte }} />
+                    </div>
+                    <span className="w-28 shrink-0 text-right text-xs text-slate-500 tabular-nums">
+                      <strong className="text-slate-900 dark:text-white">{pct(f.risposte, f.chiamate)}%</strong> · {f.risposte}/{f.chiamate}
+                    </span>
+                  </div>
+                ))}
+                {migliore && (
+                  <p className="text-xs text-slate-500 pt-2">
+                    Fascia con più risposte: <strong className="text-slate-800 dark:text-slate-200">{String(migliore.ora).padStart(2, '0')}:00–{String(migliore.ora + 1).padStart(2, '0')}:00</strong> ({pct(migliore.risposte, migliore.chiamate)}% su {migliore.chiamate} chiamate).
+                  </p>
+                )}
+              </div>
+            );
+          })()}
         </Card>
       </div>
 

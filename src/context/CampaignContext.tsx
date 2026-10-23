@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { isValidPhoneNumber, normalizePhoneNumber } from '../lib/utils';
 import { authFetch } from '../lib/authFetch';
+import { OrariConsentiti, dentroOrari, prossimaApertura, quandoBreve } from '../lib/orari';
 import * as XLSX from 'xlsx';
 
 export interface Voicebot {
@@ -47,10 +48,15 @@ export interface ContactList {
 
 // Impostazioni del server che cambiano cosa mostra l'interfaccia.
 export interface AppConfig {
-  codaSito: boolean;       // il sito gestisce la coda: le chiamate simultanee sono reali
+  codaSito: boolean;       // il sito gestisce la coda: pausa, richiamate, orari, chiamate simultanee reali
   maxSimultanee: number;
+  maxSimultaneeAppuntamenti: number;
   timerAttivo: boolean;    // il timer del server fa partire le pianificate anche ad app chiusa
+  orari: OrariConsentiti | null;
 }
+
+// Richiamate automatiche dei non raggiunti.
+export interface Richiamate { tentativi: number; intervalloMin: number }
 
 export interface HistoryItem {
   id?: string;
@@ -131,10 +137,11 @@ interface CampaignContextType {
   selectedVoicebot: Voicebot | null;
   setSelectedVoicebot: (v: Voicebot | null) => void;
   loadVoicebots: () => Promise<void>;
-  businessHoursEnabled: boolean;
-  setBusinessHoursEnabled: (v: boolean) => void;
-  businessHoursConfig: { days: number[]; startHour: number; endHour: number };
-  setBusinessHoursConfig: (c: { days: number[]; startHour: number; endHour: number }) => void;
+  richiamate: Richiamate;
+  setRichiamate: (r: Richiamate) => void;
+  maxConcurrency: number;
+  avviaConContatti: (contatti: { nome: string | null; numero: string }[]) => void;
+  reloadConfig: () => void;
 
   historyFilter: { operator: string; dateFrom: string; dateTo: string; search: string };
   setHistoryFilter: React.Dispatch<React.SetStateAction<{ operator: string; dateFrom: string; dateTo: string; search: string }>>;
@@ -176,8 +183,7 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
   const [campaignType, setCampaignType] = useState<'standard' | 'appuntamenti'>('standard');
   const [voicebots, setVoicebots] = useState<Voicebot[]>([]);
   const [selectedVoicebot, setSelectedVoicebot] = useState<Voicebot | null>(null);
-  const [businessHoursEnabled, setBusinessHoursEnabled] = useState(false);
-  const [businessHoursConfig, setBusinessHoursConfig] = useState({ days: [1,2,3,4,5], startHour: 9, endHour: 19 });
+  const [richiamate, setRichiamate] = useState<Richiamate>({ tentativi: 0, intervalloMin: 120 });
   const [historyFilter, setHistoryFilter] = useState({ operator: '', dateFrom: '', dateTo: '', search: '' });
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [lists, setLists] = useState<ContactList[]>([]);
@@ -250,7 +256,18 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
   }, [user?.username]);
 
   // ── Storico, liste e impostazioni: sul server, uguali su ogni dispositivo ──
-  const [appConfig, setAppConfig] = useState<AppConfig>({ codaSito: false, maxSimultanee: 1, timerAttivo: false });
+  const [appConfig, setAppConfig] = useState<AppConfig>({ codaSito: false, maxSimultanee: 1, maxSimultaneeAppuntamenti: 1, timerAttivo: false, orari: null });
+  const reloadConfig = () => {
+    authFetch('/api/config')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (d?.ok) setAppConfig({
+          codaSito: !!d.codaSito, maxSimultanee: d.maxSimultanee || 1, maxSimultaneeAppuntamenti: d.maxSimultaneeAppuntamenti || 1,
+          timerAttivo: !!d.timerAttivo, orari: d.orari || null,
+        });
+      })
+      .catch(() => {});
+  };
   const loadHistory = async () => {
     try {
       const res = await authFetch('/api/history');
@@ -295,16 +312,22 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       if (!isViewer) await importaArchivioLocale();
       await Promise.all([loadHistory(), isViewer ? Promise.resolve() : loadLists()]);
     })();
-    authFetch('/api/config')
-      .then(r => r.ok ? r.json() : null)
-      .then(d => { if (d?.ok) setAppConfig({ codaSito: !!d.codaSito, maxSimultanee: d.maxSimultanee || 1, timerAttivo: !!d.timerAttivo }); })
-      .catch(() => {});
+    reloadConfig();
   }, [user?.username]);
 
-  // Con la coda gestita dal sito le chiamate simultanee non possono superare il limite.
+  // Le chiamate simultanee non possono superare il limite del tipo di campagna.
+  const maxConcurrency = campaignType === 'appuntamenti' ? appConfig.maxSimultaneeAppuntamenti : appConfig.maxSimultanee;
   useEffect(() => {
-    if (concurrency > appConfig.maxSimultanee) setConcurrency(appConfig.maxSimultanee);
-  }, [appConfig.maxSimultanee]);
+    if (concurrency > maxConcurrency) setConcurrency(Math.max(1, maxConcurrency));
+  }, [maxConcurrency]);
+
+  // Nuova campagna con questi contatti (es. i "Non partita" di una campagna).
+  const avviaConContatti = (contatti: { nome: string | null; numero: string }[]) => {
+    setContacts(contatti.map((c, i) => ({ id: `r${Date.now()}-${i}`, nome: c.nome || c.numero, numero: c.numero })));
+    setUploadMode('manual');
+    setLaunchStatus({ type: 'idle', msg: '' });
+    window.dispatchEvent(new CustomEvent('gem:nav', { detail: 'campaign' }));
+  };
 
   const login = async (u: string, p: string) => {
     try {
@@ -495,14 +518,6 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
     } catch {}
   };
 
-  // Business hours check — usa la config personalizzata
-  // Controlla l'orario indicato (di default adesso). Per le campagne
-  // pianificate va controllato l'orario di partenza, non quello attuale.
-  const isBusinessHours = (at: Date = new Date()) => {
-    const day = at.getDay();
-    const hour = at.getHours();
-    return businessHoursConfig.days.includes(day) && hour >= businessHoursConfig.startHour && hour < businessHoursConfig.endHour;
-  };
 
   // Filtered history
   const filteredHistory = history.filter(h => {
@@ -594,8 +609,12 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       targetAt = target.toISOString();
     }
 
-    if (businessHoursEnabled && !isBusinessHours(targetAt ? new Date(targetAt) : new Date())) {
-      setLaunchStatus({ type: 'err', msg: `${targetAt ? "L'orario scelto è" : 'Adesso sei'} fuori dagli orari consentiti. Cambia orario o disattiva il controllo orari.` });
+    // Fuori dagli orari consentiti: con la coda del sito la campagna parte
+    // all'apertura; con il vecchio invio non si può lanciare.
+    const momento = targetAt ? new Date(targetAt) : new Date();
+    if (!appConfig.codaSito && !dentroOrari(appConfig.orari, momento)) {
+      const ap = prossimaApertura(appConfig.orari, momento);
+      setLaunchStatus({ type: 'err', msg: `${targetAt ? "L'orario scelto è" : 'Adesso è'} fuori dagli orari consentiti${ap ? `: si può chiamare da ${quandoBreve(ap)}` : ''}.` });
       return;
     }
 
@@ -621,6 +640,7 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
           note: campaignNote || undefined,
           voicebot_id: selectedVoicebot?.id,
           concurrency,
+          richiamate: appConfig.codaSito ? richiamate : undefined,
         })
       });
       const data = await res.json().catch(() => ({}));
@@ -631,6 +651,12 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       }
 
       const testPrefix = data.dryRun ? '[TEST — nessuna chiamata reale] ' : '';
+      const esclusiMsg = data.esclusi > 0
+        ? ` ${data.esclusi} ${data.esclusi === 1 ? 'numero è nella lista Non chiamare e non verrà chiamato' : 'numeri sono nella lista Non chiamare e non verranno chiamati'}.`
+        : '';
+      const attesaMsg = data.inAttesaFino
+        ? ` Fuori dagli orari consentiti: le chiamate partiranno ${quandoBreve(new Date(data.inAttesaFino))}.`
+        : '';
 
       if (data.scheduled) {
         loadHistory();
@@ -638,7 +664,7 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
         loadScheduledCampaigns();
         const quando = new Date(data.scheduledAt).toLocaleString('it-IT', { dateStyle: 'short', timeStyle: 'short' });
         const comeParte = appConfig.timerAttivo ? 'Partirà da sola all\'orario.' : 'Partirà all\'orario se l\'app è aperta su almeno un dispositivo.';
-        setLaunchStatus({ type: 'ok', msg: `${testPrefix}Campagna pianificata per ${quando} — ${validContacts.length} contatti. ${comeParte}` });
+        setLaunchStatus({ type: 'ok', msg: `${testPrefix}Campagna pianificata per ${quando} — ${validContacts.length} contatti. ${comeParte}${esclusiMsg}${attesaMsg}` });
         return;
       }
       if (data.sent > 0) {
@@ -652,8 +678,10 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
         const failedNumbers = new Set<string>((data.failedContacts || []).map((c: any) => c.numero));
         setContacts(validContacts.filter(c => failedNumbers.has(String(c.numero).replace(/[\s\-().]/g, ''))));
         setLaunchStatus({ type: 'err', msg: `${testPrefix}${data.sent} contatti inviati, ${data.failed} non inviati. In lista sono rimasti solo quelli da riprovare.${SUPPORT_HINT}` });
+      } else if (data.sent === 0 && data.esclusi > 0) {
+        setLaunchStatus({ type: 'err', msg: `Nessuna chiamata: tutti i numeri sono nella lista Non chiamare.` });
       } else {
-        setLaunchStatus({ type: 'ok', msg: `${testPrefix}Campagna inviata — ${data.sent} chiamate in elaborazione.` });
+        setLaunchStatus({ type: 'ok', msg: `${testPrefix}Campagna inviata — ${data.sent} chiamate in elaborazione.${esclusiMsg}${attesaMsg}` });
       }
     } catch(err: any) {
       setLaunchStatus({ type: 'err', msg: 'Errore di rete: ' + err.message + SUPPORT_HINT });
@@ -674,8 +702,7 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       campaignNote, setCampaignNote,
       campaignType, setCampaignType,
       voicebots, selectedVoicebot, setSelectedVoicebot, loadVoicebots,
-      businessHoursEnabled, setBusinessHoursEnabled,
-      businessHoursConfig, setBusinessHoursConfig,
+      richiamate, setRichiamate, maxConcurrency, avviaConContatti, reloadConfig,
       historyFilter, setHistoryFilter, filteredHistory, exportHistoryToXLSX,
       history, clearHistory, loadHistory, appConfig,
       scheduledCampaigns, loadScheduledCampaigns, cancelScheduledCampaign,

@@ -346,7 +346,8 @@ export function Step2Preview() {
 }
 
 export function Step3Settings() {
-  const { user, contacts, scheduleMode, setScheduleMode, scheduledAt, setScheduledAt, concurrency, setConcurrency, voicebots, selectedVoicebot, setSelectedVoicebot } = useCampaign();
+  const { user, contacts, scheduleMode, setScheduleMode, scheduledAt, setScheduledAt, concurrency, setConcurrency, voicebots, selectedVoicebot, setSelectedVoicebot,
+    appConfig, maxConcurrency, richiamate, setRichiamate } = useCampaign();
 
   if (contacts.length === 0) return null;
 
@@ -459,25 +460,62 @@ export function Step3Settings() {
 
         <div className="pt-6 border-t border-slate-200 dark:border-slate-800">
           <label className="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-4">Chiamate Simultanee</label>
-          <div className="flex items-center gap-6">
-            <input 
-              type="range" 
-              min="1" max="3" 
-              value={concurrency}
-              onChange={e => setConcurrency(parseInt(e.target.value))}
-              className="flex-1 h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer accent-brand-500"
-            />
-            <div className="w-12 h-12 bg-brand-500 text-white rounded-xl flex items-center justify-center font-display font-extrabold text-xl shadow-md shrink-0">
-              {concurrency}
-            </div>
-          </div>
-          <p className="text-xs font-medium text-slate-500 mt-3 align-middle flex items-center gap-2">
-            <AlertTriangle className="w-4 h-4 text-slate-400" />
-            {concurrency === 1 && "1 chiamata alla volta — inoltro sequenziale"}
-            {concurrency === 2 && "2 chiamate in parallelo"}
-            {concurrency === 3 && "3 chiamate in parallelo"}
-          </p>
+          {maxConcurrency > 1 ? (
+            <>
+              <div className="flex items-center gap-6">
+                <input
+                  type="range"
+                  min="1" max={maxConcurrency}
+                  value={Math.min(concurrency, maxConcurrency)}
+                  onChange={e => setConcurrency(parseInt(e.target.value))}
+                  aria-label="Chiamate simultanee"
+                  className="flex-1 h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer accent-brand-500"
+                />
+                <div className="w-12 h-12 bg-brand-500 text-white rounded-xl flex items-center justify-center font-display font-extrabold text-xl shadow-md shrink-0">
+                  {Math.min(concurrency, maxConcurrency)}
+                </div>
+              </div>
+              <p className="text-xs font-medium text-slate-500 mt-3">
+                {concurrency === 1 ? '1 chiamata alla volta' : `Fino a ${Math.min(concurrency, maxConcurrency)} chiamate in parallelo`}
+              </p>
+            </>
+          ) : (
+            <p className="text-sm text-slate-500">Una chiamata alla volta: la successiva parte quando finisce quella prima.</p>
+          )}
         </div>
+
+        {appConfig.codaSito && (
+          <div className="pt-6 border-t border-slate-200 dark:border-slate-800">
+            <label className="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-1">Richiama i non raggiunti</label>
+            <p className="text-xs text-slate-500 mb-3">Chi rifiuta, è occupato o non risponde viene richiamato in automatico.</p>
+            <div className="flex flex-wrap gap-2" role="group" aria-label="Quante volte richiamare">
+              {[0, 1, 2, 3].map(n => (
+                <button key={n} type="button" onClick={() => setRichiamate({ ...richiamate, tentativi: n })}
+                  className={cn("px-3 py-2 rounded-xl text-sm font-semibold border-2 transition-colors",
+                    richiamate.tentativi === n
+                      ? "border-brand-500 bg-brand-50 dark:bg-brand-900/20 text-brand-700 dark:text-brand-300"
+                      : "border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:border-slate-300 dark:hover:border-slate-600")}>
+                  {n === 0 ? 'No' : n === 1 ? '1 volta' : `${n} volte`}
+                </button>
+              ))}
+            </div>
+            {richiamate.tentativi > 0 && (
+              <div className="mt-3 flex items-center gap-2 flex-wrap">
+                <label htmlFor="intervallo-richiamate" className="text-sm text-slate-600 dark:text-slate-300">Richiama</label>
+                <select id="intervallo-richiamate" value={richiamate.intervalloMin}
+                  onChange={e => setRichiamate({ ...richiamate, intervalloMin: parseInt(e.target.value) })}
+                  className="px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-xl text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50">
+                  <option value={30}>dopo 30 minuti</option>
+                  <option value={60}>dopo 1 ora</option>
+                  <option value={120}>dopo 2 ore</option>
+                  <option value={240}>dopo 4 ore</option>
+                  <option value={1440}>il giorno dopo</option>
+                </select>
+                {appConfig.orari?.attivo && <span className="text-xs text-slate-500">(sempre negli orari consentiti)</span>}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

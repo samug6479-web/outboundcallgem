@@ -36,8 +36,9 @@ Copia `env.example` e configura i valori. Su Vercel vanno impostate nel pannello
 | `MAKE_WEBHOOK_SECRET` | ➖ | Inviato a Make nell'header `x-gem-secret`, da controllare con un filtro nello scenario. Lo stesso valore protegge `/api/live/make-event`, con cui Make avvisa il sito dopo ogni richiesta di chiamata (pagina "In diretta"). |
 | `CALLS_DRY_RUN` | ➖ | `"true"` = lancio simulato (nessuna chiamata). Se vuota: chiamate reali **solo** in produzione Vercel. |
 | `GITHUB_DATA_BRANCH` | ➖ | Branch per `users.json` / `voicebots.json`. Vuota = branch principale. Nelle anteprime Vercel, senza questa variabile, le scritture sono bloccate. |
-| `CAMPAIGN_QUEUE_MODE` | ➖ | `sito` = la coda delle chiamate la gestisce il sito: manda a Make un contatto per volta e al massimo N chiamate insieme per campagna (vedi sotto). Vuota = invio classico, tutta la lista a Make. |
-| `MAX_CHIAMATE_SIMULTANEE` | ➖ | Con `CAMPAIGN_QUEUE_MODE=sito`, quante chiamate al massimo per campagna (1–10, default 3). Va scelto in base ai canali del centralino e del voicebot. |
+| `CAMPAIGN_QUEUE_MODE` | ➖ | Vuota (predefinito) = la coda delle chiamate la gestisce il sito: manda a Make un contatto per volta (vedi sotto). Serve per pausa, orari consentiti, richiamate e "Non chiamare" in coda. `make` = vecchio invio, tutta la lista a Make. |
+| `MAX_CHIAMATE_SIMULTANEE` | ➖ | Campagne standard: quante chiamate al massimo insieme (1–10, default 1). Per alzarlo va tolta la coda sequenziale nello scenario Make "Chiama Lista". |
+| `MAX_CHIAMATE_SIMULTANEE_APPUNTAMENTI` | ➖ | Campagne conferma appuntamenti: quante chiamate al massimo insieme (1–10, default 3). |
 | `MAKE_API_TOKEN` | ➖ | Token API di Make (permesso `scenarios:write`): il sito programma lo scenario "Timer campagne" solo quando serve (vedi "Timer del server"). |
 | `CRON_SECRET` | ➖ | Alternativa a `MAKE_WEBHOOK_SECRET` per il timer `/api/cron/tick` (header `Authorization: Bearer …`, formato di Vercel Cron). |
 
@@ -81,13 +82,15 @@ Con la sveglia il sito programma lo scenario Make **"GEM Outbound - Timer campag
 
 Quando suona, lo scenario chiama `/api/cron/tick`. Il sito fa partire le campagne arrivate all'orario e programma la sveglia successiva. Se non c'è più niente in programma, la spegne.
 
+Gli scenari sveglia sono **due** e si alternano ("Timer campagne (sveglia)" con `?s=1` nell'URL e "sveglia 2" con `?s=2`). Make spegne uno scenario "una volta" appena finisce di girare: lo scenario che sta chiamando il tick non si può riattivare da dentro il tick, quindi il sito arma l'altro.
+
 Con più campagne pianificate la sveglia è una sola, sulla prima. Una campagna pianificata prima di quella in programma la fa anticipare. Una campagna annullata può lasciare una sveglia "a vuoto", che costa una sola operazione.
 
 Le chiamate alle API di Make non consumano operazioni: si paga solo un'esecuzione quando c'è davvero qualcosa da fare.
 
 Per attivarla, su Vercel (Production):
 - `MAKE_API_TOKEN` (accettato anche `MAKE_API_TOKE`): token API di Make (profilo → API → Add token) con permesso `scenarios:write`.
-- `MAKE_TIMER_SCENARIO_ID` (facoltativa, default `8130692`) e `MAKE_API_URL` (facoltativa, default `https://eu1.make.com/api/v2`).
+- `MAKE_TIMER_SCENARIO_ID` e `MAKE_TIMER_SCENARIO_ID_2` (facoltative, default `8130692` e `8132573`) e `MAKE_API_URL` (facoltativa, default `https://eu1.make.com/api/v2`).
 
 In alternativa, qualsiasi servizio può chiamare `/api/cron/tick` a intervalli fissi (header `x-gem-secret`), ma consuma un'esecuzione a ogni giro.
 
@@ -105,18 +108,33 @@ Il controllo parte:
 - a ogni riassunto ricevuto;
 - dal timer, o dall'app aperta ogni 30 secondi.
 
-### Chiamate simultanee (coda gestita dal sito)
+### Coda gestita dal sito (predefinita)
 
-Lo scenario Make "Chiama Lista" ha la coda **sequenziale**: le chiamate partono una alla volta, qualunque sia il numero di "chiamate simultanee" scelto. Con `CAMPAIGN_QUEUE_MODE=sito`:
+Il sito tiene la coda di ogni campagna e manda a Make **un contatto per esecuzione**:
 
-- il sito tiene la coda della campagna e manda a Make **un contatto per esecuzione**;
-- non ci sono mai più di N chiamate in corso per campagna (N = scelta dell'operatore, fino a `MAX_CHIAMATE_SIMULTANEE`);
+- non ci sono mai più di N chiamate in corso per campagna (N = scelta dell'operatore, fino a `MAX_CHIAMATE_SIMULTANEE` o `MAX_CHIAMATE_SIMULTANEE_APPUNTAMENTI`);
 - una chiamata libera il posto quando ha un esito:
   - esito da Make (non partita, errore);
   - fine chiamata dal webhook Wildix `call:completed` (risposta, interrotta, non risposta);
-- senza notizie da Make entro 10 minuti la chiamata va in errore. Dopo 20 minuti dall'avvio senza fine chiamata il posto si libera comunque.
+- senza notizie da Make entro 10 minuti la chiamata va in errore. Dopo 15 minuti dall'avvio senza fine chiamata il posto si libera comunque.
 
-In Make, lo scenario usato da questa modalità deve avere **Sequential processing disattivato**, altrimenti le esecuzioni restano una alla volta. Il webhook Wildix `call:completed` deve arrivare allo stesso dominio dell'app, altrimenti ogni posto si libera solo dopo 20 minuti.
+Lo scenario Make "Chiama Lista" aspetta la risposta del cliente e ha la coda **sequenziale**: per più di 1 chiamata insieme nelle campagne standard va disattivato **Sequential processing** e alzato `MAX_CHIAMATE_SIMULTANEE`. Il webhook Wildix `call:completed` deve arrivare allo stesso dominio dell'app, altrimenti ogni posto si libera solo dopo 15 minuti.
+
+Con la coda del sito funzionano anche:
+
+- **Pausa, ripresa e stop** di una campagna da In diretta. In pausa non partono nuove chiamate; con lo stop i contatti non ancora chiamati diventano "Annullata".
+- **Richiamate dei non raggiunti** (rifiutata, occupato, senza risposta): 0–3 tentativi in più, dopo 30 minuti – 24 ore, scelti al lancio. L'esito va allo Sheets solo dopo l'ultimo tentativo.
+- **Orari consentiti** (Amministrazione → Impostazioni): giorni e fasce in ora italiana. Fuori orario le chiamate restano in coda e la sveglia Make le fa ripartire all'apertura. Spenti finché un Admin non li attiva.
+- **Lista Non chiamare** (tabella `do_not_call`): i numeri vengono tolti al lancio e dalle code in corso. Wilma aggiunge chi chiede di non essere più contattato (dal riassunto della chiamata).
+
+### Esito commerciale e clienti caldi
+
+Dal riassunto di Wilma il sito ricava l'esito commerciale: Appuntamento, Interessato, Da richiamare, Non interessato, Non chiamare, Da valutare (regole sulle parole del riassunto, `classificaEsitoCommerciale`). Nelle campagne standard:
+
+- Interessato e Appuntamento creano un follow-up assegnato a chi ha lanciato la campagna e gli mandano subito un'email;
+- Da richiamare crea un follow-up.
+
+L'esito commerciale compare in In diretta, Esiti Chiamate, nell'email di fine campagna e nelle Statistiche (confronto tra voicebot e per fascia oraria).
 
 ### Ambiente di test completo
 
@@ -129,7 +147,7 @@ Per provare timer, coda e chiamate simultanee senza toccare la produzione, sull'
    - il timer, verso l'URL dell'anteprima.
 4. Variabili Preview:
    - `MAKE_WEBHOOK_URL` e `MAKE_WEBHOOK_URL_APPUNTAMENTI` → i webhook delle copie;
-   - `CAMPAIGN_QUEUE_MODE=sito` e `MAX_CHIAMATE_SIMULTANEE`;
+   - `MAX_CHIAMATE_SIMULTANEE` (la coda del sito è già predefinita);
    - `CALLS_DRY_RUN=false` solo durante la prova.
 5. In Wildix (WMS → Integrazioni → Webhook), un secondo webhook `call:completed` verso `https://<anteprima>/api/wildix-webhook` con lo stesso segreto.
 

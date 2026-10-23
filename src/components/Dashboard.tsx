@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useCampaign } from '../context/CampaignContext';
 import { GemLogo } from './Icons';
-import { LogOut, Sun, Moon, Plus, List, Clock, User, Headset, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen, Radio, Bot } from 'lucide-react';
+import { LogOut, Sun, Moon, Plus, List, Clock, User, Headset, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen, Radio, Bot, Ban, Settings } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { authFetch } from '../lib/authFetch';
 import { Step1Upload, Step2Preview, Step3Settings } from './CampaignSteps';
@@ -17,8 +17,10 @@ import { CallResultsSection } from './CallResultsSection';
 import { FollowupsSection } from './FollowupsSection';
 import { LiveSection } from './LiveSection';
 import { ConfirmModal } from './ConfirmModal';
+import { NonChiamareSection } from './NonChiamareSection';
+import { ImpostazioniSection } from './ImpostazioniSection';
 
-type Tab = 'live' | 'campaign' | 'appointments' | 'lists' | 'history' | 'callresults' | 'followups' | 'profile' | 'support' | 'stats' | 'users' | 'voicebots';
+type Tab = 'live' | 'campaign' | 'appointments' | 'lists' | 'dnc' | 'history' | 'callresults' | 'followups' | 'profile' | 'support' | 'stats' | 'users' | 'voicebots' | 'settings';
 
 interface NavItem {
   id: Tab;
@@ -45,6 +47,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: 'campaign' as Tab, label: 'Nuova Campagna', icon: Plus, viewerHidden: true },
       { id: 'appointments' as Tab, label: 'Conferma Appuntamenti', icon: CalendarCheck, viewerHidden: true },
       { id: 'lists' as Tab, label: 'Liste Salvate', icon: List, viewerHidden: true },
+      { id: 'dnc' as Tab, label: 'Non chiamare', icon: Ban, viewerHidden: true },
     ]
   },
   {
@@ -68,6 +71,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { id: 'users' as Tab, label: 'Gestione Utenti', icon: Users, adminOnly: true },
       { id: 'voicebots' as Tab, label: 'Voicebot', icon: Bot, adminOnly: true },
+      { id: 'settings' as Tab, label: 'Impostazioni', icon: Settings, adminOnly: true },
     ]
   },
 ];
@@ -76,6 +80,8 @@ const TAB_META: Record<Tab, { title: string; subtitle: string }> = {
   campaign: { title: 'Nuova Campagna', subtitle: 'Carica la lista contatti, definisci le tempistiche e avvia le chiamate sul centralino Wildix.' },
   appointments: { title: 'Conferma Appuntamenti', subtitle: 'Visualizza, importa e gestisci gli appuntamenti programmati per le campagne di richiamata.' },
   lists: { title: 'Liste Salvate', subtitle: 'Salva, gestisci o riutilizza le tue liste contatti precedentemente caricate.' },
+  dnc: { title: 'Non chiamare', subtitle: 'Numeri che nessuna campagna chiama mai: chi lo ha chiesto, clienti attivi, numeri sbagliati.' },
+  settings: { title: 'Impostazioni', subtitle: 'Orari in cui le campagne possono chiamare.' },
   history: { title: 'Storico Campagne', subtitle: 'Le campagne lanciate da tutti gli operatori, con i report da scaricare.' },
   live: { title: 'In diretta', subtitle: 'Le chiamate delle campagne in corso, aggiornate ogni pochi secondi.' },
   followups: { title: 'Follow-up', subtitle: 'Contatti da richiamare o gestire a mano: chiamate non risposte, rifiuti, disdette e trasferimenti.' },
@@ -135,7 +141,7 @@ export function Dashboard() {
   // ?tab=... nell'indirizzo (es. il pulsante "Segui in diretta" dell'email)
   // ha la precedenza sulla scheda ricordata. I Viewer non aprono pagine a loro nascoste.
   const urlTab = new URLSearchParams(window.location.search).get('tab') as Tab | null;
-  const viewerHiddenTabs: Tab[] = ['campaign', 'appointments', 'lists', 'live'];
+  const viewerHiddenTabs: Tab[] = ['campaign', 'appointments', 'lists', 'live', 'dnc'];
   const linkTab = urlTab && urlTab in TAB_META && !(isViewer && viewerHiddenTabs.includes(urlTab)) ? urlTab : null;
   const savedTab = sessionStorage.getItem('gem_active_tab') as Tab | null;
   const [activeTab, setActiveTab] = useState<Tab>(linkTab || savedTab || (isViewer ? 'callresults' : 'campaign'));
@@ -547,6 +553,14 @@ export function Dashboard() {
             <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
               <AdminUsers />
             </div>
+          )}
+
+          {activeTab === 'dnc' && !isViewer && (
+            <NonChiamareSection />
+          )}
+
+          {activeTab === 'settings' && isAdmin && (
+            <ImpostazioniSection />
           )}
 
           {activeTab === 'voicebots' && isAdmin && (

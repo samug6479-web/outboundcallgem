@@ -3,6 +3,7 @@ import { PhoneCall, CheckCircle2, XCircle, ChevronDown, RefreshCw, Clock, Search
 import * as XLSX from 'xlsx';
 import { cn } from '../lib/utils';
 import { authFetch } from '../lib/authFetch';
+import { ESITI_COMMERCIALI, EsitoCommerciale } from './liveStati';
 
 interface CallResult {
   callId: string;
@@ -19,6 +20,7 @@ interface CallResult {
     decisioni: string[];
     problemi: string[];
   } | null;
+  esitoCommerciale?: EsitoCommerciale | null;
 }
 
 function formatDurata(ms: number | null) {
@@ -88,6 +90,11 @@ function ResultCard({ r }: { r: CallResult }) {
             {confermato && (
               <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300 flex items-center gap-1">
                 <CheckCircle2 className="w-3 h-3" /> Confermato
+              </span>
+            )}
+            {!confermato && !rifiutato && r.esitoCommerciale && r.esitoCommerciale !== 'da_valutare' && (
+              <span className={cn("text-[11px] font-bold px-2 py-0.5 rounded-full", ESITI_COMMERCIALI[r.esitoCommerciale].cls)}>
+                {ESITI_COMMERCIALI[r.esitoCommerciale].label}
               </span>
             )}
             {rifiutato && (
@@ -227,6 +234,7 @@ export function CallResultsSection() {
       Nome: r.nome || '',
       Numero: r.numero || '',
       Esito: ESITO_LABEL[getEsito(r)],
+      'Esito commerciale': r.esitoCommerciale ? ESITI_COMMERCIALI[r.esitoCommerciale].label : '',
       Durata: formatDurata(r.durata),
       Data: new Date(r.timestamp).toLocaleString('it-IT'),
       Riassunto: r.riassunto?.testo || '',

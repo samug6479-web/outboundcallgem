@@ -251,6 +251,7 @@ async function readCallResults(limit = 50, offset = 0): Promise<{ rows: any[]; t
         timestamp: r.ts,
         trascrizione: r.trascrizione,
         riassunto: r.riassunto,
+        esitoCommerciale: r.risposto ? classificaEsitoCommerciale(r.riassunto) : null,
       })),
       total: (countRes[0] as any).total,
     };
@@ -385,17 +386,92 @@ async function logWebhookEvent(eventType: string, reason: string) {
 // (disdetta, richiesta informazioni, trasferimento, non risposto)
 // Non crea doppioni: Wildix può reinviare lo stesso evento, quindi lo stesso
 // motivo per la stessa chiamata viene registrato una volta sola.
-async function createFollowup(entry: { callId: string; numero: string | null; nome: string | null; motivo: string }) {
+// Restituisce true se il follow-up è nuovo (serve per non mandare due volte la stessa notifica).
+async function createFollowup(entry: { callId: string; numero: string | null; nome: string | null; motivo: string; assegnatoA?: string | null }): Promise<boolean> {
   try {
-    await sql`
-      INSERT INTO followups (call_id, numero, nome, motivo)
-      SELECT ${entry.callId}, ${entry.numero}, ${entry.nome}, ${entry.motivo}
+    await ensureFollowupsExtra();
+    const r = (await sql`
+      INSERT INTO followups (call_id, numero, nome, motivo, assegnato_a)
+      SELECT ${entry.callId}, ${entry.numero}, ${entry.nome}, ${entry.motivo}, ${entry.assegnatoA || null}
       WHERE NOT EXISTS (
         SELECT 1 FROM followups WHERE call_id = ${entry.callId} AND motivo = ${entry.motivo}
       )
-    `;
+      RETURNING id
+    `) as any[];
+    return r.length > 0;
   } catch (err) {
     console.error("Error creating followup:", err);
+    return false;
+  }
+}
+
+// Follow-up: note e persona assegnata (colonne aggiunte dopo).
+let followupsExtraReady: Promise<void> | null = null;
+function ensureFollowupsExtra(): Promise<void> {
+  if (!followupsExtraReady) {
+    followupsExtraReady = (async () => {
+      await sql!`ALTER TABLE followups ADD COLUMN IF NOT EXISTS nota TEXT`;
+      await sql!`ALTER TABLE followups ADD COLUMN IF NOT EXISTS assegnato_a TEXT`;
+      await sql!`ALTER TABLE followups ADD COLUMN IF NOT EXISTS aggiornato_at TIMESTAMPTZ`;
+      await sql!`ALTER TABLE followups ADD COLUMN IF NOT EXISTS aggiornato_da TEXT`;
+    })().catch(err => { followupsExtraReady = null; throw err; });
+  }
+  return followupsExtraReady;
+}
+
+// La campagna più recente del sito che ha chiamato questo numero (ultimi giorni).
+async function campagnaDelNumero(numero: string | null): Promise<any | null> {
+  if (!sql || !numero) return null;
+  try {
+    await ensureLiveSchema();
+    const r = (await sql`
+      SELECT c.id, c.username, c.operatore, c.tipo_campagna, c.voicebot_nome, l.nome
+      FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
+      WHERE l.numero = ${numero} AND l.queued_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int)
+      ORDER BY l.queued_at DESC LIMIT 1
+    `) as any[];
+    return r[0] || null;
+  } catch { return null; }
+}
+
+// Cliente caldo (interessato o appuntamento): email subito a chi ha lanciato la
+// campagna, così lo richiama finché è ancora "caldo".
+async function notificaClienteCaldo(info: { numero: string | null; nome: string | null; esito: EsitoCommerciale; riassunto: any; campagna: any }) {
+  if (!process.env.SMTP_USER) return;
+  const user = info.campagna?.username ? await findSessionUser(info.campagna.username).catch(() => null) : null;
+  const to = user?.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(user.email) ? user.email : process.env.NOTIFY_EMAIL;
+  if (!to) return;
+  const appUrl = (process.env.APP_URL || "https://outboundcallgem.vercel.app").replace(/\/$/, "");
+  const etichetta = ESITO_COMMERCIALE_LABEL[info.esito].label;
+  const chi = info.nome || info.numero || "Contatto";
+  const testo = String(info.riassunto?.testo || info.riassunto?.titolo || "").trim();
+  const decisioni = (Array.isArray(info.riassunto?.decisioni) ? info.riassunto.decisioni : []).filter((d: any) => typeof d === "string");
+  try {
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || "smtp.gmail.com",
+      port: parseInt(process.env.SMTP_PORT || "587"),
+      secure: process.env.SMTP_SECURE === "true",
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+    await transporter.sendMail({
+      from: `"GEM Outbound" <${process.env.SMTP_USER}>`,
+      to,
+      subject: `${info.esito === "appuntamento" ? "Appuntamento" : "Cliente interessato"}: ${chi}${info.campagna?.voicebot_nome ? ` · ${info.campagna.voicebot_nome}` : ""}`,
+      text: [`${etichetta}: ${chi}${info.numero ? ` (${info.numero})` : ""}`, "", testo, ...decisioni.map((d: string) => `- ${d}`), "", `Follow-up: ${appUrl}/?tab=followups`].join("\n"),
+      html: `
+<div style="background:#eef1f6;padding:28px 12px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0;">
+  <tr><td style="padding:26px 36px 0;"><span style="display:inline-block;background:${ESITO_COMMERCIALE_LABEL[info.esito].bg};color:${ESITO_COMMERCIALE_LABEL[info.esito].fg};font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;">${etichetta}</span></td></tr>
+  <tr><td style="padding:14px 36px 4px;font-size:22px;font-weight:700;color:#0f172a;">${escapeHtml(chi)}</td></tr>
+  ${info.numero ? `<tr><td style="padding:0 36px 14px;"><a href="tel:${escapeHtml(info.numero)}" style="font-size:16px;color:#1e3dc8;font-weight:600;text-decoration:none;">${escapeHtml(info.numero)}</a></td></tr>` : ""}
+  ${testo ? `<tr><td style="padding:0 36px 10px;font-size:15px;color:#334155;line-height:1.6;">${escapeHtml(testo)}</td></tr>` : ""}
+  ${decisioni.length ? `<tr><td style="padding:0 36px 10px;font-size:14px;color:#475569;line-height:1.6;"><ul style="margin:0;padding-left:18px;">${decisioni.map((d: string) => `<li>${escapeHtml(d)}</li>`).join("")}</ul></td></tr>` : ""}
+  <tr><td style="padding:16px 36px 28px;"><a href="${appUrl}/?tab=followups" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:13px 20px;border-radius:9px;">Apri i Follow-up</a></td></tr>
+  <tr><td style="padding:16px 36px;border-top:1px solid #eef1f6;font-size:12px;color:#94a3b8;">Richiamalo presto: è il momento migliore. Email automatica di GEM Outbound.</td></tr>
+</table></div>`,
+    });
+  } catch (err) {
+    console.error("Errore invio notifica cliente caldo:", err);
   }
 }
 
@@ -441,6 +517,7 @@ async function closeAutoFollowups(numero: string | null, motivi: string[]) {
 app.get("/api/followups", requireAuth, async (req, res) => {
   const stato = (req.query.stato as string) || "pending";
   try {
+    await ensureFollowupsExtra().catch(err => console.error("Colonne follow-up:", err));
     const rows = await sql`
       SELECT * FROM followups WHERE stato = ${stato} ORDER BY created_at DESC LIMIT 200
     `;
@@ -449,6 +526,45 @@ app.get("/api/followups", requireAuth, async (req, res) => {
     console.error("Error reading followups:", err);
     res.status(500).json({ ok: false, followups: [] });
   }
+});
+
+// Nota e persona assegnata di un follow-up.
+app.put("/api/followups/:id", requireAuth, express.json(), async (req: any, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!sql || !(id > 0)) return res.status(400).json({ ok: false, error: "Richiesta non valida" });
+  const body = req.body || {};
+  const nota = body.nota === undefined ? undefined : (cleanText(body.nota, 2000) || null);
+  let assegnato: string | null | undefined = undefined;
+  if (body.assegnato_a !== undefined) {
+    if (body.assegnato_a === null || body.assegnato_a === "") assegnato = null;
+    else {
+      const u = await findSessionUser(String(body.assegnato_a));
+      if (!u) return res.status(400).json({ ok: false, error: "Utente non trovato" });
+      assegnato = u.username;
+    }
+  }
+  try {
+    await ensureFollowupsExtra();
+    const r = (await sql`
+      UPDATE followups SET
+        nota = CASE WHEN ${nota !== undefined}::boolean THEN ${nota ?? null} ELSE nota END,
+        assegnato_a = CASE WHEN ${assegnato !== undefined}::boolean THEN ${assegnato ?? null} ELSE assegnato_a END,
+        aggiornato_at = now(), aggiornato_da = ${req.session.username}
+      WHERE id = ${id}
+      RETURNING *
+    `) as any[];
+    if (!r[0]) return res.status(404).json({ ok: false, error: "Follow-up non trovato" });
+    res.json({ ok: true, followup: r[0] });
+  } catch (err) {
+    console.error("Errore aggiornamento follow-up:", err);
+    res.status(500).json({ ok: false, error: "Errore aggiornamento" });
+  }
+});
+
+// Nomi degli utenti (per assegnare i follow-up). Niente dati riservati.
+app.get("/api/utenti/nomi", requireAuth, async (_req, res) => {
+  const users = await readUsers();
+  res.json({ ok: true, utenti: users.map((u: any) => ({ username: u.username, nome: u.nome || u.username })) });
 });
 
 app.post("/api/followups/:id/done", requireAuth, express.json(), async (req, res) => {
@@ -544,6 +660,44 @@ app.get("/api/stats", requireAuth, async (req, res) => {
 
     const logStart = await safe(async () => ((await sql`SELECT MIN(created_at) AS inizio FROM campaign_log`) as any[])[0]?.inizio ?? null, null);
 
+    // Confronto tra voicebot e tra fasce orarie, dalle chiamate delle campagne del sito.
+    const confronto = await safe(async () => {
+      await ensureLiveSchema();
+      const righe = (await sql`
+        SELECT COALESCE(c.voicebot_nome, 'Voicebot predefinito') AS voicebot, l.stato, l.durata_ms,
+               extract(hour FROM l.updated_at AT TIME ZONE 'Europe/Rome')::int AS ora,
+               r.riassunto
+        FROM live_calls l
+        JOIN live_campaigns c ON c.id = l.campaign_id
+        LEFT JOIN call_results r ON r.call_id = l.call_id
+        WHERE l.updated_at >= ${da} AND l.stato IN ('risposta', 'interrotta', 'non_risposta', 'non_partita')
+        LIMIT 50000
+      `) as any[];
+      const vuoto = () => ({ chiamate: 0, risposte: 0, interrotte: 0, nonRaggiunte: 0, interessati: 0, durataTot: 0, durataN: 0 });
+      const perBot = new Map<string, ReturnType<typeof vuoto>>();
+      const perOra = new Map<number, ReturnType<typeof vuoto>>();
+      for (const r of righe) {
+        const ec = r.stato === "risposta" || r.stato === "interrotta" ? classificaEsitoCommerciale(r.riassunto) : null;
+        for (const [m, k] of [[perBot, r.voicebot], [perOra, r.ora]] as [Map<any, ReturnType<typeof vuoto>>, any][]) {
+          const a = m.get(k) || vuoto();
+          a.chiamate++;
+          if (r.stato === "risposta") { a.risposte++; if (r.durata_ms > 0) { a.durataTot += r.durata_ms; a.durataN++; } }
+          if (r.stato === "interrotta") a.interrotte++;
+          if (r.stato === "non_risposta" || r.stato === "non_partita") a.nonRaggiunte++;
+          if (ec === "interessato" || ec === "appuntamento") a.interessati++;
+          m.set(k, a);
+        }
+      }
+      const fuori = (a: ReturnType<typeof vuoto>) => ({
+        chiamate: a.chiamate, risposte: a.risposte, interrotte: a.interrotte, nonRaggiunte: a.nonRaggiunte, interessati: a.interessati,
+        durataMediaMs: a.durataN ? Math.round(a.durataTot / a.durataN) : null,
+      });
+      return {
+        perVoicebot: [...perBot.entries()].map(([voicebot, a]) => ({ voicebot, ...fuori(a) })).sort((x, y) => y.chiamate - x.chiamate),
+        perFascia: [...perOra.entries()].map(([ora, a]) => ({ ora, ...fuori(a) })).sort((x, y) => x.ora - y.ora),
+      };
+    }, { perVoicebot: [] as any[], perFascia: [] as any[] });
+
     res.json({
       ok: true,
       days,
@@ -555,6 +709,8 @@ app.get("/api/stats", requireAuth, async (req, res) => {
       perOperatore,
       pianificateInAttesa,
       registroCampagneDal: logStart,
+      perVoicebot: confronto.perVoicebot,
+      perFascia: confronto.perFascia,
     });
   } catch (err) {
     console.error("Errore /api/stats:", err);
@@ -715,6 +871,27 @@ app.post(
 
         if (motivoFollowup) {
           await createFollowup({ callId, numero, nome, motivo: motivoFollowup });
+        }
+
+        // ── Esito commerciale (campagne standard del sito) ──
+        const campagna = await campagnaDelNumero(numero);
+        const esitoComm = classificaEsitoCommerciale(riassunto);
+        if (esitoComm === "non_chiamare" && numero) {
+          // Ha chiesto di non essere più chiamato: entra nella lista "Non chiamare".
+          await aggiungiNonChiamare([{ numero, nome: nome || campagna?.nome }], "Chiesto durante la chiamata con il voicebot", "wilma", null)
+            .catch(err => console.error("Errore aggiunta Non chiamare da Wilma:", err));
+        }
+        if (campagna && campagna.tipo_campagna !== "appuntamenti" && !motivoFollowup) {
+          const nomeContatto = nome || campagna.nome || null;
+          const motivoComm = esitoComm === "appuntamento" ? "Appuntamento fissato"
+            : esitoComm === "interessato" ? "Cliente interessato"
+            : esitoComm === "richiamare" ? "Da richiamare (chiesto dal cliente)" : null;
+          if (motivoComm) {
+            const nuovo = await createFollowup({ callId, numero, nome: nomeContatto, motivo: motivoComm, assegnatoA: campagna.username || null });
+            if (nuovo && (esitoComm === "appuntamento" || esitoComm === "interessato")) {
+              await notificaClienteCaldo({ numero, nome: nomeContatto, esito: esitoComm, riassunto, campagna });
+            }
+          }
         }
         // È arrivato un riassunto: forse una campagna aspettava solo questo.
         await controllaFineCampagne();
@@ -1638,11 +1815,32 @@ interface CampaignSpec {
   scheduledAt: string | null;
   username?: string;
   scheduledId?: number | null;
+  // Richiamate automatiche dei non raggiunti (solo con la coda del sito).
+  retryMax?: number;
+  retryIntervalloMin?: number;
+}
+
+// Opzioni di richiamata ricevute dal browser: 0–3 tentativi in più, ogni 30 minuti – 24 ore.
+const RETRY_INTERVALLI_MIN = [30, 60, 120, 240, 1440];
+function parseRichiamate(raw: any): { retryMax: number; retryIntervalloMin: number } {
+  const n = Math.min(Math.max(parseInt(raw?.tentativi, 10) || 0, 0), 3);
+  const i = parseInt(raw?.intervalloMin, 10);
+  return { retryMax: n, retryIntervalloMin: RETRY_INTERVALLI_MIN.includes(i) ? i : 120 };
 }
 
 // Invia una campagna a Make a blocchi. Usata sia per il lancio immediato sia
 // per le campagne pianificate quando arriva il loro orario.
 async function sendCampaignToMake(spec: CampaignSpec) {
+  // I numeri nella lista "Non chiamare" non partono mai.
+  const esclusi = await numeriNonChiamare(spec.contacts.map(c => c.numero));
+  if (esclusi.size > 0) {
+    const tutti = spec.contacts;
+    spec = { ...spec, contacts: tutti.filter(c => !esclusi.has(normalizePhone(c.numero) || c.numero)) };
+  }
+  const esclusiContatti = esclusi.size;
+  if (spec.contacts.length === 0) {
+    return { dryRun: isCallsDryRun(), sentContacts: [] as LaunchContact[], failedContacts: [] as LaunchContact[], chunksOk: 0, chunksTotal: 0, esclusi: esclusiContatti };
+  }
   const chunks: LaunchContact[][] = [];
   for (let i = 0; i < spec.contacts.length; i += spec.chunkSize) chunks.push(spec.contacts.slice(i, i + spec.chunkSize));
 
@@ -1651,7 +1849,7 @@ async function sendCampaignToMake(spec: CampaignSpec) {
   const dryRun = isCallsDryRun();
 
   if (!dryRun && isCodaSito()) {
-    const concurrency = Math.min(Math.max(spec.chunkSize || 1, 1), maxSimultanee());
+    const concurrency = Math.min(Math.max(spec.chunkSize || 1, 1), maxSimultanee(spec.campaignType));
     const payloadBase = {
       tipo_campagna: spec.campaignType,
       avviatoIl,
@@ -1669,7 +1867,7 @@ async function sendCampaignToMake(spec: CampaignSpec) {
       await upsertContactNames(spec.contacts);
       await pumpCampaign(codaId);
       // I contatti sono tutti in coda: chi non parte compare in "In diretta" come errore.
-      return { dryRun, sentContacts: spec.contacts, failedContacts: [] as LaunchContact[], chunksOk: 1, chunksTotal: 1 };
+      return { dryRun, sentContacts: spec.contacts, failedContacts: [] as LaunchContact[], chunksOk: 1, chunksTotal: 1, esclusi: esclusiContatti };
     }
     // Database non disponibile: si usa l'invio classico.
   }
@@ -1712,7 +1910,7 @@ async function sendCampaignToMake(spec: CampaignSpec) {
     await recordLiveCalls(liveId, chunks, results);
     if (results.some(ok => !ok)) await inviaEsitiFalliti(liveId);
   }
-  return { dryRun, sentContacts, failedContacts, chunksOk: results.filter(Boolean).length, chunksTotal: chunks.length };
+  return { dryRun, sentContacts, failedContacts, chunksOk: results.filter(Boolean).length, chunksTotal: chunks.length, esclusi: esclusiContatti };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1815,6 +2013,12 @@ function ensureLiveSchema(): Promise<void> {
       // così non partono email per campagne vecchie.
       await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS riepilogo_inviato_at TIMESTAMPTZ DEFAULT now()`;
       await sql!`ALTER TABLE live_campaigns ALTER COLUMN riepilogo_inviato_at DROP DEFAULT`;
+      // Pausa e stop della campagna, richiamate automatiche dei non raggiunti.
+      await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS in_pausa BOOLEAN NOT NULL DEFAULT false`;
+      await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS fermata_at TIMESTAMPTZ`;
+      await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS fermata_da TEXT`;
+      await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS retry_max INT NOT NULL DEFAULT 0`;
+      await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS retry_intervallo_min INT NOT NULL DEFAULT 120`;
       await sql!`
         CREATE TABLE IF NOT EXISTS live_calls (
           id          SERIAL PRIMARY KEY,
@@ -1835,6 +2039,10 @@ function ensureLiveSchema(): Promise<void> {
       // il contatto aspetta il suo turno.
       await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS inviata_at TIMESTAMPTZ DEFAULT now()`;
       await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS dati JSONB`;
+      // Richiamate: numero del tentativo, quando può ripartire, esito del tentativo prima.
+      await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS tentativo INT NOT NULL DEFAULT 1`;
+      await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS programmata_at TIMESTAMPTZ`;
+      await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS esito_precedente TEXT`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_coda ON live_calls (campaign_id, stato, inviata_at)`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_numero ON live_calls (numero, queued_at DESC)`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_campaign ON live_calls (campaign_id)`;
@@ -1857,12 +2065,13 @@ async function createLiveCampaign(
     await ensureLiveSchema();
     const rows = (await sql`
       INSERT INTO live_campaigns (username, operatore, tipo_campagna, voicebot_nome, voicebot_exten, totale, scheduled_id, webhook_esiti,
-                                  modalita_coda, concurrency, webhook_url, payload_base)
+                                  modalita_coda, concurrency, webhook_url, payload_base, retry_max, retry_intervallo_min)
       VALUES (${spec.username || null}, ${spec.operatore || null}, ${spec.campaignType}, ${spec.bot?.nome || null},
               ${spec.bot?.exten != null ? String(spec.bot.exten) : null}, ${spec.contacts.length}, ${spec.scheduledId ?? null},
               ${webhookEsitiValido(spec.bot?.webhookEsiti)},
               ${!!coda}, ${coda?.concurrency ?? 1}, ${coda?.webhookUrl ?? null},
-              ${coda ? JSON.stringify(coda.payloadBase) : null}::jsonb)
+              ${coda ? JSON.stringify(coda.payloadBase) : null}::jsonb,
+              ${coda ? spec.retryMax || 0 : 0}, ${spec.retryIntervalloMin || 120})
       RETURNING id
     `) as any[];
     return rows[0]?.id ?? null;
@@ -1894,22 +2103,183 @@ async function recordLiveCalls(campaignId: number, chunks: LaunchContact[][], re
   }
 }
 
-// ── Coda gestita dal sito (CAMPAIGN_QUEUE_MODE=sito) ──
-// Lo scenario Make con la coda "sequenziale" fa una chiamata alla volta.
-// In questa modalità invece il sito tiene la coda: manda a Make un contatto
-// per esecuzione e al massimo N chiamate in corso per campagna. Quando una
-// chiamata finisce (esito da Make o fine chiamata da Wildix) parte la
-// successiva. Il timer (/api/cron/tick) fa ripartire le code rimaste ferme.
-function isCodaSito(): boolean {
-  return (process.env.CAMPAIGN_QUEUE_MODE || "").trim().toLowerCase() === "sito";
+// ── Orari consentiti ──
+// Un Admin sceglie giorni e fasce orarie (ora italiana) in cui si può
+// chiamare. Fuori orario le code non mandano contatti a Make: le chiamate
+// aspettano la prossima apertura (anche il giorno dopo). Spenti finché un
+// Admin non li attiva.
+interface Fascia { da: string; a: string }
+interface OrariConsentiti { attivo: boolean; giorni: number[]; fasce: Fascia[] }
+const ORARI_PREDEFINITI: OrariConsentiti = {
+  attivo: false,
+  giorni: [1, 2, 3, 4, 5],
+  fasce: [{ da: "09:00", a: "13:00" }, { da: "14:30", a: "18:30" }],
+};
+const GIORNI_BREVI = ["dom", "lun", "mar", "mer", "gio", "ven", "sab"];
+
+function minutiOra(hhmm: string): number {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm || "");
+  return m ? Math.min(parseInt(m[1], 10), 24) * 60 + Math.min(parseInt(m[2], 10), 59) : -1;
 }
-function maxSimultanee(): number {
-  return Math.min(Math.max(parseInt(process.env.MAX_CHIAMATE_SIMULTANEE || "3", 10) || 3, 1), 10);
+
+function validaOrari(raw: any): OrariConsentiti | null {
+  if (!raw || typeof raw !== "object") return null;
+  const giorni = [...new Set((Array.isArray(raw.giorni) ? raw.giorni : []).map((g: any) => parseInt(g, 10)))]
+    .filter((g: any) => Number.isInteger(g) && g >= 0 && g <= 6) as number[];
+  const fasce: Fascia[] = (Array.isArray(raw.fasce) ? raw.fasce : []).slice(0, 4)
+    .map((f: any) => ({ da: String(f?.da || "").trim(), a: String(f?.a || "").trim() }))
+    .filter((f: Fascia) => minutiOra(f.da) >= 0 && minutiOra(f.a) > minutiOra(f.da))
+    .sort((x: Fascia, y: Fascia) => minutiOra(x.da) - minutiOra(y.da));
+  const attivo = raw.attivo === true;
+  if (attivo && (giorni.length === 0 || fasce.length === 0)) return null;
+  return { attivo, giorni: giorni.sort(), fasce };
+}
+
+let orariCache: { v: OrariConsentiti; t: number } | null = null;
+async function leggiOrari(): Promise<OrariConsentiti> {
+  if (orariCache && Date.now() - orariCache.t < 30_000) return orariCache.v;
+  let v = ORARI_PREDEFINITI;
+  if (sql) {
+    try {
+      await ensureAppState();
+      const r = (await sql`SELECT value FROM app_state WHERE key = 'orari'`) as any[];
+      if (r[0]?.value) v = validaOrari(JSON.parse(r[0].value)) || ORARI_PREDEFINITI;
+    } catch (err) {
+      console.error("Errore lettura orari consentiti:", err);
+    }
+  }
+  orariCache = { v, t: Date.now() };
+  return v;
+}
+
+// Giorno della settimana, data e minuti dall'inizio del giorno, in ora italiana.
+function parteRoma(d: Date): { y: number; m: number; g: number; dow: number; min: number } {
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Rome", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23", weekday: "short",
+  }).formatToParts(d).map(x => [x.type, x.value]));
+  const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(p.weekday);
+  return { y: +p.year, m: +p.month, g: +p.day, dow, min: +p.hour * 60 + +p.minute };
+}
+
+// L'istante UTC di una data e ora italiane (gestisce l'ora legale).
+function daOraRoma(y: number, m: number, g: number, minuti: number): Date {
+  const guess = Date.UTC(y, m - 1, g, Math.floor(minuti / 60), minuti % 60);
+  let t = guess;
+  for (let i = 0; i < 2; i++) {
+    const p = parteRoma(new Date(t));
+    const visto = Date.UTC(p.y, p.m - 1, p.g, Math.floor(p.min / 60), p.min % 60);
+    t += guess - visto;
+  }
+  return new Date(t);
+}
+
+function dentroOrari(o: OrariConsentiti, d: Date): boolean {
+  if (!o.attivo) return true;
+  const p = parteRoma(d);
+  return o.giorni.includes(p.dow) && o.fasce.some(f => p.min >= minutiOra(f.da) && p.min < minutiOra(f.a));
+}
+
+// Il primo istante, da "d" in poi, in cui si può chiamare.
+function prossimaApertura(o: OrariConsentiti, d: Date): Date | null {
+  if (dentroOrari(o, d)) return d;
+  const p = parteRoma(d);
+  for (let k = 0; k <= 7; k++) {
+    const giorno = new Date(Date.UTC(p.y, p.m - 1, p.g + k));
+    const dow = giorno.getUTCDay();
+    if (!o.giorni.includes(dow)) continue;
+    for (const f of o.fasce) {
+      const t = daOraRoma(giorno.getUTCFullYear(), giorno.getUTCMonth() + 1, giorno.getUTCDate(), minutiOra(f.da));
+      if (t.getTime() > d.getTime()) return t;
+    }
+  }
+  return null;
+}
+
+function descriviOrari(o: OrariConsentiti): string {
+  if (!o.attivo) return "sempre";
+  return `${o.giorni.map(g => GIORNI_BREVI[g]).join(", ")} · ${o.fasce.map(f => `${f.da}–${f.a}`).join(", ")}`;
+}
+
+// ── Lista "Non chiamare" ──
+// Numeri da non chiamare mai: chi lo ha chiesto, clienti attivi, numeri
+// sbagliati. Vengono tolti da ogni campagna, anche da quelle già in coda.
+// Wilma aggiunge da sola chi chiede di non essere più contattato.
+let dncReady: Promise<void> | null = null;
+function ensureDncSchema(): Promise<void> {
+  if (!dncReady) {
+    dncReady = sql!`
+      CREATE TABLE IF NOT EXISTS do_not_call (
+        numero     TEXT PRIMARY KEY,
+        nome       TEXT,
+        motivo     TEXT,
+        fonte      TEXT        NOT NULL DEFAULT 'manuale',
+        created_by TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `.then(() => undefined).catch(err => { dncReady = null; throw err; });
+  }
+  return dncReady;
+}
+
+async function numeriNonChiamare(numeri: string[]): Promise<Set<string>> {
+  if (!sql || numeri.length === 0) return new Set();
+  try {
+    await ensureDncSchema();
+    const norm = [...new Set(numeri.map(n => normalizePhone(n) || n))];
+    const rows = (await sql`SELECT numero FROM do_not_call WHERE numero = ANY(${norm}::text[])`) as any[];
+    return new Set(rows.map(r => r.numero));
+  } catch (err) {
+    console.error("Errore lettura lista Non chiamare:", err);
+    return new Set();
+  }
+}
+
+async function aggiungiNonChiamare(voci: { numero: string; nome?: string | null }[], motivo: string | null, fonte: string, autore: string | null): Promise<number> {
+  const mappa = new Map<string, string | null>();
+  for (const v of voci) {
+    const n = normalizePhone(v.numero);
+    if (n && /^\+?\d{6,15}$/.test(n)) mappa.set(n, v.nome ? String(v.nome).slice(0, 200) : null);
+  }
+  if (!sql || mappa.size === 0) return 0;
+  await ensureDncSchema();
+  const numeri = [...mappa.keys()];
+  const nomi = numeri.map(n => mappa.get(n) || null);
+  const r = (await sql`
+    INSERT INTO do_not_call (numero, nome, motivo, fonte, created_by)
+    SELECT n, nm, ${motivo}, ${fonte}, ${autore} FROM unnest(${numeri}::text[], ${nomi}::text[]) AS t(n, nm)
+    ON CONFLICT (numero) DO UPDATE SET nome = COALESCE(do_not_call.nome, EXCLUDED.nome)
+    RETURNING (xmax = 0) AS nuovo
+  `) as any[];
+  return r.filter(x => x.nuovo).length;
+}
+
+// ── Coda gestita dal sito (modalità predefinita) ──
+// Il sito tiene la coda: manda a Make un contatto per esecuzione e al massimo
+// N chiamate in corso per campagna. Quando una chiamata finisce (esito da Make
+// o fine chiamata da Wildix) parte la successiva. Così si possono mettere in
+// pausa le campagne, rispettare gli orari consentiti, richiamare i non
+// raggiunti e saltare i numeri "Non chiamare". Il timer (/api/cron/tick) fa
+// ripartire le code rimaste ferme.
+// CAMPAIGN_QUEUE_MODE=make torna al vecchio invio: tutta la lista a Make.
+function isCodaSito(): boolean {
+  return (process.env.CAMPAIGN_QUEUE_MODE || "").trim().toLowerCase() !== "make";
+}
+// Chiamate contemporanee per campagna. Standard: 1, perché lo scenario Make
+// aspetta la risposta del cliente e lavora una richiesta alla volta (per
+// alzarlo va tolta l'elaborazione sequenziale in Make). Appuntamenti: 3,
+// perché lo scenario avvia la chiamata senza aspettare.
+function maxSimultanee(tipo: string = "standard"): number {
+  const env = tipo === "appuntamenti" ? process.env.MAX_CHIAMATE_SIMULTANEE_APPUNTAMENTI : process.env.MAX_CHIAMATE_SIMULTANEE;
+  const def = tipo === "appuntamenti" ? 3 : 1;
+  return Math.min(Math.max(parseInt(env || String(def), 10) || def, 1), 10);
 }
 // Una chiamata passata a Make occupa un posto finché non ha un esito. Senza
 // notizie entro questi tempi il posto si libera, così la coda non si blocca.
 const CODA_ATTESA_MAKE_MIN = 10;
-const CODA_DURATA_MAX_MIN = 20;
+const CODA_DURATA_MAX_MIN = 15;
+// Le code (richiamate comprese) restano attive al massimo per questi giorni.
+const CODA_GIORNI_MAX = 7;
 
 async function recordQueuedCalls(campaignId: number, contacts: LaunchContact[]): Promise<boolean> {
   if (!sql) return false;
@@ -1938,11 +2308,12 @@ async function claimNextCalls(campaignId: number): Promise<any[]> {
     sql!`
       UPDATE live_calls l SET inviata_at = now(), updated_at = now()
       FROM live_campaigns c
-      WHERE c.id = ${campaignId} AND c.modalita_coda AND l.campaign_id = c.id
+      WHERE c.id = ${campaignId} AND c.modalita_coda AND NOT c.in_pausa AND c.fermata_at IS NULL AND l.campaign_id = c.id
         AND l.id IN (
           SELECT id FROM live_calls
           WHERE campaign_id = ${campaignId} AND stato = 'in_coda' AND inviata_at IS NULL
-          ORDER BY id
+            AND (programmata_at IS NULL OR programmata_at <= now())
+          ORDER BY tentativo, id
           LIMIT GREATEST(0,
             (SELECT concurrency FROM live_campaigns WHERE id = ${campaignId})
             - (SELECT count(*) FROM live_calls
@@ -1962,7 +2333,11 @@ async function pumpCampaign(campaignId: number | null | undefined): Promise<numb
   let inviati = 0;
   try {
     await ensureLiveSchema();
-    for (let giro = 0; giro < 5; giro++) {
+    await programmaRichiamate(campaignId);
+    await escludiNonChiamare(campaignId);
+    // Fuori dagli orari consentiti non parte nessuno: ci pensa la sveglia all'apertura.
+    const aperto = dentroOrari(await leggiOrari(), new Date());
+    for (let giro = 0; aperto && giro < 5; giro++) {
       const presi = await claimNextCalls(campaignId);
       if (presi.length === 0) break;
       const esiti = await Promise.all(presi.map(row => {
@@ -1992,6 +2367,35 @@ async function pumpCampaign(campaignId: number | null | undefined): Promise<numb
   return inviati;
 }
 
+// Non raggiunti (rifiutata, occupato, senza risposta): se la campagna prevede
+// richiamate e restano tentativi, il contatto torna in coda e ripartirà dopo
+// l'intervallo scelto. L'esito va allo Sheets solo dopo l'ultimo tentativo.
+async function programmaRichiamate(campaignId: number): Promise<number> {
+  const r = (await sql!`
+    UPDATE live_calls l SET
+      stato = 'in_coda', inviata_at = NULL, esito_precedente = l.stato,
+      tentativo = l.tentativo + 1, call_id = NULL, durata_ms = NULL,
+      programmata_at = now() + make_interval(mins => c.retry_intervallo_min),
+      updated_at = now()
+    FROM live_campaigns c
+    WHERE l.campaign_id = ${campaignId} AND c.id = l.campaign_id
+      AND c.modalita_coda AND c.fermata_at IS NULL AND l.tentativo <= c.retry_max
+      AND l.stato IN ('non_partita', 'non_risposta') AND l.esito_inviato = false
+    RETURNING l.id
+  `) as any[];
+  return r.length;
+}
+
+// Numeri entrati nella lista "Non chiamare" mentre aspettavano in coda.
+async function escludiNonChiamare(campaignId: number): Promise<void> {
+  await ensureDncSchema();
+  await sql!`
+    UPDATE live_calls l SET stato = 'escluso', errore = 'Nella lista Non chiamare', programmata_at = NULL, updated_at = now()
+    FROM do_not_call d
+    WHERE l.campaign_id = ${campaignId} AND l.stato = 'in_coda' AND l.inviata_at IS NULL AND d.numero = l.numero
+  `;
+}
+
 // Lavoro del timer sulle code: chiude le chiamate rimaste senza risposta da
 // Make e fa ripartire le campagne con contatti in attesa.
 async function pumpAllQueues(): Promise<{ campagne: number; inviati: number; scadute: number }> {
@@ -2009,7 +2413,10 @@ async function pumpAllQueues(): Promise<{ campagne: number; inviati: number; sca
   `) as any[];
   const conCoda = (await sql`
     SELECT DISTINCT l.campaign_id FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
-    WHERE c.modalita_coda AND l.stato = 'in_coda' AND l.inviata_at IS NULL AND l.queued_at > now() - interval '24 hours'
+    WHERE c.modalita_coda AND NOT c.in_pausa AND c.fermata_at IS NULL
+      AND l.queued_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int)
+      AND ((l.stato = 'in_coda' AND l.inviata_at IS NULL AND (l.programmata_at IS NULL OR l.programmata_at <= now()))
+        OR (l.stato IN ('non_partita', 'non_risposta') AND l.tentativo <= c.retry_max AND l.esito_inviato = false))
   `) as any[];
   const ids = [...new Set([...scadute.map(r => r.campaign_id), ...conCoda.map(r => r.campaign_id)])];
   let inviati = 0;
@@ -2036,20 +2443,24 @@ async function controllaFineCampagne(soloId?: number | null): Promise<void> {
       WITH stato AS (
         SELECT c.id,
           max(l.updated_at) AS ultimo,
-          count(*) FILTER (WHERE l.stato IN ('in_coda', 'avviata')) AS aperte,
+          count(*) FILTER (WHERE l.stato IN ('in_coda', 'avviata')
+            OR (l.stato IN ('non_partita', 'non_risposta') AND c.modalita_coda AND c.fermata_at IS NULL
+                AND l.tentativo <= c.retry_max AND l.esito_inviato = false)) AS aperte,
+          -- Contatti che aspettano il loro turno (pausa, orari, richiamata): la campagna non è ferma.
+          count(*) FILTER (WHERE l.stato = 'in_coda' AND l.inviata_at IS NULL) AS da_inviare,
           count(*) FILTER (WHERE l.stato = 'risposta' AND NOT EXISTS (
             SELECT 1 FROM call_results r
             WHERE r.riassunto IS NOT NULL
               AND (r.call_id = l.call_id OR (r.numero = l.numero AND r.ts::timestamptz > c.created_at))
           )) AS senza_riassunto
         FROM live_campaigns c JOIN live_calls l ON l.campaign_id = c.id
-        WHERE c.riepilogo_inviato_at IS NULL AND c.created_at > now() - interval '24 hours'
+        WHERE c.riepilogo_inviato_at IS NULL AND c.created_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int)
           AND (${soloId ?? null}::int IS NULL OR c.id = ${soloId ?? null}::int)
         GROUP BY c.id
       )
       SELECT id FROM stato
       WHERE (aperte = 0 AND (senza_riassunto = 0 OR ultimo < now() - make_interval(mins => ${FINE_ATTESA_RIASSUNTI_MIN}::int)))
-         OR ultimo < now() - make_interval(mins => ${FINE_MAX_INATTIVITA_MIN}::int)
+         OR (da_inviare = 0 AND ultimo < now() - make_interval(mins => ${FINE_MAX_INATTIVITA_MIN}::int))
     `) as any[];
     for (const { id } of pronte) {
       // Una sola richiesta "prende" la campagna: l'email parte una volta sola.
@@ -2065,6 +2476,46 @@ async function controllaFineCampagne(soloId?: number | null): Promise<void> {
   }
 }
 
+// ── Esito commerciale ──
+// Dal riassunto di Wilma: com'è andata per il commerciale, oltre all'esito
+// tecnico (risposto / non risposto). Regole sulle parole del riassunto, in
+// quest'ordine: chi non vuole essere chiamato, chi rifiuta, appuntamento,
+// interessato, richiamare. Senza una regola che corrisponde: "da valutare".
+type EsitoCommerciale = "non_chiamare" | "non_interessato" | "appuntamento" | "richiamare" | "interessato" | "da_valutare";
+const ESITO_COMMERCIALE_LABEL: Record<EsitoCommerciale, { label: string; bg: string; fg: string }> = {
+  appuntamento: { label: "Appuntamento", bg: "#dcfce7", fg: "#166534" },
+  interessato: { label: "Interessato", bg: "#dbeafe", fg: "#1e40af" },
+  richiamare: { label: "Da richiamare", bg: "#ede9fe", fg: "#5b21b6" },
+  non_interessato: { label: "Non interessato", bg: "#f1f5f9", fg: "#475569" },
+  non_chiamare: { label: "Non chiamare", bg: "#fee2e2", fg: "#991b1b" },
+  da_valutare: { label: "Da valutare", bg: "#f8fafc", fg: "#64748b" },
+};
+const RE_NON_CHIAMARE = /(non (vuole|vogliono|desidera|desiderano) (pi[uù] )?essere (ri)?(contattat|chiamat|disturbat)|di non essere (pi[uù] )?(ri)?(contattat|chiamat|disturbat)|non (mi|lo|la|ci|li|le) (chiamate|contattate|richiamate|disturbate) pi[uù]|(non (deve|devono) (pi[uù] )?(essere )?(ri)?(chiamar|contattar))|(rimozion|rimuover|cancellar|cancellazion|eliminar)\w*.{0,50}(numer|nominativ|dati|lista|elenc|contatt)|registro (pubblico )?(delle |dell'?)?opposizion|non disturbar|smettere di (chiamar|contattar)|stop (alle )?chiamate|chiamate indesiderate)/;
+const RE_NON_INTERESSATO = /(non (è|e'|sono|risulta|risultano|si dichiara|si è detto|si e' detto|appare) (\w+ )?interessat|nessun interesse|non (ha|hanno|mostra|mostrano|manifesta) (alcun |nessun )?interesse|disinteress|rifiut|non conferm|disdett|disdic|annullat\w* l'appuntamento|non (gli|le|ci) interessa|non interessa|gi[aà] (un |altro )?fornitore|gi[aà] (soddisfatt|servit|client)|non ne (ha|hanno) bisogno|non (gli|le) serve|non serve)/;
+const RE_APPUNTAMENTO = /((appuntament|incontr|demo|dimostrazion|sopralluog|videochiamat|visita|consulenz)\w*.{0,50}(fissat|confermat|concordat|prenotat|programmat|issat|stabilit|accettat)|(fissat|concordat|prenotat|conferm|programmat|accetta)\w*.{0,40}(appuntament|incontr|demo|dimostrazion|sopralluog|videochiamat|visita|consulenz))/;
+const RE_RICHIAMARE = /(richiam|ricontatt|risentir|chiamare (pi[uù] )?tardi|(in un |un )?altro momento|un altro giorno|(era|è|e') occupat|non (pu[oò]|poteva|potevano) parlare|ripassare|inviare (una |un'?)?(e-?mail|informazion|preventiv|materiale|brochure)|mandare (una |un'?)?(e-?mail|informazion|preventiv)|pi[uù] tardi)/;
+const RE_INTERESSATO = /(interessat|interesse|vuole (sapere|ricevere|avere|un preventivo|maggiori|approfondire)|chiede(va|ndo)? (informazion|un preventivo|dettagli|maggiori|costi|prezz)|preventiv|valutare (l'offerta|la proposta|il servizio)|curios|disponibil\w* a (ricevere|valutare|approfondire|un incontro))/;
+
+function leggiRiassunto(v: any): any {
+  if (v == null) return null;
+  if (typeof v !== "string") return v;
+  try { return JSON.parse(v); } catch { return { testo: v }; }
+}
+
+function classificaEsitoCommerciale(riassuntoRaw: any): EsitoCommerciale | null {
+  const r = leggiRiassunto(riassuntoRaw);
+  if (!r) return null;
+  const testo = [r.titolo, r.testo, ...(Array.isArray(r.decisioni) ? r.decisioni : []), ...(Array.isArray(r.problemi) ? r.problemi : [])]
+    .filter(x => typeof x === "string").join(" ").toLowerCase().replace(/\s+/g, " ");
+  if (!testo.trim()) return null;
+  if (RE_NON_CHIAMARE.test(testo)) return "non_chiamare";
+  if (RE_NON_INTERESSATO.test(testo)) return "non_interessato";
+  if (RE_APPUNTAMENTO.test(testo)) return "appuntamento";
+  if (RE_INTERESSATO.test(testo)) return "interessato";
+  if (RE_RICHIAMARE.test(testo)) return "richiamare";
+  return "da_valutare";
+}
+
 const ESITO_LABEL: Record<string, { label: string; bg: string; fg: string }> = {
   risposta: { label: "Risposto", bg: "#dcfce7", fg: "#166534" },
   interrotta: { label: "Interrotta", bg: "#fef3c7", fg: "#92400e" },
@@ -2073,6 +2524,8 @@ const ESITO_LABEL: Record<string, { label: string; bg: string; fg: string }> = {
   errore: { label: "Errore", bg: "#fee2e2", fg: "#991b1b" },
   in_coda: { label: "Senza esito", bg: "#f1f5f9", fg: "#64748b" },
   avviata: { label: "Senza esito", bg: "#f1f5f9", fg: "#64748b" },
+  annullata: { label: "Annullata", bg: "#f1f5f9", fg: "#64748b" },
+  escluso: { label: "Non chiamare", bg: "#fee2e2", fg: "#991b1b" },
 };
 
 // Tutte le chiamate di una campagna con il riassunto e la trascrizione di
@@ -2081,6 +2534,7 @@ const ESITO_LABEL: Record<string, { label: string; bg: string; fg: string }> = {
 async function chiamateCampagna(campaignId: number, createdAt: any): Promise<any[]> {
   return (await sql!`
     SELECT l.id, l.nome, l.numero, l.stato, l.errore, l.durata_ms, l.queued_at, l.updated_at,
+      l.tentativo, l.programmata_at, l.esito_precedente, l.inviata_at,
       r.riassunto, r.trascrizione
     FROM live_calls l
     LEFT JOIN LATERAL (
@@ -2110,6 +2564,8 @@ async function inviaRiepilogoCampagna(c: any): Promise<void> {
   const nonRisposte = conta(["non_risposta", "non_partita"]);
   const errori = conta(["errore"]);
   const senzaEsito = conta(["in_coda", "avviata"]);
+  const commerciale = (r: any) => (r.stato === "risposta" || r.stato === "interrotta") ? classificaEsitoCommerciale(r.riassunto) : null;
+  const interessati = righe.filter(r => ["interessato", "appuntamento"].includes(commerciale(r) || "")).length;
   const durate = righe.filter(r => r.stato === "risposta" && r.durata_ms > 0).map(r => r.durata_ms / 1000);
   const durataMedia = durate.length ? Math.round(durate.reduce((a, b) => a + b, 0) / durate.length) : 0;
   const mmss = (sec: number) => `${Math.floor(sec / 60)}:${String(Math.round(sec % 60)).padStart(2, "0")}`;
@@ -2139,7 +2595,11 @@ async function inviaRiepilogoCampagna(c: any): Promise<void> {
     ["Tipo", c.tipo_campagna === "appuntamenti" ? "Conferma appuntamenti" : "Standard"],
     ["Avviata", quando(new Date(c.created_at))],
     ...(durate.length ? [["Durata media risposte", mmss(durataMedia)] as [string, string]] : []),
+    ...(interessati ? [["Interessati o appuntamenti", String(interessati)] as [string, string]] : []),
     ...(errori ? [["Errori", String(errori)] as [string, string]] : []),
+    ...(c.retry_max ? [["Richiamate dei non raggiunti", `fino a ${c.retry_max} ${c.retry_max === 1 ? "volta" : "volte"}`] as [string, string]] : []),
+    ...(conta(["escluso"]) ? [["Esclusi (Non chiamare)", String(conta(["escluso"]))] as [string, string]] : []),
+    ...(conta(["annullata"]) ? [["Annullate (campagna fermata)", String(conta(["annullata"]))] as [string, string]] : []),
     ...(c.operatore ? [["Lanciata da", c.operatore] as [string, string]] : []),
   ];
   const datiRows = dati.map(([k, v], i) => {
@@ -2149,16 +2609,19 @@ async function inviaRiepilogoCampagna(c: any): Promise<void> {
 
   const MAX_RIGHE_EMAIL = 200;
   // Prima le risposte (con il riassunto), poi le altre.
-  const ordine = ["risposta", "interrotta", "non_risposta", "non_partita", "errore", "avviata", "in_coda"];
+  const ordine = ["risposta", "interrotta", "non_risposta", "non_partita", "errore", "avviata", "in_coda", "escluso", "annullata"];
   const ordinate = [...righe].sort((a, b) => ordine.indexOf(a.stato) - ordine.indexOf(b.stato));
   const callRows = ordinate.slice(0, MAX_RIGHE_EMAIL).map(r => {
     const e = ESITO_LABEL[r.stato] || ESITO_LABEL.in_coda;
+    const ec = commerciale(r);
+    const ecl = ec && ec !== "da_valutare" ? ESITO_COMMERCIALE_LABEL[ec] : null;
     const riass = testoRiassunto(r);
     const extra = riass ? escapeHtml(riass.length > 320 ? riass.slice(0, 317) + "…" : riass)
       : r.stato === "non_partita" || r.stato === "errore" ? escapeHtml(r.errore || "") : "";
     return `<tr><td style="padding:12px 0;border-bottom:1px solid #eef1f6;vertical-align:top;">
       <div style="font-size:14px;font-weight:600;color:#0f172a;">${escapeHtml(r.nome || r.numero)}
         <span style="display:inline-block;margin-left:6px;background:${e.bg};color:${e.fg};font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;">${e.label}</span>
+        ${ecl ? `<span style="display:inline-block;margin-left:4px;background:${ecl.bg};color:${ecl.fg};font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;">${ecl.label}</span>` : ""}
         ${r.stato === "risposta" && r.durata_ms ? `<span style="font-size:12px;color:#94a3b8;font-weight:400;margin-left:4px;">${mmss(r.durata_ms / 1000)}</span>` : ""}</div>
       <div style="font-size:12px;color:#94a3b8;margin-top:2px;">${escapeHtml(r.numero)}</div>
       ${extra ? `<div style="font-size:13px;color:#475569;line-height:1.5;margin-top:6px;">${extra}</div>` : ""}
@@ -2200,9 +2663,10 @@ async function inviaRiepilogoCampagna(c: any): Promise<void> {
   // CSV per Excel in italiano: punto e virgola e BOM UTF-8.
   const cella = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""').replace(/\r?\n/g, " ")}"`;
   const csv = "﻿" + [
-    ["Nome", "Numero", "Esito", "Durata (secondi)", "Riassunto", "Dettaglio"].map(cella).join(";"),
+    ["Nome", "Numero", "Esito", "Esito commerciale", "Tentativi", "Durata (secondi)", "Riassunto", "Dettaglio"].map(cella).join(";"),
     ...ordinate.map(r => [
       r.nome || "", r.numero, (ESITO_LABEL[r.stato] || ESITO_LABEL.in_coda).label,
+      commerciale(r) ? ESITO_COMMERCIALE_LABEL[commerciale(r)!].label : "", r.tentativo || 1,
       r.durata_ms ? Math.round(r.durata_ms / 1000) : "", testoRiassunto(r), r.errore || "",
     ].map(cella).join(";")),
   ].join("\r\n");
@@ -2312,8 +2776,8 @@ async function markLiveCallCompleted(numero: string | null, risposto: boolean, d
       SELECT l.id, l.campaign_id, c.voicebot_exten
       FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
       WHERE l.numero = ${numero} AND l.stato = ANY(${LIVE_STATI_CORREGGIBILI}::text[]) AND l.inviata_at IS NOT NULL
-        AND l.queued_at > now() - interval '12 hours'
-      ORDER BY l.queued_at DESC
+        AND l.inviata_at > now() - interval '12 hours'
+      ORDER BY l.inviata_at DESC
     `) as any[];
     if (open.length === 0) return;
     const conBot = open.filter(r => r.voicebot_exten && rawEvent.includes(`"${r.voicebot_exten}"`));
@@ -2380,8 +2844,8 @@ app.post("/api/live/make-event", express.json({ limit: "20kb" }), express.urlenc
         SELECT id FROM live_calls
         WHERE numero = ${numero} AND stato = 'in_coda' AND inviata_at IS NOT NULL
           AND (${campaignId}::int IS NULL OR campaign_id = ${campaignId}::int)
-          AND queued_at > now() - interval '12 hours'
-        ORDER BY queued_at ASC LIMIT 1
+          AND inviata_at > now() - interval '12 hours'
+        ORDER BY inviata_at ASC LIMIT 1
       )
       RETURNING id, campaign_id
     `) as any[];
@@ -2448,8 +2912,14 @@ async function timerAttivo(): Promise<boolean> {
 // pianificata, oppure il controllo di fine campagna. Quando suona, il tick fa
 // il lavoro e ricalcola la sveglia successiva. Le chiamate alle API di Make
 // non consumano operazioni. Serve MAKE_API_TOKEN (permesso scenarios:write).
+//
+// Gli scenari sono due e si alternano: Make spegne uno scenario "una volta"
+// appena finisce di girare, quindi lo scenario che sta chiamando il tick non
+// si può riattivare da dentro il tick. Il tick arma l'altro, che è fermo.
+// Nell'URL di ogni scenario c'è ?s=1 o ?s=2, così il sito sa chi lo chiama.
 const MAKE_API_URL = (process.env.MAKE_API_URL || "https://eu1.make.com/api/v2").replace(/\/$/, "");
 const MAKE_TIMER_SCENARIO_ID = (process.env.MAKE_TIMER_SCENARIO_ID || "8130692").trim();
+const MAKE_TIMER_SCENARI = [...new Set([MAKE_TIMER_SCENARIO_ID, (process.env.MAKE_TIMER_SCENARIO_ID_2 || "8132573").trim()].filter(Boolean))];
 // Su Vercel la variabile è stata creata come MAKE_API_TOKE: si accettano entrambi i nomi.
 function makeApiToken(): string {
   return (process.env.MAKE_API_TOKEN || process.env.MAKE_API_TOKE || "").trim();
@@ -2478,22 +2948,51 @@ async function prossimaSveglia(): Promise<Date | null> {
   // Campagne che aspettano l'email di fine: allo scadere dell'attesa dei
   // riassunti (se le chiamate sono finite) o del limite di inattività.
   const aperte = (await sql!`
-    SELECT max(l.updated_at) AS ultimo, count(*) FILTER (WHERE l.stato IN ('in_coda', 'avviata')) AS aperte
+    SELECT max(l.updated_at) AS ultimo, count(*) FILTER (WHERE l.stato IN ('in_coda', 'avviata')) AS aperte,
+      count(*) FILTER (WHERE l.stato = 'in_coda' AND l.inviata_at IS NULL) AS da_inviare
     FROM live_campaigns c JOIN live_calls l ON l.campaign_id = c.id
-    WHERE c.riepilogo_inviato_at IS NULL AND c.created_at > now() - interval '24 hours'
+    WHERE c.riepilogo_inviato_at IS NULL AND c.created_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int)
     GROUP BY c.id
   `) as any[];
   for (const a of aperte) {
+    // Contatti che aspettano il turno: ci pensano i controlli delle code qui sotto.
+    if (Number(a.da_inviare) > 0) continue;
     const min = Number(a.aperte) === 0 ? FINE_ATTESA_RIASSUNTI_MIN : FINE_MAX_INATTIVITA_MIN;
     candidati.push(new Date(a.ultimo).getTime() + (min + 1) * 60_000);
   }
-  // Coda gestita dal sito: un controllo per le chiamate rimaste senza conferma.
-  if (isCodaSito()) {
-    const coda = (await sql!`
-      SELECT 1 FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
-      WHERE c.modalita_coda AND l.stato = 'in_coda' AND l.queued_at > now() - interval '24 hours' LIMIT 1
-    `) as any[];
-    if (coda.length) candidati.push(Date.now() + (CODA_ATTESA_MAKE_MIN + 1) * 60_000);
+  // Code del sito: quando si libera un posto bloccato, quando scade una
+  // richiamata, quando riaprono gli orari consentiti.
+  const code = (await sql!`
+    SELECT c.id,
+      count(*) FILTER (WHERE l.stato = 'in_coda' AND l.inviata_at IS NULL
+                         AND (l.programmata_at IS NULL OR l.programmata_at <= now())) AS pronte,
+      min(l.programmata_at) FILTER (WHERE l.stato = 'in_coda' AND l.inviata_at IS NULL AND l.programmata_at > now()) AS prossima_richiamata,
+      min(CASE WHEN l.stato = 'in_coda' AND l.inviata_at IS NOT NULL
+                 THEN l.inviata_at + make_interval(mins => ${CODA_ATTESA_MAKE_MIN}::int)
+               WHEN l.stato = 'avviata'
+                 THEN l.updated_at + make_interval(mins => ${CODA_DURATA_MAX_MIN}::int) END) AS scadenza_posto
+    FROM live_campaigns c JOIN live_calls l ON l.campaign_id = c.id
+    WHERE c.modalita_coda AND NOT c.in_pausa AND c.fermata_at IS NULL
+      AND l.stato IN ('in_coda', 'avviata') AND l.queued_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int)
+    GROUP BY c.id
+  `) as any[];
+  if (code.length) {
+    const orari = await leggiOrari();
+    const ora = new Date();
+    for (const q of code) {
+      if (q.scadenza_posto) candidati.push(new Date(q.scadenza_posto).getTime() + 60_000);
+      if (Number(q.pronte) > 0) {
+        // Contatti pronti: se gli orari sono chiusi, alla riapertura; se sono
+        // aperti e nessun posto è occupato, la coda è ferma: controllo a breve.
+        const ap = prossimaApertura(orari, ora);
+        if (ap && ap.getTime() > ora.getTime()) candidati.push(ap.getTime() + 30_000);
+        else if (!q.scadenza_posto) candidati.push(ora.getTime());
+      }
+      if (q.prossima_richiamata) {
+        const ap = prossimaApertura(orari, new Date(q.prossima_richiamata));
+        if (ap) candidati.push(ap.getTime() + 30_000);
+      }
+    }
   }
   if (!candidati.length) return null;
   // Make ha bisogno di un orario nel futuro.
@@ -2501,44 +3000,61 @@ async function prossimaSveglia(): Promise<Date | null> {
 }
 
 // dopoTick: la sveglia è appena suonata, quindi va sempre riprogrammata (o
-// spenta). Negli altri casi si cambia solo se va anticipata: una sveglia in
-// anticipo costa al massimo un'esecuzione, poi il tick la sposta.
-async function aggiornaSveglia(opts: { dopoTick?: boolean } = {}): Promise<void> {
+// spenta), sull'altro scenario. Negli altri casi si cambia solo se va
+// anticipata: una sveglia in anticipo costa al massimo un'esecuzione, poi il
+// tick la sposta.
+async function aggiornaSveglia(opts: { dopoTick?: boolean; chiamante?: string | null } = {}): Promise<void> {
   if (!sql || !svegliaConfigurata()) return;
   try {
     await ensureAppState();
     const prossima = await prossimaSveglia();
-    const cur = ((await sql`SELECT value FROM app_state WHERE key = 'sveglia'`) as any[])[0]?.value || "spenta";
+    const leggi = async (k: string) => ((await sql!`SELECT value FROM app_state WHERE key = ${k}`) as any[])[0]?.value as string | undefined;
+    const cur = (await leggi("sveglia")) || "spenta";
+    const armatoSalvato = await leggi("sveglia_scenario");
+    const armato = armatoSalvato && MAKE_TIMER_SCENARI.includes(armatoSalvato) ? armatoSalvato : MAKE_TIMER_SCENARI[0];
     const curData = cur !== "spenta" ? new Date(cur) : null;
     const curFutura = !!curData && curData.getTime() > Date.now();
     const salva = (k: string, v: string) => sql!`
       INSERT INTO app_state (key, value, updated_at) VALUES (${k}, ${v}, now())
       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`;
+    // Lo scenario che sta girando adesso si spegne da solo a fine esecuzione.
+    const inCorso = opts.dopoTick ? (opts.chiamante || armato) : null;
+    const ferma = async (id: string) => {
+      if (id === inCorso) return;
+      const r = await makeApi(`/scenarios/${id}/stop`, "POST");
+      if (!r.ok && r.status !== 400) console.error("Sveglia Make: stop non riuscito", id, r.status, r.testo);
+    };
 
     if (!prossima) {
       if (cur === "spenta" || (!opts.dopoTick && curFutura)) return;
-      const stop = await makeApi(`/scenarios/${MAKE_TIMER_SCENARIO_ID}/stop`, "POST");
-      if (!stop.ok && stop.status !== 400) console.error("Sveglia Make: stop non riuscito", stop.status, stop.testo);
+      await ferma(armato);
       await salva("sveglia", "spenta");
       return;
     }
     const daCambiare = opts.dopoTick || !curFutura || prossima.getTime() < curData!.getTime() - 30_000;
     if (!daCambiare) return;
 
-    const patch = await makeApi(`/scenarios/${MAKE_TIMER_SCENARIO_ID}`, "PATCH", {
+    // Dopo un tick si arma lo scenario fermo; altrimenti quello già armato.
+    const target = inCorso ? (MAKE_TIMER_SCENARI.find(id => id !== inCorso) || inCorso) : armato;
+    const patch = await makeApi(`/scenarios/${target}`, "PATCH", {
       scheduling: JSON.stringify({ type: "once", date: prossima.toISOString() }),
     });
     if (!patch.ok) {
-      console.error("Sveglia Make: programmazione non riuscita", patch.status, patch.testo);
+      console.error("Sveglia Make: programmazione non riuscita", target, patch.status, patch.testo);
       await salva("sveglia_stato", "errore");
       return;
     }
     // Avvia lo scenario (se è già attivo Make risponde con un errore innocuo).
-    const start = await makeApi(`/scenarios/${MAKE_TIMER_SCENARIO_ID}/start`, "POST");
+    const start = await makeApi(`/scenarios/${target}/start`, "POST");
     if (!start.ok && !/already|attiv|active/i.test(start.testo)) {
-      console.error("Sveglia Make: avvio non riuscito", start.status, start.testo);
+      console.error("Sveglia Make: avvio non riuscito", target, start.status, start.testo);
+      await salva("sveglia_stato", "errore");
+      return;
     }
+    // Una sola sveglia armata: l'altro scenario si ferma (se non sta girando).
+    if (target !== armato) await ferma(armato);
     await salva("sveglia", prossima.toISOString());
+    await salva("sveglia_scenario", target);
     await salva("sveglia_stato", "ok");
   } catch (err) {
     console.error("Errore sveglia Make (non bloccante):", err);
@@ -2567,7 +3083,10 @@ async function handleTick(req: any, res: any) {
     await dispatchDueCampaigns();
     const code = await pumpAllQueues();
     await controllaFineCampagne();
-    await aggiornaSveglia({ dopoTick: true });
+    // ?s=1 / ?s=2: quale dei due scenari sveglia sta chiamando.
+    const n = parseInt(String(req.query?.s || ""), 10);
+    const chiamante = n >= 1 && n <= MAKE_TIMER_SCENARI.length ? MAKE_TIMER_SCENARI[n - 1] : null;
+    await aggiornaSveglia({ dopoTick: true, chiamante });
     res.json({ ok: true, ...code });
   } catch (err) {
     console.error("Errore timer:", err);
@@ -2579,11 +3098,16 @@ app.get("/api/cron/tick", handleTick);
 
 // Impostazioni che l'interfaccia deve conoscere.
 app.get("/api/config", requireAuth, async (_req, res) => {
+  const orari = await leggiOrari();
   res.json({
     ok: true,
+    // In anteprima (prova) le chiamate sono simulate: niente coda, quindi niente richiamate o pausa.
     codaSito: isCodaSito() && !isCallsDryRun(),
-    maxSimultanee: isCodaSito() ? maxSimultanee() : 1,
+    maxSimultanee: isCodaSito() ? maxSimultanee("standard") : 1,
+    maxSimultaneeAppuntamenti: isCodaSito() ? maxSimultanee("appuntamenti") : 1,
     timerAttivo: await timerAttivo(),
+    orari,
+    orariDescrizione: descriviOrari(orari),
   });
 });
 
@@ -2839,8 +3363,13 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
     await ensureLiveSchema();
     const campaigns = (await sql`
       SELECT c.id, c.created_at, c.operatore, c.tipo_campagna, c.voicebot_nome, c.voicebot_exten, c.totale, c.scheduled_id,
+        c.modalita_coda, c.in_pausa, c.fermata_at, c.retry_max, c.retry_intervallo_min, c.username,
         count(l.id)::int AS registrate,
-        count(*) FILTER (WHERE l.stato = 'in_coda')::int      AS in_coda,
+        count(*) FILTER (WHERE l.stato = 'in_coda' AND (l.programmata_at IS NULL OR l.programmata_at <= now()))::int AS in_coda,
+        count(*) FILTER (WHERE l.stato = 'in_coda' AND l.programmata_at > now())::int AS da_richiamare,
+        min(l.programmata_at) FILTER (WHERE l.stato = 'in_coda' AND l.programmata_at > now()) AS prossima_richiamata,
+        count(*) FILTER (WHERE l.stato = 'annullata')::int    AS annullate,
+        count(*) FILTER (WHERE l.stato = 'escluso')::int      AS esclusi,
         count(*) FILTER (WHERE l.stato = 'avviata' AND l.updated_at > now() - make_interval(mins => ${LIVE_SENZA_ESITO_MIN}::int))::int AS avviate,
         count(*) FILTER (WHERE l.stato = 'avviata' AND l.updated_at <= now() - make_interval(mins => ${LIVE_SENZA_ESITO_MIN}::int))::int AS senza_esito,
         count(*) FILTER (WHERE l.stato = 'risposta')::int     AS risposte,
@@ -2853,6 +3382,9 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
       FROM live_campaigns c
       LEFT JOIN live_calls l ON l.campaign_id = c.id
       WHERE c.created_at > now() - make_interval(hours => ${hours})
+         -- Anche le campagne più vecchie che hanno ancora contatti in coda (pausa, richiamate).
+         OR (c.modalita_coda AND c.created_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int) AND c.fermata_at IS NULL
+             AND EXISTS (SELECT 1 FROM live_calls x WHERE x.campaign_id = c.id AND x.stato IN ('in_coda', 'avviata')))
       GROUP BY c.id
       ORDER BY c.created_at DESC
       LIMIT 30
@@ -2861,7 +3393,7 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
       SELECT l.id, l.campaign_id, l.numero, l.nome,
              CASE WHEN l.stato = 'avviata' AND l.updated_at <= now() - make_interval(mins => ${LIVE_SENZA_ESITO_MIN}::int)
                   THEN 'senza_esito' ELSE l.stato END AS stato,
-             l.errore, l.durata_ms, l.queued_at, l.updated_at,
+             l.errore, l.durata_ms, l.queued_at, l.updated_at, l.tentativo, l.esito_precedente, l.programmata_at,
              c.operatore, c.voicebot_nome
       FROM live_calls l
       LEFT JOIN live_campaigns c ON c.id = l.campaign_id
@@ -2882,7 +3414,13 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
         diagnostics = [];
       }
     }
-    res.json({ ok: true, hours, serverTime: new Date().toISOString(), campaigns, events, diagnostics });
+    const orari = await leggiOrari();
+    const ora = new Date();
+    const aperto = dentroOrari(orari, ora);
+    res.json({
+      ok: true, hours, serverTime: ora.toISOString(), campaigns, events, diagnostics,
+      orari: { attivo: orari.attivo, descrizione: descriviOrari(orari), aperto, prossimaApertura: aperto ? null : prossimaApertura(orari, ora)?.toISOString() || null },
+    });
   } catch (err) {
     console.error("Errore /api/live:", err);
     res.status(500).json({ ok: false, error: "Errore caricamento dati in diretta" });
@@ -2900,7 +3438,8 @@ app.get("/api/live/campaigns/:id", requireAuth, async (req: any, res) => {
   try {
     await ensureLiveSchema();
     const c = ((await sql`
-      SELECT id, created_at, operatore, tipo_campagna, voicebot_nome, voicebot_exten, totale, scheduled_id
+      SELECT id, created_at, operatore, tipo_campagna, voicebot_nome, voicebot_exten, totale, scheduled_id,
+             modalita_coda, in_pausa, fermata_at, fermata_da, retry_max, retry_intervallo_min
       FROM live_campaigns WHERE id = ${id}
     `) as any[])[0];
     if (!c) return res.status(404).json({ ok: false, error: "Campagna non trovata" });
@@ -2915,18 +3454,161 @@ app.get("/api/live/campaigns/:id", requireAuth, async (req: any, res) => {
         id: r.id,
         nome: r.nome,
         numero: r.numero,
-        stato: r.stato === "avviata" && new Date(r.updated_at).getTime() <= limiteSenzaEsito ? "senza_esito" : r.stato,
+        stato: r.stato === "avviata" && new Date(r.updated_at).getTime() <= limiteSenzaEsito ? "senza_esito"
+          : r.stato === "in_coda" && r.programmata_at && new Date(r.programmata_at).getTime() > Date.now() ? "programmata" : r.stato,
         errore: r.errore,
         durata_ms: r.durata_ms,
         updated_at: r.updated_at,
+        tentativo: r.tentativo || 1,
+        programmata_at: r.programmata_at,
+        esito_precedente: r.esito_precedente,
         riassunto: leggi(r.riassunto),
         trascrizione: typeof r.trascrizione === "string" ? r.trascrizione : null,
+        esito_commerciale: r.stato === "risposta" || r.stato === "interrotta" ? classificaEsitoCommerciale(r.riassunto) : null,
       };
     });
-    res.json({ ok: true, campaign: c, calls });
+    const dnc = await numeriNonChiamare(calls.map(x => x.numero));
+    res.json({ ok: true, campaign: c, calls: calls.map(x => ({ ...x, non_chiamare: dnc.has(x.numero) })) });
   } catch (err) {
     console.error("Errore /api/live/campaigns/:id:", err);
     res.status(500).json({ ok: false, error: "Errore caricamento campagna" });
+  }
+});
+
+// Pausa e ripresa di una campagna in coda: in pausa non partono nuove
+// chiamate (quelle già avviate finiscono normalmente).
+app.post("/api/live/campaigns/:id/pausa", requireAuth, async (req: any, res) => {
+  const user = await requireEditor(req, res);
+  if (!user) return;
+  const id = parseInt(String(req.params.id), 10);
+  const pausa = req.body?.pausa === true;
+  if (!sql || !(id > 0)) return res.status(400).json({ ok: false, error: "Richiesta non valida" });
+  try {
+    await ensureLiveSchema();
+    const r = (await sql`
+      UPDATE live_campaigns SET in_pausa = ${pausa}
+      WHERE id = ${id} AND modalita_coda AND fermata_at IS NULL
+      RETURNING id
+    `) as any[];
+    if (!r[0]) return res.status(409).json({ ok: false, error: "Questa campagna non si può mettere in pausa (già fermata o inviata tutta a Make)" });
+    if (!pausa) await pumpCampaign(id);
+    await aggiornaSveglia();
+    res.json({ ok: true, pausa });
+  } catch (err) {
+    console.error("Errore pausa campagna:", err);
+    res.status(500).json({ ok: false, error: "Errore" });
+  }
+});
+
+// Stop definitivo: i contatti non ancora chiamati diventano "annullata".
+app.post("/api/live/campaigns/:id/ferma", requireAuth, async (req: any, res) => {
+  const user = await requireEditor(req, res);
+  if (!user) return;
+  const id = parseInt(String(req.params.id), 10);
+  if (!sql || !(id > 0)) return res.status(400).json({ ok: false, error: "Richiesta non valida" });
+  try {
+    await ensureLiveSchema();
+    const r = (await sql`
+      UPDATE live_campaigns SET fermata_at = now(), fermata_da = ${user.nome || user.username}, in_pausa = false
+      WHERE id = ${id} AND modalita_coda AND fermata_at IS NULL
+      RETURNING id
+    `) as any[];
+    if (!r[0]) return res.status(409).json({ ok: false, error: "Questa campagna non si può fermare (già fermata o inviata tutta a Make)" });
+    const annullate = (await sql`
+      UPDATE live_calls SET stato = 'annullata', errore = ${`Campagna fermata da ${user.nome || user.username}`},
+        programmata_at = NULL, updated_at = now()
+      WHERE campaign_id = ${id} AND stato = 'in_coda' AND inviata_at IS NULL
+      RETURNING id
+    `) as any[];
+    await inviaEsitiFalliti(id);
+    await controllaFineCampagne(id);
+    await aggiornaSveglia();
+    res.json({ ok: true, annullate: annullate.length });
+  } catch (err) {
+    console.error("Errore stop campagna:", err);
+    res.status(500).json({ ok: false, error: "Errore" });
+  }
+});
+
+// ── Lista "Non chiamare": Editor e Admin la vedono e la riempiono, solo un Admin toglie numeri ──
+app.get("/api/non-chiamare", requireAuth, async (req: any, res) => {
+  const user = await requireEditor(req, res);
+  if (!user) return;
+  if (!sql) return res.json({ ok: true, numeri: [] });
+  try {
+    await ensureDncSchema();
+    const rows = (await sql`SELECT * FROM do_not_call ORDER BY created_at DESC LIMIT 10000`) as any[];
+    res.json({ ok: true, numeri: rows });
+  } catch (err) {
+    console.error("Errore lettura Non chiamare:", err);
+    res.status(500).json({ ok: false, error: "Errore lettura" });
+  }
+});
+
+app.post("/api/non-chiamare", requireAuth, async (req: any, res) => {
+  const user = await requireEditor(req, res);
+  if (!user) return;
+  const voci = Array.isArray(req.body?.numeri) ? req.body.numeri.slice(0, MAX_CONTACTS_PER_LAUNCH) : [];
+  if (voci.length === 0) return res.status(400).json({ ok: false, error: "Nessun numero" });
+  const validi = voci.filter((v: any) => /^\+?\d{6,15}$/.test(String(v?.numero || "").replace(/[\s\-().]/g, "")));
+  if (validi.length === 0) return res.status(400).json({ ok: false, error: "Nessun numero valido" });
+  if (!sql) return res.status(503).json({ ok: false, error: "Database non disponibile" });
+  try {
+    const aggiunti = await aggiungiNonChiamare(
+      validi.map((v: any) => ({ numero: String(v.numero), nome: cleanText(v.nome) || null })),
+      cleanText(req.body?.motivo, 300) || null, "manuale", user.nome || user.username,
+    );
+    // I numeri aggiunti spariscono subito dalle code delle campagne in corso.
+    await ensureLiveSchema();
+    await sql`
+      UPDATE live_calls l SET stato = 'escluso', errore = 'Nella lista Non chiamare', programmata_at = NULL, updated_at = now()
+      FROM do_not_call d WHERE l.stato = 'in_coda' AND l.inviata_at IS NULL AND d.numero = l.numero
+    `;
+    res.json({ ok: true, aggiunti, giaPresenti: validi.length - aggiunti, scartati: voci.length - validi.length });
+  } catch (err) {
+    console.error("Errore aggiunta Non chiamare:", err);
+    res.status(500).json({ ok: false, error: "Errore salvataggio" });
+  }
+});
+
+app.delete("/api/non-chiamare/:numero", requireAuth, requireAdmin, async (req: any, res) => {
+  if (!sql) return res.status(503).json({ ok: false });
+  try {
+    await ensureDncSchema();
+    const n = normalizePhone(decodeURIComponent(String(req.params.numero))) || "";
+    const r = (await sql`DELETE FROM do_not_call WHERE numero = ${n} RETURNING numero`) as any[];
+    res.json({ ok: true, rimossi: r.length });
+  } catch (err) {
+    console.error("Errore rimozione Non chiamare:", err);
+    res.status(500).json({ ok: false, error: "Errore" });
+  }
+});
+
+// ── Orari consentiti: tutti li leggono, solo un Admin li cambia ──
+app.get("/api/impostazioni/orari", requireAuth, async (_req, res) => {
+  const orari = await leggiOrari();
+  const ora = new Date();
+  res.json({ ok: true, orari, descrizione: descriviOrari(orari), aperto: dentroOrari(orari, ora), prossimaApertura: prossimaApertura(orari, ora)?.toISOString() || null });
+});
+
+app.put("/api/impostazioni/orari", requireAuth, requireAdmin, async (req: any, res) => {
+  const orari = validaOrari(req.body);
+  if (!orari) return res.status(400).json({ ok: false, error: "Orari non validi: scegli almeno un giorno e una fascia con l'inizio prima della fine" });
+  if (!sql) return res.status(503).json({ ok: false, error: "Database non disponibile" });
+  try {
+    await ensureAppState();
+    await sql`
+      INSERT INTO app_state (key, value, updated_at) VALUES ('orari', ${JSON.stringify(orari)}, now())
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+    `;
+    orariCache = null;
+    // Le code ferme per orario ripartono (o aspettano la nuova apertura).
+    await pumpAllQueues();
+    await aggiornaSveglia();
+    res.json({ ok: true, orari, descrizione: descriviOrari(orari) });
+  } catch (err) {
+    console.error("Errore salvataggio orari:", err);
+    res.status(500).json({ ok: false, error: "Errore salvataggio" });
   }
 });
 
@@ -2967,6 +3649,8 @@ function ensureScheduleSchema(): Promise<void> {
         )
       `;
       await sql!`CREATE INDEX IF NOT EXISTS idx_scheduled_campaigns_due ON scheduled_campaigns (status, scheduled_at)`;
+      await sql!`ALTER TABLE scheduled_campaigns ADD COLUMN IF NOT EXISTS retry_max INT NOT NULL DEFAULT 0`;
+      await sql!`ALTER TABLE scheduled_campaigns ADD COLUMN IF NOT EXISTS retry_intervallo_min INT NOT NULL DEFAULT 120`;
     })().catch(err => {
       scheduleSchemaReady = null;
       throw err;
@@ -3028,11 +3712,14 @@ async function dispatchDueCampaigns(): Promise<void> {
           scheduledAt: new Date(row.scheduled_at).toISOString(),
           username: row.created_by,
           scheduledId: row.id,
+          retryMax: row.retry_max || 0,
+          retryIntervalloMin: row.retry_intervallo_min || 120,
         });
-        const status = result.failedContacts.length === 0 ? "sent" : result.sentContacts.length > 0 ? "partial" : "failed";
+        const status = result.failedContacts.length === 0 ? (result.sentContacts.length > 0 || !result.esclusi ? "sent" : "failed") : result.sentContacts.length > 0 ? "partial" : "failed";
         await sql`
           UPDATE scheduled_campaigns
-          SET status = ${status}, sent_count = ${result.sentContacts.length}, failed_count = ${result.failedContacts.length}
+          SET status = ${status}, sent_count = ${result.sentContacts.length}, failed_count = ${result.failedContacts.length},
+              error = ${result.esclusi ? `${result.esclusi} ${result.esclusi === 1 ? "numero escluso" : "numeri esclusi"}: nella lista Non chiamare` : null}
           WHERE id = ${row.id}
         `;
         await logCampaign({
@@ -3072,7 +3759,8 @@ async function dispatchDueCampaigns(): Promise<void> {
 }
 
 app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
-  const { contatti, tipo_campagna, scheduledAt, note, voicebot_id, concurrency } = req.body || {};
+  const { contatti, tipo_campagna, scheduledAt, note, voicebot_id, concurrency, richiamate } = req.body || {};
+  const { retryMax, retryIntervalloMin } = parseRichiamate(richiamate);
   const campaignType = tipo_campagna === "appuntamenti" ? "appuntamenti" : "standard";
 
   const parsed = parseLaunchContacts(contatti, campaignType === "appuntamenti");
@@ -3106,10 +3794,11 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
       await ensureScheduleSchema();
       const rows = (await sql`
         INSERT INTO scheduled_campaigns
-          (created_by, operatore, user_email, scheduled_at, tipo_campagna, voicebot_id, chunk_size, note, contacts)
+          (created_by, operatore, user_email, scheduled_at, tipo_campagna, voicebot_id, chunk_size, note, contacts, retry_max, retry_intervallo_min)
         VALUES
           (${user.username}, ${user.nome || user.username}, ${user.email || null}, ${t.toISOString()},
-           ${campaignType}, ${bot?.id || null}, ${chunkSize}, ${cleanNote || null}, ${JSON.stringify(contacts)}::jsonb)
+           ${campaignType}, ${bot?.id || null}, ${chunkSize}, ${cleanNote || null}, ${JSON.stringify(contacts)}::jsonb,
+           ${retryMax}, ${retryIntervalloMin})
         RETURNING id
       `) as any[];
       await recordHistory({
@@ -3129,6 +3818,9 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
         voicebot: bot?.nome,
         tipoCampagna: campaignType,
       });
+      // Avvisi per l'operatore: numeri oggi in "Non chiamare" e orario fuori fascia.
+      const esclusi = (await numeriNonChiamare(contacts.map(c => c.numero))).size;
+      const orari = await leggiOrari();
       return res.json({
         ok: true,
         scheduled: true,
@@ -3139,6 +3831,8 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
         sentContacts: contacts,
         failedContacts: [],
         scheduledAt: t.toISOString(),
+        esclusi,
+        inAttesaFino: dentroOrari(orari, t) ? null : prossimaApertura(orari, t)?.toISOString() || null,
       });
     } catch (err) {
       console.error("Errore salvataggio campagna pianificata:", err);
@@ -3147,9 +3841,16 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
   }
 
   // ── Immediata ──
+  // Fuori dagli orari consentiti la campagna si crea lo stesso, ma le chiamate
+  // aspettano l'apertura. Con il vecchio invio (tutto a Make) non si può: si blocca.
+  const orari = await leggiOrari();
+  const adesso = new Date();
+  if (!dentroOrari(orari, adesso) && !isCodaSito()) {
+    return res.status(400).json({ ok: false, error: `Fuori dagli orari consentiti (${descriviOrari(orari)}). Pianifica la campagna per un orario consentito.` });
+  }
   const result = await sendCampaignToMake({
     contacts, campaignType, bot, chunkSize, note: cleanNote, operatore: user.nome, scheduledAt: null,
-    username: user.username,
+    username: user.username, retryMax, retryIntervalloMin,
   });
   // Sveglia per l'email di fine campagna, se nessuno avrà l'app aperta.
   if (!result.dryRun) await aggiornaSveglia();
@@ -3193,6 +3894,9 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
     sentContacts: result.sentContacts,
     failedContacts: result.failedContacts,
     scheduledAt: null,
+    esclusi: result.esclusi || 0,
+    inAttesaFino: !result.dryRun && result.sentContacts.length > 0 && !dentroOrari(orari, adesso)
+      ? prossimaApertura(orari, adesso)?.toISOString() || null : null,
   });
 });
 

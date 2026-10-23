@@ -1,11 +1,15 @@
 import React, { useState } from 'react';
 import { useCampaign } from '../context/CampaignContext';
-import { Play, AlertTriangle, Loader2, Trash2, DownloadCloud, Save, Phone, Clock, Filter, X, StickyNote, CheckCircle2, ChevronDown, ChevronUp } from 'lucide-react';
+import { Play, AlertTriangle, Loader2, Trash2, DownloadCloud, Save, Phone, Clock, Filter, X, StickyNote, CheckCircle2 } from 'lucide-react';
 import { format, isToday, isYesterday } from 'date-fns';
 import { it } from 'date-fns/locale';
 import { cn } from '../lib/utils';
 import { ScheduledCampaigns } from './ScheduledCampaigns';
 import * as XLSX from 'xlsx';
+import { dentroOrari, prossimaApertura, descriviOrari, quandoBreve } from '../lib/orari';
+
+export const intervalloLabel = (min: number) =>
+  min >= 1440 ? 'il giorno dopo' : min >= 60 ? `dopo ${min / 60} ${min === 60 ? 'ora' : 'ore'}` : `dopo ${min} minuti`;
 
 function dayLabel(date: Date): string {
   if (isToday(date)) return 'Oggi';
@@ -36,8 +40,7 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
     selectedVoicebot, campaignType,
     testSingleCall, testStatus,
     campaignNote, setCampaignNote,
-    businessHoursEnabled, setBusinessHoursEnabled,
-    businessHoursConfig, setBusinessHoursConfig,
+    richiamate, maxConcurrency,
     historyFilter, setHistoryFilter, filteredHistory, exportHistoryToXLSX,
     history, clearHistory, saveList,
   } = useCampaign();
@@ -47,7 +50,6 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
   const [listName, setListName] = useState('');
   const [showFilters, setShowFilters] = useState(false);
   const [showTestModal, setShowTestModal] = useState(false);
-  const [showBhConfig, setShowBhConfig] = useState(false);
   const [testNome, setTestNome] = useState('');
   const [testNumero, setTestNumero] = useState('');
 
@@ -156,9 +158,9 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
               <span className="text-sm font-semibold text-slate-500">Chiamate Simultanee</span>
               {/* Scelta possibile solo con la coda gestita dal sito: con lo scenario
                   Make sequenziale le chiamate partono comunque una alla volta. */}
-              {appConfig.codaSito && appConfig.maxSimultanee > 1 ? (
+              {appConfig.codaSito && maxConcurrency > 1 ? (
                 <div className="flex items-center gap-1" role="group" aria-label="Chiamate simultanee">
-                  {Array.from({ length: appConfig.maxSimultanee }, (_, i) => i + 1).map(n => (
+                  {Array.from({ length: maxConcurrency }, (_, i) => i + 1).map(n => (
                     <button key={n} type="button" onClick={() => setConcurrency(n)} disabled={isLaunching}
                       className={cn("w-7 h-7 rounded-lg text-xs font-bold transition-colors",
                         concurrency === n ? "bg-brand-600 text-white dark:bg-brand-500" : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700")}>
@@ -204,7 +206,39 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
                 </span>
               </div>
             )}
+            {appConfig.codaSito && (
+              <div className="flex justify-between items-center pt-3 border-t border-slate-200 dark:border-slate-700">
+                <span className="text-sm font-semibold text-slate-500">Richiamate</span>
+                <span className="text-sm font-bold text-slate-900 dark:text-white text-right">
+                  {richiamate.tentativi === 0 ? 'No' : `${richiamate.tentativi} ${richiamate.tentativi === 1 ? 'volta' : 'volte'}, ${intervalloLabel(richiamate.intervalloMin)}`}
+                </span>
+              </div>
+            )}
+            {appConfig.orari?.attivo && (
+              <div className="flex justify-between items-start gap-3 pt-3 border-t border-slate-200 dark:border-slate-700">
+                <span className="text-sm font-semibold text-slate-500 shrink-0">Orari consentiti</span>
+                <span className="text-xs font-bold text-slate-900 dark:text-white text-right">{descriviOrari(appConfig.orari)}</span>
+              </div>
+            )}
           </div>
+
+          {/* Fuori orario: la campagna si crea, le chiamate aspettano l'apertura */}
+          {appConfig.orari?.attivo && validContacts.length > 0 && (() => {
+            const momento = scheduleMode === 'later' && scheduledAt ? new Date(scheduledAt) : new Date();
+            if (isNaN(momento.getTime()) || dentroOrari(appConfig.orari, momento)) return null;
+            const ap = prossimaApertura(appConfig.orari, momento);
+            return (
+              <div className="flex items-start gap-2 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl p-3 mb-4">
+                <Clock className="w-4 h-4 text-amber-500 mt-0.5 shrink-0" />
+                <p className="text-xs font-medium text-amber-700 dark:text-amber-400">
+                  {scheduleMode === 'later' ? "L'orario scelto è" : 'Adesso è'} fuori dagli orari consentiti.
+                  {appConfig.codaSito
+                    ? <> Le chiamate partiranno {ap ? quandoBreve(ap) : 'alla prossima apertura'}.</>
+                    : <> Scegli un orario consentito.</>}
+                </p>
+              </div>
+            );
+          })()}
 
           {/* Note campagna */}
           <div className="mb-4">
@@ -219,80 +253,6 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
               className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950/50 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:border-brand-500 dark:text-white"
             />
           </div>
-
-          {/* Orari consentiti — solo se pianificata */}
-          {scheduleMode === 'later' && (
-            <div className="mb-4 border border-slate-200 dark:border-slate-700 rounded-lg overflow-hidden">
-              <div className="flex items-center justify-between p-3 bg-slate-50 dark:bg-slate-800/50">
-                <div className="flex items-center gap-2">
-                  <Clock className="w-4 h-4 text-slate-500" />
-                  <span className="text-xs font-semibold text-slate-600 dark:text-slate-400">Blocca fuori orario</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button onClick={() => setShowBhConfig(!showBhConfig)} className="text-slate-400 hover:text-slate-600 transition-colors">
-                    {showBhConfig ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                  </button>
-                  <button
-                    onClick={() => setBusinessHoursEnabled(!businessHoursEnabled)}
-                    role="switch"
-                    aria-checked={businessHoursEnabled}
-                    aria-label="Blocca chiamate fuori orario"
-                    className={cn("relative w-10 h-5 rounded-full transition-colors", businessHoursEnabled ? "bg-brand-600" : "bg-slate-300 dark:bg-slate-600")}
-                  >
-                    <span className={cn("absolute top-0.5 w-4 h-4 bg-white dark:bg-white! rounded-full shadow transition-transform", businessHoursEnabled ? "translate-x-5" : "translate-x-0.5")} />
-                  </button>
-                </div>
-              </div>
-              {showBhConfig && (
-                <div className="p-3 border-t border-slate-200 dark:border-slate-700 space-y-3 animate-in fade-in slide-in-from-top-2">
-                  {/* Giorni */}
-                  <div>
-                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Giorni consentiti</label>
-                    <div className="flex gap-1 flex-wrap">
-                      {[{d:1,l:'Lu'},{d:2,l:'Ma'},{d:3,l:'Me'},{d:4,l:'Gi'},{d:5,l:'Ve'},{d:6,l:'Sa'},{d:0,l:'Do'}].map(({d,l}) => (
-                        <button key={d}
-                          onClick={() => {
-                            const days = businessHoursConfig.days.includes(d)
-                              ? businessHoursConfig.days.filter(x => x !== d)
-                              : [...businessHoursConfig.days, d];
-                            setBusinessHoursConfig({...businessHoursConfig, days});
-                          }}
-                          className={cn("w-8 h-8 rounded-lg text-xs font-bold transition-colors",
-                            businessHoursConfig.days.includes(d)
-                              ? "bg-brand-600 text-white"
-                              : "bg-slate-100 dark:bg-slate-800 text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700"
-                          )}>
-                          {l}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                  {/* Ore */}
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Dalle</label>
-                      <select value={businessHoursConfig.startHour}
-                        onChange={e => setBusinessHoursConfig({...businessHoursConfig, startHour: parseInt(e.target.value)})}
-                        className="w-full px-2 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg focus:outline-none dark:text-white">
-                        {Array.from({length:24},(_,i)=><option key={i} value={i}>{String(i).padStart(2,'0')}:00</option>)}
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Alle</label>
-                      <select value={businessHoursConfig.endHour}
-                        onChange={e => setBusinessHoursConfig({...businessHoursConfig, endHour: parseInt(e.target.value)})}
-                        className="w-full px-2 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg focus:outline-none dark:text-white">
-                        {Array.from({length:24},(_,i)=><option key={i} value={i}>{String(i).padStart(2,'0')}:00</option>)}
-                      </select>
-                    </div>
-                  </div>
-                  <div className="text-xs text-slate-400">
-                    Attivo: {businessHoursConfig.days.length} giorni · {String(businessHoursConfig.startHour).padStart(2,'0')}:00–{String(businessHoursConfig.endHour).padStart(2,'0')}:00
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
 
           {/* Test chiamata singola */}
           <button

@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Radio, RefreshCw, AlertTriangle, PhoneCall, PhoneMissed, Phone, Clock, XCircle, ChevronDown, ChevronRight } from 'lucide-react';
+import { Radio, RefreshCw, AlertTriangle, PhoneCall, PhoneMissed, Phone, Clock, XCircle, ChevronDown, ChevronRight, Pause, Play, Square, Moon } from 'lucide-react';
 import { authFetch } from '../lib/authFetch';
 import { useCampaign } from '../context/CampaignContext';
 import { cn } from '../lib/utils';
-import { STATI, Stato } from './liveStati';
+import { STATI, Stato, azioneCampagna, oraBreve } from './liveStati';
 import { CampaignDetail } from './CampaignDetail';
+import { ConfirmModal } from './ConfirmModal';
 
 interface LiveCampaign {
   id: number;
@@ -26,6 +27,27 @@ interface LiveCampaign {
   errori: number;
   ultimo_aggiornamento: string | null;
   ultimo_avanzamento: string | null;
+  modalita_coda?: boolean;
+  in_pausa?: boolean;
+  fermata_at?: string | null;
+  retry_max?: number;
+  da_richiamare?: number;
+  prossima_richiamata?: string | null;
+  annullate?: number;
+  esclusi?: number;
+}
+
+interface OrariLive { attivo: boolean; descrizione: string; aperto: boolean; prossimaApertura: string | null }
+
+// Stato della campagna mostrato sulla scheda.
+export function statoCampagna(c: LiveCampaign, orari: OrariLive | null): { label: string; cls: string } {
+  const attive = c.in_coda + c.avviate;
+  if (c.fermata_at) return { label: 'Fermata', cls: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300' };
+  if (attive === 0 && !(c.da_richiamare || 0)) return { label: 'Conclusa', cls: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300' };
+  if (c.in_pausa) return { label: 'In pausa', cls: 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' };
+  if (c.modalita_coda && orari && !orari.aperto && c.avviate === 0) return { label: 'Fuori orario', cls: 'bg-indigo-50 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300' };
+  if (attive === 0) return { label: 'Richiamate in attesa', cls: 'bg-violet-50 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300' };
+  return { label: 'In corso', cls: 'bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-400' };
 }
 
 interface LiveEvent {
@@ -72,6 +94,17 @@ export function LiveSection() {
   const [now, setNow] = useState(Date.now());
   const [showDiag, setShowDiag] = useState(false);
   const [aperta, setAperta] = useState<number | null>(null);
+  const [orari, setOrari] = useState<OrariLive | null>(null);
+  const [daFermare, setDaFermare] = useState<LiveCampaign | null>(null);
+  const [azioneErr, setAzioneErr] = useState('');
+  const [busy, setBusy] = useState<number | null>(null);
+  const esegui = async (id: number, azione: 'pausa' | 'riprendi' | 'ferma') => {
+    setBusy(id);
+    const r = await azioneCampagna(id, azione);
+    setAzioneErr(r.ok ? '' : r.error || 'Operazione non riuscita');
+    await load();
+    setBusy(null);
+  };
   const chiudiDettaglio = useCallback(() => setAperta(null), []);
   const timer = useRef<number | null>(null);
 
@@ -83,6 +116,7 @@ export function LiveSection() {
       setCampaigns(data.campaigns || []);
       setEvents(data.events || []);
       setDiagnostics(data.diagnostics ?? null);
+      setOrari(data.orari ?? null);
       setUpdatedAt(new Date());
       setError('');
     } catch {
@@ -122,7 +156,7 @@ export function LiveSection() {
   const avvisi: { id: string; text: string; tone: 'red' | 'amber' }[] = [];
   for (const c of campaigns) {
     const nome = `${c.operatore || 'Campagna'} · ${c.voicebot_nome || 'voicebot predefinito'}`;
-    const gestite = c.registrate - c.in_coda;
+    const gestite = c.registrate - c.in_coda - (c.da_richiamare || 0);
     const riuscite = c.avviate + c.risposte + c.interrotte + c.non_risposte;
     if (c.errori >= 3 && c.errori / Math.max(gestite, 1) >= 0.5) {
       avvisi.push({ id: `e${c.id}`, tone: 'red', text: `${nome}: ${c.errori} chiamate in errore su ${gestite}. Controlla lo scenario Make e il voicebot.` });
@@ -131,7 +165,9 @@ export function LiveSection() {
       avvisi.push({ id: `n${c.id}`, tone: 'red', text: `${nome}: nessuna delle prime ${c.non_partite + c.errori} chiamate è partita. Controlla il voicebot e lo scenario Make.` });
     }
     const ultimo = c.ultimo_avanzamento || c.created_at;
-    if (c.in_coda > 0 && minutiDa(ultimo, now) > CODA_FERMA_MIN) {
+    // In pausa, fermata o fuori orario la coda è ferma apposta.
+    const fermaApposta = c.in_pausa || !!c.fermata_at || (c.modalita_coda && orari && !orari.aperto);
+    if (c.in_coda > 0 && !fermaApposta && minutiDa(ultimo, now) > CODA_FERMA_MIN) {
       avvisi.push({ id: `c${c.id}`, tone: 'amber', text: `${nome}: ${c.in_coda} contatti in coda e nessun avanzamento da ${Math.floor(minutiDa(ultimo, now))} minuti. La coda di Make potrebbe essere ferma.` });
     }
   }
@@ -149,7 +185,15 @@ export function LiveSection() {
 
   return (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-300">
-      {aperta !== null && <CampaignDetail campaignId={aperta} onClose={chiudiDettaglio} />}
+      {aperta !== null && <CampaignDetail campaignId={aperta} onClose={chiudiDettaglio} onChange={() => load()} />}
+      <ConfirmModal
+        open={!!daFermare}
+        title="Fermare la campagna?"
+        message={daFermare ? `I ${daFermare.in_coda + (daFermare.da_richiamare || 0)} contatti non ancora chiamati non verranno chiamati. Le chiamate già partite finiscono normalmente. Non si può annullare.` : ''}
+        confirmLabel="Ferma campagna"
+        onCancel={() => setDaFermare(null)}
+        onConfirm={() => { const c = daFermare; setDaFermare(null); if (c) esegui(c.id, 'ferma'); }}
+      />
       {/* Barra superiore */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2 text-sm text-slate-500">
@@ -176,6 +220,15 @@ export function LiveSection() {
       </div>
 
       {error && <p className="text-sm text-red-500">{error}</p>}
+      {azioneErr && <p className="text-sm text-red-500">{azioneErr}</p>}
+
+      {/* Fuori dagli orari consentiti le code aspettano l'apertura */}
+      {orari?.attivo && !orari.aperto && campaigns.some(c => c.modalita_coda && !c.fermata_at && c.in_coda + (c.da_richiamare || 0) > 0) && (
+        <div className="flex items-start gap-3 rounded-xl border px-4 py-3 text-sm bg-indigo-50 border-indigo-200 text-indigo-800 dark:bg-indigo-950/40 dark:border-indigo-900 dark:text-indigo-300">
+          <Moon className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>Fuori dagli orari consentiti ({orari.descrizione}): le chiamate in coda ripartono {orari.prossimaApertura ? oraBreve(orari.prossimaApertura) : 'alla prossima apertura'}.</span>
+        </div>
+      )}
 
       {/* Contatori */}
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
@@ -213,12 +266,15 @@ export function LiveSection() {
             </div>
           )}
           {campaigns.map(c => {
-            const gestite = c.registrate - c.in_coda;
+            const gestite = c.registrate - c.in_coda - (c.da_richiamare || 0) - (c.esclusi || 0) - (c.annullate || 0);
             const parts: [Stato, number][] = [
               ['risposta', c.risposte], ['interrotta', c.interrotte], ['non_risposta', c.non_risposte],
-              ['non_partita', c.non_partite], ['errore', c.errori], ['senza_esito', c.senza_esito || 0], ['avviata', c.avviate], ['in_coda', c.in_coda],
+              ['non_partita', c.non_partite], ['errore', c.errori], ['senza_esito', c.senza_esito || 0], ['avviata', c.avviate],
+              ['programmata', c.da_richiamare || 0], ['in_coda', c.in_coda], ['escluso', c.esclusi || 0], ['annullata', c.annullate || 0],
             ];
-            const finita = c.in_coda === 0 && c.avviate === 0;
+            const st = statoCampagna(c, orari);
+            const finita = st.label === 'Conclusa' || st.label === 'Fermata';
+            const azioni = c.modalita_coda && !finita;
             return (
               <div key={c.id} role="button" tabIndex={0} onClick={() => setAperta(c.id)}
                 onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setAperta(c.id); } }}
@@ -235,10 +291,7 @@ export function LiveSection() {
                       {c.scheduled_id ? ' · pianificata' : ''} · partita alle {ora(c.created_at).slice(0, 5)}
                     </div>
                   </div>
-                  <span className={cn('text-[11px] font-bold px-2 py-0.5 rounded-full',
-                    finita ? 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300' : 'bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-400')}>
-                    {finita ? 'Conclusa' : 'In corso'}
-                  </span>
+                  <span className={cn('text-[11px] font-bold px-2 py-0.5 rounded-full', st.cls)}>{st.label}</span>
                 </div>
                 <div className="flex items-baseline justify-between text-sm mb-1.5">
                   <span className="text-slate-500">Gestite</span>
@@ -258,8 +311,34 @@ export function LiveSection() {
                     </span>
                   ))}
                 </div>
-                <div className="mt-3 pt-3 border-t border-slate-100 dark:border-slate-800 text-xs font-semibold text-brand-600 dark:text-brand-400 inline-flex items-center gap-1">
-                  Vedi numeri e riassunti <ChevronRight className="w-3.5 h-3.5 transition-transform group-hover:translate-x-0.5" />
+                {(c.da_richiamare || 0) > 0 && c.prossima_richiamata && !c.fermata_at && (
+                  <p className="mt-2 text-xs text-violet-700 dark:text-violet-300">
+                    Prossima richiamata: {oraBreve(c.prossima_richiamata)}{(c.retry_max || 0) > 0 ? ` · fino a ${c.retry_max} ${c.retry_max === 1 ? 'volta' : 'volte'}` : ''}
+                  </p>
+                )}
+                <div className="mt-3 pt-3 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-brand-600 dark:text-brand-400 inline-flex items-center gap-1">
+                    Vedi numeri e riassunti <ChevronRight className="w-3.5 h-3.5 transition-transform group-hover:translate-x-0.5" />
+                  </span>
+                  {azioni && (
+                    <span className="flex items-center gap-1.5" onClick={e => e.stopPropagation()} onKeyDown={e => e.stopPropagation()}>
+                      {c.in_pausa ? (
+                        <button type="button" disabled={busy === c.id} onClick={() => esegui(c.id, 'riprendi')}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold bg-green-600 text-white hover:bg-green-700 disabled:opacity-50">
+                          <Play className="w-3.5 h-3.5" /> Riprendi
+                        </button>
+                      ) : (
+                        <button type="button" disabled={busy === c.id} onClick={() => esegui(c.id, 'pausa')}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50">
+                          <Pause className="w-3.5 h-3.5" /> Pausa
+                        </button>
+                      )}
+                      <button type="button" disabled={busy === c.id} onClick={() => setDaFermare(c)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold border border-red-200 dark:border-red-900 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-50">
+                        <Square className="w-3.5 h-3.5" /> Ferma
+                      </button>
+                    </span>
+                  )}
                 </div>
               </div>
             );
@@ -339,6 +418,8 @@ export function LiveSection() {
         "Non partita": Wildix non ha completato la chiamata (rifiutata, occupato, nessuna risposta o numero non raggiungibile).
         "Errore": la richiesta non è arrivata a Wildix.
         "Senza esito": Wildix ha accettato la chiamata ma dopo 30 minuti non ha ancora comunicato come è finita.
+        "Da richiamare": non raggiunto, verrà richiamato in automatico. "Non chiamare": numero nella lista Non chiamare.
+        "Annullata": la campagna è stata fermata prima di chiamarlo.
       </p>
 
       {/* Diagnostica (solo admin): eventi Wildix non usati */}

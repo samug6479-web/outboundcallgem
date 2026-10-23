@@ -1,10 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { X, Search, Download, RefreshCw, ChevronDown, Clock } from 'lucide-react';
+import { X, Search, Download, RefreshCw, ChevronDown, Clock, Ban, Pause, Play, Square, Rocket, Save, RotateCcw } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { authFetch } from '../lib/authFetch';
 import { cn } from '../lib/utils';
-import { STATI, Stato } from './liveStati';
+import { STATI, Stato, ESITI_COMMERCIALI, EsitoCommerciale, azioneCampagna, oraBreve } from './liveStati';
+import { useCampaign } from '../context/CampaignContext';
+import { ConfirmModal } from './ConfirmModal';
 
 interface Riassunto {
   titolo?: string | null;
@@ -22,8 +24,13 @@ interface Chiamata {
   errore: string | null;
   durata_ms: number | null;
   updated_at: string;
+  tentativo: number;
+  programmata_at: string | null;
+  esito_precedente: string | null;
   riassunto: Riassunto | null;
   trascrizione: string | null;
+  esito_commerciale: EsitoCommerciale | null;
+  non_chiamare: boolean;
 }
 
 interface Campagna {
@@ -35,10 +42,16 @@ interface Campagna {
   voicebot_exten: string | null;
   totale: number;
   scheduled_id: number | null;
+  modalita_coda: boolean;
+  in_pausa: boolean;
+  fermata_at: string | null;
+  fermata_da: string | null;
+  retry_max: number;
 }
 
 // Ordine dei filtri: prima chi ha parlato con il voicebot.
-const ORDINE: Stato[] = ['risposta', 'interrotta', 'non_risposta', 'non_partita', 'errore', 'senza_esito', 'avviata', 'in_coda'];
+const ORDINE: Stato[] = ['risposta', 'interrotta', 'non_risposta', 'non_partita', 'errore', 'senza_esito', 'avviata', 'programmata', 'in_coda', 'escluso', 'annullata'];
+const ORDINE_COMM: EsitoCommerciale[] = ['appuntamento', 'interessato', 'richiamare', 'non_interessato', 'non_chiamare', 'da_valutare'];
 
 const durata = (ms: number | null) => {
   if (!ms) return '';
@@ -48,7 +61,7 @@ const durata = (ms: number | null) => {
 const dataOra = (iso: string) => new Date(iso).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 const lista = (v: unknown) => (Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.trim()) as string[] : []);
 
-function RigaChiamata({ c }: { c: Chiamata }) {
+function RigaChiamata({ c, onNonChiamare, busy }: { c: Chiamata; onNonChiamare: (c: Chiamata) => void; busy: boolean }) {
   const [open, setOpen] = useState(false);
   const st = STATI[c.stato] || STATI.in_coda;
   const Icon = st.icon;
@@ -57,6 +70,8 @@ function RigaChiamata({ c }: { c: Chiamata }) {
   const argomenti = lista(c.riassunto?.argomenti);
   const problemi = lista(c.riassunto?.problemi);
   const dettagli = !!(c.trascrizione || decisioni.length || argomenti.length || problemi.length);
+  const ec = c.esito_commerciale && c.esito_commerciale !== 'da_valutare' ? ESITI_COMMERCIALI[c.esito_commerciale] : null;
+  const precedente = c.esito_precedente ? STATI[c.esito_precedente as Stato]?.label : null;
 
   return (
     <li className="px-5 py-3.5">
@@ -66,21 +81,37 @@ function RigaChiamata({ c }: { c: Chiamata }) {
           <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
             <span className="font-semibold text-sm text-slate-900 dark:text-white truncate">{c.nome || c.numero}</span>
             {c.nome && <span className="text-xs font-mono text-slate-400">{c.numero}</span>}
+            {ec && <span className={cn('text-[11px] font-bold px-2 py-0.5 rounded-full', ec.cls)}>{ec.label}</span>}
+            {c.non_chiamare && c.stato !== 'escluso' && (
+              <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300">Non chiamare</span>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 mt-0.5 text-xs">
             <span className={cn('font-semibold', st.color)}>{st.label}</span>
             {c.durata_ms ? <span className="inline-flex items-center gap-1 text-slate-500"><Clock className="w-3 h-3" />{durata(c.durata_ms)}</span> : null}
-            <span className="text-slate-400">{dataOra(c.updated_at)}</span>
+            {c.tentativo > 1 && <span className="text-slate-500">{c.stato === 'programmata' ? `${c.tentativo}° tentativo` : `${c.tentativo} tentativi`}</span>}
+            {c.stato === 'programmata' && c.programmata_at
+              ? <span className="text-violet-600 dark:text-violet-400">richiamata {oraBreve(c.programmata_at)}</span>
+              : <span className="text-slate-400">{dataOra(c.updated_at)}</span>}
           </div>
-          {c.errore && <p className="text-xs text-slate-500 mt-1">{c.errore}</p>}
+          {c.stato === 'programmata' && precedente && <p className="text-xs text-slate-500 mt-1">Tentativo prima: {precedente}{c.errore ? ` · ${c.errore}` : ''}</p>}
+          {c.stato !== 'programmata' && c.errore && <p className="text-xs text-slate-500 mt-1">{c.errore}</p>}
           {testo && <p className="text-sm text-slate-600 dark:text-slate-300 mt-1.5 leading-relaxed">{testo}</p>}
         </div>
-        {dettagli && (
-          <button onClick={() => setOpen(o => !o)} aria-expanded={open} aria-label={open ? 'Nascondi dettagli' : 'Mostra dettagli'}
-            className="p-1 -m-1 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-white shrink-0">
-            <ChevronDown className={cn('w-4 h-4 transition-transform', open && 'rotate-180')} />
-          </button>
-        )}
+        <div className="flex items-center gap-1 shrink-0">
+          {!c.non_chiamare && (
+            <button onClick={() => onNonChiamare(c)} disabled={busy} title="Aggiungi alla lista Non chiamare" aria-label={`Non chiamare più ${c.nome || c.numero}`}
+              className="p-1.5 rounded-lg text-slate-300 hover:text-rose-600 hover:bg-rose-50 dark:text-slate-600 dark:hover:text-rose-400 dark:hover:bg-rose-950/40 disabled:opacity-40">
+              <Ban className="w-4 h-4" />
+            </button>
+          )}
+          {dettagli && (
+            <button onClick={() => setOpen(o => !o)} aria-expanded={open} aria-label={open ? 'Nascondi dettagli' : 'Mostra dettagli'}
+              className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-white">
+              <ChevronDown className={cn('w-4 h-4 transition-transform', open && 'rotate-180')} />
+            </button>
+          )}
+        </div>
       </div>
       {open && (
         <div className="ml-7 mt-3 space-y-3 text-sm">
@@ -116,13 +147,19 @@ function RigaChiamata({ c }: { c: Chiamata }) {
 }
 
 // Pannello laterale con tutti i numeri di una campagna, esito e riassunto di Wilma.
-export function CampaignDetail({ campaignId, onClose }: { campaignId: number; onClose: () => void }) {
+export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: number; onClose: () => void; onChange?: () => void }) {
+  const { user, avviaConContatti, saveList } = useCampaign();
   const [campagna, setCampagna] = useState<Campagna | null>(null);
   const [chiamate, setChiamate] = useState<Chiamata[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [msg, setMsg] = useState('');
   const [filtro, setFiltro] = useState<Stato | 'tutte'>('tutte');
+  const [filtroComm, setFiltroComm] = useState<EsitoCommerciale | 'tutti'>('tutti');
   const [search, setSearch] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [chiediStop, setChiediStop] = useState(false);
+  const [nomeLista, setNomeLista] = useState<string | null>(null);
 
   const load = async () => {
     setLoading(true);
@@ -143,12 +180,12 @@ export function CampaignDetail({ campaignId, onClose }: { campaignId: number; on
 
   // Esc chiude il pannello; la pagina sotto non scorre.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !chiediStop) onClose(); };
     window.addEventListener('keydown', onKey);
     const prev = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
     return () => { window.removeEventListener('keydown', onKey); document.body.style.overflow = prev; };
-  }, [onClose]);
+  }, [onClose, chiediStop]);
 
   const conteggi = useMemo(() => {
     const m = new Map<Stato, number>();
@@ -156,25 +193,38 @@ export function CampaignDetail({ campaignId, onClose }: { campaignId: number; on
     return ORDINE.filter(s => m.get(s)).map(s => [s, m.get(s)!] as [Stato, number]);
   }, [chiamate]);
 
+  const conteggiComm = useMemo(() => {
+    const m = new Map<EsitoCommerciale, number>();
+    for (const c of chiamate) if (c.esito_commerciale) m.set(c.esito_commerciale, (m.get(c.esito_commerciale) || 0) + 1);
+    return ORDINE_COMM.filter(s => m.get(s)).map(s => [s, m.get(s)!] as [EsitoCommerciale, number]);
+  }, [chiamate]);
+
   const filtrate = useMemo(() => {
     const q = search.trim().toLowerCase();
     return chiamate
       .filter(c => filtro === 'tutte' || c.stato === filtro)
+      .filter(c => filtroComm === 'tutti' || c.esito_commerciale === filtroComm)
       .filter(c => !q || [c.nome, c.numero, c.riassunto?.testo, c.riassunto?.titolo, c.errore]
         .some(v => v && v.toLowerCase().includes(q)))
       .sort((a, b) => ORDINE.indexOf(a.stato) - ORDINE.indexOf(b.stato) || a.id - b.id);
-  }, [chiamate, filtro, search]);
+  }, [chiamate, filtro, filtroComm, search]);
+
+  // Numeri richiamabili tra quelli mostrati: non quelli in "Non chiamare".
+  const richiamabili = filtrate.filter(c => !c.non_chiamare && c.stato !== 'escluso');
 
   const esporta = () => {
     const rows = filtrate.map(c => ({
       Nome: c.nome || '',
       Numero: c.numero,
       Esito: STATI[c.stato]?.label || c.stato,
+      'Esito commerciale': c.esito_commerciale ? ESITI_COMMERCIALI[c.esito_commerciale].label : '',
+      Tentativi: c.tentativo || 1,
       Durata: durata(c.durata_ms),
       Ora: dataOra(c.updated_at),
       Riassunto: c.riassunto?.testo || c.riassunto?.titolo || '',
       Decisioni: lista(c.riassunto?.decisioni).join('; '),
       Note: c.errore || '',
+      'Non chiamare': c.non_chiamare ? 'Sì' : '',
     }));
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
@@ -183,7 +233,47 @@ export function CampaignDetail({ campaignId, onClose }: { campaignId: number; on
     XLSX.writeFile(wb, `campagna-${giorno}-${campaignId}.xlsx`);
   };
 
+  const azione = async (a: 'pausa' | 'riprendi' | 'ferma') => {
+    setBusy(true);
+    const r = await azioneCampagna(campaignId, a);
+    setMsg(r.ok ? (a === 'pausa' ? 'Campagna in pausa: non partono nuove chiamate.' : a === 'riprendi' ? 'Campagna ripresa.' : 'Campagna fermata.') : r.error || 'Operazione non riuscita');
+    await load();
+    onChange?.();
+    setBusy(false);
+  };
+
+  const nonChiamare = async (c: Chiamata) => {
+    setBusy(true);
+    try {
+      const res = await authFetch('/api/non-chiamare', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ numeri: [{ numero: c.numero, nome: c.nome }], motivo: 'Aggiunto dal dettaglio campagna' }),
+      });
+      const data = await res.json().catch(() => ({}));
+      setMsg(res.ok && data.ok ? `${c.nome || c.numero} non verrà più chiamato.` : data.error || 'Non aggiunto');
+      await load();
+    } catch {
+      setMsg('Errore di rete');
+    }
+    setBusy(false);
+  };
+
+  const nuovaCampagna = () => {
+    avviaConContatti(richiamabili.map(c => ({ nome: c.nome, numero: c.numero })));
+    onClose();
+  };
+
+  const salvaLista = async () => {
+    if (!nomeLista?.trim()) return;
+    const r = await saveList(nomeLista.trim(), richiamabili.map((c, i) => ({ id: String(i), nome: c.nome || c.numero, numero: c.numero })));
+    setMsg(r.ok ? `Lista "${nomeLista.trim()}" salvata con ${richiamabili.length} numeri.` : r.error || 'Lista non salvata');
+    if (r.ok) setNomeLista(null);
+  };
+
   const conRiassunto = chiamate.filter(c => c.riassunto?.testo || c.riassunto?.titolo).length;
+  const daChiamare = chiamate.filter(c => c.stato === 'in_coda' || c.stato === 'programmata').length;
+  const attiva = !!campagna?.modalita_coda && !campagna.fermata_at && daChiamare + chiamate.filter(c => c.stato === 'avviata').length > 0;
+  const isViewer = user?.role === 'Viewer';
 
   // Nel body: i contenitori animati della pagina limiterebbero il "fixed".
   return createPortal(
@@ -201,6 +291,9 @@ export function CampaignDetail({ campaignId, onClose }: { campaignId: number; on
               <div className="text-xs text-slate-500 mt-0.5">
                 {campagna.operatore || '—'} · {campagna.tipo_campagna === 'appuntamenti' ? 'Conferma appuntamenti' : 'Standard'}
                 {' · '}partita il {dataOra(campagna.created_at)} · {chiamate.length} numeri · {conRiassunto} riassunti
+                {campagna.retry_max > 0 && ` · richiamate fino a ${campagna.retry_max} ${campagna.retry_max === 1 ? 'volta' : 'volte'}`}
+                {campagna.fermata_at && ` · fermata${campagna.fermata_da ? ` da ${campagna.fermata_da}` : ''}`}
+                {campagna.in_pausa && !campagna.fermata_at && ' · in pausa'}
               </div>
             )}
           </div>
@@ -214,11 +307,33 @@ export function CampaignDetail({ campaignId, onClose }: { campaignId: number; on
           </button>
         </div>
 
+        {/* Pausa / ripresa / stop */}
+        {attiva && !isViewer && (
+          <div className="px-5 py-2.5 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center gap-2 bg-slate-50 dark:bg-slate-800/40">
+            <span className="text-xs text-slate-500 mr-auto">{daChiamare} {daChiamare === 1 ? 'contatto ancora da chiamare' : 'contatti ancora da chiamare'}</span>
+            {campagna?.in_pausa ? (
+              <button onClick={() => azione('riprendi')} disabled={busy}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-green-600 text-white hover:bg-green-700 disabled:opacity-50">
+                <Play className="w-3.5 h-3.5" /> Riprendi
+              </button>
+            ) : (
+              <button onClick={() => azione('pausa')} disabled={busy}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50">
+                <Pause className="w-3.5 h-3.5" /> Pausa
+              </button>
+            )}
+            <button onClick={() => setChiediStop(true)} disabled={busy}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-red-200 dark:border-red-900 bg-white dark:bg-slate-900 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-50">
+              <Square className="w-3.5 h-3.5" /> Ferma
+            </button>
+          </div>
+        )}
+
         {/* Filtri */}
-        <div className="px-5 py-3 border-b border-slate-200 dark:border-slate-800 space-y-3">
-          <div className="flex flex-wrap gap-1.5">
+        <div className="px-5 py-3 border-b border-slate-200 dark:border-slate-800 space-y-2.5">
+          <div className="flex flex-wrap gap-1.5" role="group" aria-label="Filtra per esito">
             {([['tutte', chiamate.length] as [Stato | 'tutte', number], ...conteggi]).map(([s, n]) => (
-              <button key={s} onClick={() => setFiltro(s)}
+              <button key={s} onClick={() => setFiltro(s)} aria-pressed={filtro === s}
                 className={cn('text-xs font-semibold px-2.5 py-1 rounded-full border transition-colors inline-flex items-center gap-1.5',
                   filtro === s
                     ? 'bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-slate-900 dark:border-white'
@@ -229,6 +344,18 @@ export function CampaignDetail({ campaignId, onClose }: { campaignId: number; on
               </button>
             ))}
           </div>
+          {conteggiComm.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Filtra per esito commerciale">
+              <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wide mr-1">Commerciale</span>
+              {conteggiComm.map(([s, n]) => (
+                <button key={s} onClick={() => setFiltroComm(filtroComm === s ? 'tutti' : s)} aria-pressed={filtroComm === s}
+                  className={cn('text-xs font-semibold px-2.5 py-1 rounded-full transition', ESITI_COMMERCIALI[s].cls,
+                    filtroComm === s ? 'ring-2 ring-offset-1 ring-slate-900 dark:ring-white dark:ring-offset-slate-900' : 'opacity-80 hover:opacity-100')}>
+                  {ESITI_COMMERCIALI[s].label} <span className="tabular-nums opacity-70">{n}</span>
+                </button>
+              ))}
+            </div>
+          )}
           <div className="flex gap-2">
             <div className="relative flex-1">
               <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -240,6 +367,7 @@ export function CampaignDetail({ campaignId, onClose }: { campaignId: number; on
               <Download className="w-4 h-4" /><span className="hidden sm:inline">Excel</span>
             </button>
           </div>
+          {msg && <p className="text-xs font-medium text-brand-700 dark:text-brand-300">{msg}</p>}
         </div>
 
         {/* Elenco */}
@@ -252,11 +380,48 @@ export function CampaignDetail({ campaignId, onClose }: { campaignId: number; on
             <div className="p-8 text-center text-sm text-slate-500">Nessuna chiamata con questi filtri.</div>
           ) : (
             <ul className="divide-y divide-slate-100 dark:divide-slate-800">
-              {filtrate.map(c => <RigaChiamata key={c.id} c={c} />)}
+              {filtrate.map(c => <RigaChiamata key={c.id} c={c} onNonChiamare={nonChiamare} busy={busy || isViewer} />)}
             </ul>
           )}
         </div>
+
+        {/* Riusare i numeri mostrati */}
+        {!isViewer && richiamabili.length > 0 && (
+          <div className="px-5 py-3 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/40">
+            {nomeLista === null ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs text-slate-500 mr-auto">{richiamabili.length} {richiamabili.length === 1 ? 'numero mostrato' : 'numeri mostrati'}</span>
+                <button onClick={() => setNomeLista('')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">
+                  <Save className="w-3.5 h-3.5" /> Salva come lista
+                </button>
+                <button onClick={nuovaCampagna}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-brand-600 text-white hover:bg-brand-700">
+                  {filtro === 'non_partita' || filtro === 'non_risposta' ? <RotateCcw className="w-3.5 h-3.5" /> : <Rocket className="w-3.5 h-3.5" />}
+                  Nuova campagna con questi numeri
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <input autoFocus value={nomeLista} onChange={e => setNomeLista(e.target.value)} placeholder="Nome della lista"
+                  onKeyDown={e => { if (e.key === 'Enter') salvaLista(); }}
+                  className="flex-1 px-3 py-1.5 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-brand-500" />
+                <button onClick={() => setNomeLista(null)} className="px-3 py-1.5 text-xs font-semibold text-slate-500 hover:text-slate-800 dark:hover:text-white">Annulla</button>
+                <button onClick={salvaLista} disabled={!nomeLista.trim()}
+                  className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50">Salva</button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
+      <ConfirmModal
+        open={chiediStop}
+        title="Fermare la campagna?"
+        message={`I ${daChiamare} contatti non ancora chiamati non verranno chiamati. Le chiamate già partite finiscono normalmente. Non si può annullare.`}
+        confirmLabel="Ferma campagna"
+        onCancel={() => setChiediStop(false)}
+        onConfirm={() => { setChiediStop(false); azione('ferma'); }}
+      />
     </div>,
     document.body,
   );
