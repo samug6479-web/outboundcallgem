@@ -667,7 +667,7 @@ app.get("/api/stats", requireAuth, async (req, res) => {
       const righe = (await sql`
         SELECT COALESCE(c.voicebot_nome, 'Voicebot predefinito') AS voicebot, l.stato, l.durata_ms,
                extract(hour FROM l.updated_at AT TIME ZONE 'Europe/Rome')::int AS ora,
-               r.riassunto,
+               r.riassunto, r.trascrizione, l.esito_manuale,
                (SELECT e.esito FROM voicebot_esiti e WHERE e.live_call_id = l.id ORDER BY e.id LIMIT 1) AS lead_esito
         FROM live_calls l
         JOIN live_campaigns c ON c.id = l.campaign_id
@@ -2152,6 +2152,9 @@ function ensureLiveSchema(): Promise<void> {
       await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS tentativo INT NOT NULL DEFAULT 1`;
       await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS programmata_at TIMESTAMPTZ`;
       await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS esito_precedente TEXT`;
+      // Esito commerciale corretto a mano dal dettaglio campagna (vince sulle regole).
+      await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS esito_manuale TEXT`;
+      await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS esito_manuale_da TEXT`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_coda ON live_calls (campaign_id, stato, inviata_at)`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_numero ON live_calls (numero, queued_at DESC)`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_campaign ON live_calls (campaign_id)`;
@@ -2590,20 +2593,34 @@ async function controllaFineCampagne(soloId?: number | null): Promise<void> {
 // tecnico (risposto / non risposto). Regole sulle parole del riassunto, in
 // quest'ordine: chi non vuole essere chiamato, chi rifiuta, appuntamento,
 // interessato, richiamare. Senza una regola che corrisponde: "da valutare".
-type EsitoCommerciale = "non_chiamare" | "non_interessato" | "appuntamento" | "richiamare" | "interessato" | "da_valutare";
+type EsitoCommerciale = "non_chiamare" | "non_interessato" | "appuntamento" | "richiamare" | "interessato"
+  | "segreteria" | "numero_errato" | "nessun_dialogo" | "da_valutare";
+const ESITI_COMMERCIALI_VALIDI: EsitoCommerciale[] = ["appuntamento", "interessato", "richiamare", "non_interessato", "non_chiamare",
+  "segreteria", "numero_errato", "nessun_dialogo", "da_valutare"];
 const ESITO_COMMERCIALE_LABEL: Record<EsitoCommerciale, { label: string; bg: string; fg: string }> = {
   appuntamento: { label: "Appuntamento", bg: "#dcfce7", fg: "#166534" },
   interessato: { label: "Interessato", bg: "#dbeafe", fg: "#1e40af" },
   richiamare: { label: "Da richiamare", bg: "#ede9fe", fg: "#5b21b6" },
   non_interessato: { label: "Non interessato", bg: "#f1f5f9", fg: "#475569" },
   non_chiamare: { label: "Non chiamare", bg: "#fee2e2", fg: "#991b1b" },
+  segreteria: { label: "Segreteria / centralino", bg: "#fef3c7", fg: "#92400e" },
+  numero_errato: { label: "Numero errato", bg: "#ffedd5", fg: "#9a3412" },
+  nessun_dialogo: { label: "Nessun dialogo", bg: "#f1f5f9", fg: "#475569" },
   da_valutare: { label: "Da valutare", bg: "#f8fafc", fg: "#64748b" },
 };
-const RE_NON_CHIAMARE = /(non (vuole|vogliono|desidera|desiderano) (pi[uù] )?essere (ri)?(contattat|chiamat|disturbat)|di non essere (pi[uù] )?(ri)?(contattat|chiamat|disturbat)|non (mi|lo|la|ci|li|le) (chiamate|contattate|richiamate|disturbate) pi[uù]|(non (deve|devono) (pi[uù] )?(essere )?(ri)?(chiamar|contattar))|(rimozion|rimuover|cancellar|cancellazion|eliminar)\w*.{0,50}(numer|nominativ|dati|lista|elenc|contatt)|registro (pubblico )?(delle |dell'?)?opposizion|non disturbar|smettere di (chiamar|contattar)|stop (alle )?chiamate|chiamate indesiderate)/;
-const RE_NON_INTERESSATO = /(non (è|e'|sono|risulta|risultano|si dichiara|si è detto|si e' detto|appare) (\w+ )?interessat|nessun interesse|non (ha|hanno|mostra|mostrano|manifesta) (alcun |nessun )?interesse|disinteress|rifiut|non conferm|disdett|disdic|annullat\w* l'appuntamento|non (gli|le|ci) interessa|non interessa|gi[aà] (un |altro )?fornitore|gi[aà] (soddisfatt|servit|client)|non ne (ha|hanno) bisogno|non (gli|le) serve|non serve)/;
-const RE_APPUNTAMENTO = /((appuntament|incontr|demo|dimostrazion|sopralluog|videochiamat|visita|consulenz)\w*.{0,50}(fissat|confermat|concordat|prenotat|programmat|issat|stabilit|accettat)|(fissat|concordat|prenotat|conferm|programmat|accetta)\w*.{0,40}(appuntament|incontr|demo|dimostrazion|sopralluog|videochiamat|visita|consulenz))/;
-const RE_RICHIAMARE = /(richiam|ricontatt|risentir|chiamare (pi[uù] )?tardi|(in un |un )?altro momento|un altro giorno|(era|è|e') occupat|non (pu[oò]|poteva|potevano) parlare|ripassare|inviare (una |un'?)?(e-?mail|informazion|preventiv|materiale|brochure)|mandare (una |un'?)?(e-?mail|informazion|preventiv)|pi[uù] tardi)/;
-const RE_INTERESSATO = /(interessat|interesse|vuole (sapere|ricevere|avere|un preventivo|maggiori|approfondire)|chiede(va|ndo)? (informazion|un preventivo|dettagli|maggiori|costi|prezz)|preventiv|valutare (l'offerta|la proposta|il servizio)|curios|disponibil\w* a (ricevere|valutare|approfondire|un incontro))/;
+const RE_NON_CHIAMARE = /(non (vuole|vogliono|desidera|desiderano) (pi[uù] )?essere (ri)?(contattat|chiamat|disturbat)|di non essere (pi[uù] )?(ri)?(contattat|chiamat|disturbat)|non (mi|lo|la|ci|li|le) (chiamate|contattate|richiamate|disturbate) pi[uù]|(non (deve|devono) (pi[uù] )?(essere )?(ri)?(chiamar|contattar))|(rimozion|rimuover|cancellar|cancellazion|eliminar)\w*.{0,50}(numer|nominativ|dati|lista|elenc|contatt)|registro (pubblico )?(delle |dell'?)?opposizion|non disturbar|smettere di (chiamar|contattar)|stop (alle )?chiamate|chiamate indesiderate|do not call|don'?t call|not to be (called|contacted)|remove\w* .{0,30}(number|list))/;
+const RE_NUMERO_ERRATO = /(numero (errato|sbagliato|non corretto|inesistente|non valido|non (più )?attivo)|(persona|azienda|destinatario) sbagliat|sbagliato numero|non (conosce|corrisponde a) (la persona|l'azienda|il nominativo|il destinatario|nessun)|non (è|e') (la persona|l'azienda) (cercat|indicat|richiest)|wrong (number|person))/;
+// Segreteria telefonica: nessuna persona raggiunta. Viene prima delle altre
+// regole perché il voicebot può lasciare un messaggio ("mi richiami").
+const RE_SEGRETERIA = /(segreteria telefonica|casella vocale|voicemail|voice mail|answering machine|messaggio (della |in )?segreteria|(lasciat|lasciare) .{0,20}messaggio (in|nella) segreteria|al segnale acustico|dopo il segnale|(numero|utente|telefono|cellulare)\w* .{0,30}(non (è |e' )?(al momento )?raggiungibil|irraggiungibil)|(telefono|cellulare|apparecchio) .{0,15}spento|fuori copertura)/;
+// Centralino o menu automatico: conta solo se nel riassunto non c'è altro.
+const RE_CENTRALINO = /(centralino|risponditore|menu (vocale|automatico|telefonico)|messaggio (automatico|registrato|preregistrato|vocale)|sistema (automatico|di risposta)|selezion\w* (il |un |l')?(tasto|opzione|interno)|premere (il )?(tasto|\d)|digit\w* (il |un )?(tasto|interno)|(mess\w*|tenut\w*) in attesa|attesa (in linea|telefonica)|musica d'attesa|\bivr\b|automated (message|system)|phone menu)/;
+const RE_NON_INTERESSATO = /(non (è|e'|sono|risulta|risultano|si dichiara|si è detto|si e' detto|appare) (\w+ )?interessat|nessun interesse|non (ha|hanno|mostra|mostrano|manifesta) (alcun |nessun )?interesse|disinteress|rifiut|non conferm|disdett|disdic|annullat\w* l'appuntamento|non (gli|le|ci) interessa|non interessa|gi[aà] (un |altro )?fornitore|gi[aà] (soddisfatt|servit|client)|non ne (ha|hanno) bisogno|non (gli|le) serve|non serve|non c'(è|e') (alcun |nessun )?interesse|not interested|no interest|declin)/;
+const RE_APPUNTAMENTO = /((appuntament|incontr|demo|dimostrazion|sopralluog|videochiamat|visita|consulenz)\w*.{0,50}(fissat|confermat|concordat|prenotat|programmat|issat|stabilit|accettat)|(fissat|concordat|prenotat|conferm|programmat|accetta)\w*.{0,40}(appuntament|incontr|demo|dimostrazion|sopralluog|videochiamat|visita|consulenz)|(appointment|meeting|demo)\w*.{0,30}(scheduled|booked|confirmed|set up|arranged))/;
+const RE_RICHIAMARE = /(richiam|ricontatt|risentir|chiamare (pi[uù] )?tardi|(in un |un )?altro momento|un altro giorno|(era|è|e') occupat|non (pu[oò]|poteva|potevano) parlare|ripassare|inviare (una |un'?)?(e-?mail|informazion|preventiv|materiale|brochure)|mandare (una |un'?)?(e-?mail|informazion|preventiv)|pi[uù] tardi|assente|non (è|e'|era) (presente|disponibile|in ufficio|in sede)|in riunione|fuori (ufficio|sede)|in ferie|non c'(è|e'|era) (il |la |lo |l'|nessuno|in )|call ?back|call (again |)later|not available)/;
+const RE_INTERESSATO = /(interessat|interesse|vuole (sapere|ricevere|avere|un preventivo|maggiori|approfondire)|chiede(va|ndo)? (informazion|un preventivo|dettagli|maggiori|costi|prezz)|preventiv|valutare (l'offerta|la proposta|il servizio)|curios|disponibil\w* a (ricevere|valutare|approfondire|un incontro)|interested|wants (more )?information)/;
+// Nessuna conversazione utile: ha riattaccato subito, silenzio, nessuna risposta.
+const RE_NESSUN_DIALOGO = /(riattacc|(ha |avrebbe )?chiuso (la chiamata|la comunicazione|subito)|chiamata .{0,20}(interrott|terminat|conclus)\w* .{0,20}(subito|bruscamente|prima|senza)|interrott|nessuna risposta|non (ha )?rispost|silenzi|non (ha )?parlat|nessun (dialogo|interlocutore|scambio|intervento)|non c'(è|e') stat\w* (alcuna |nessuna )?(conversazione|interazione|risposta)|senza (alcuna )?(risposta|interazione|conversazione)|non (ha )?(interagit|risposto alle domande)|(brev|corta|breve) .{0,20}(chiamata|conversazione)|hung up|no (response|answer|conversation)|did not (respond|speak))/;
 
 function leggiRiassunto(v: any): any {
   if (v == null) return null;
@@ -2614,21 +2631,32 @@ function leggiRiassunto(v: any): any {
 // Esito commerciale di una chiamata: quello dichiarato da Wilma con salva_lead,
 // se c'è, altrimenti dalle regole sul riassunto.
 function esitoCommercialeChiamata(r: any): EsitoCommerciale | null {
+  if (r.esito_manuale && ESITI_COMMERCIALI_VALIDI.includes(r.esito_manuale)) return r.esito_manuale;
   if (r.stato !== "risposta" && r.stato !== "interrotta" && !r.lead_esito) return null;
-  return (r.lead_esito && ESITO_VOICEBOT_COMMERCIALE[r.lead_esito]) || classificaEsitoCommerciale(r.riassunto);
+  return (r.lead_esito && ESITO_VOICEBOT_COMMERCIALE[r.lead_esito]) || classificaEsitoCommerciale(r.riassunto, r.trascrizione);
 }
 
-function classificaEsitoCommerciale(riassuntoRaw: any): EsitoCommerciale | null {
+function classificaEsitoCommerciale(riassuntoRaw: any, trascrizione?: string | null): EsitoCommerciale | null {
   const r = leggiRiassunto(riassuntoRaw);
-  if (!r) return null;
-  const testo = [r.titolo, r.testo, ...(Array.isArray(r.decisioni) ? r.decisioni : []), ...(Array.isArray(r.problemi) ? r.problemi : [])]
+  const lista = (v: any) => (Array.isArray(v) ? v : []).map((x: any) => (typeof x === "string" ? x : x?.title || x?.text || x?.name || ""));
+  const testo = (r ? [r.titolo, r.testo, ...lista(r.decisioni), ...lista(r.problemi), ...lista(r.argomenti)] : [])
     .filter(x => typeof x === "string").join(" ").toLowerCase().replace(/\s+/g, " ");
-  if (!testo.trim()) return null;
+  const trasc = typeof trascrizione === "string" ? trascrizione.toLowerCase().replace(/\s+/g, " ") : "";
+  if (!testo.trim()) {
+    // Senza riassunto: dalla trascrizione si riconoscono solo segreteria e centralino.
+    if (trasc && (RE_SEGRETERIA.test(trasc) || RE_CENTRALINO.test(trasc))) return "segreteria";
+    return null;
+  }
   if (RE_NON_CHIAMARE.test(testo)) return "non_chiamare";
+  if (RE_NUMERO_ERRATO.test(testo)) return "numero_errato";
+  if (RE_SEGRETERIA.test(testo)) return "segreteria";
   if (RE_NON_INTERESSATO.test(testo)) return "non_interessato";
   if (RE_APPUNTAMENTO.test(testo)) return "appuntamento";
   if (RE_INTERESSATO.test(testo)) return "interessato";
   if (RE_RICHIAMARE.test(testo)) return "richiamare";
+  if (RE_CENTRALINO.test(testo)) return "segreteria";
+  if (RE_NESSUN_DIALOGO.test(testo)) return "nessun_dialogo";
+  if (trasc && RE_SEGRETERIA.test(trasc)) return "segreteria";
   return "da_valutare";
 }
 
@@ -2651,7 +2679,7 @@ async function chiamateCampagna(campaignId: number, createdAt: any): Promise<any
   await ensureEsitiVoicebot();
   return (await sql!`
     SELECT l.id, l.nome, l.numero, l.stato, l.errore, l.durata_ms, l.queued_at, l.updated_at,
-      l.tentativo, l.programmata_at, l.esito_precedente, l.inviata_at,
+      l.tentativo, l.programmata_at, l.esito_precedente, l.inviata_at, l.esito_manuale, l.esito_manuale_da,
       r.riassunto, r.trascrizione,
       v.esito AS lead_esito, v.nome AS lead_nome, v.azienda AS lead_azienda, v.ruolo AS lead_ruolo, v.fascia AS lead_fascia,
       v.esigenza AS lead_esigenza, v.email AS lead_email, v.note AS lead_note, v.riepilogo AS lead_riepilogo
@@ -3588,6 +3616,8 @@ app.get("/api/live/campaigns/:id", requireAuth, async (req: any, res) => {
         riassunto: leggi(r.riassunto),
         trascrizione: typeof r.trascrizione === "string" ? r.trascrizione : null,
         esito_commerciale: esitoCommercialeChiamata(r),
+        esito_manuale: r.esito_manuale || null,
+        esito_manuale_da: r.esito_manuale_da || null,
         lead: r.lead_esito ? {
           esito: r.lead_esito, nome: r.lead_nome, azienda: r.lead_azienda, ruolo: r.lead_ruolo, fascia: r.lead_fascia,
           esigenza: r.lead_esigenza, email: r.lead_email, note: r.lead_note, riepilogo: r.lead_riepilogo,
@@ -3599,6 +3629,32 @@ app.get("/api/live/campaigns/:id", requireAuth, async (req: any, res) => {
   } catch (err) {
     console.error("Errore /api/live/campaigns/:id:", err);
     res.status(500).json({ ok: false, error: "Errore caricamento campagna" });
+  }
+});
+
+// Correzione a mano dell'esito commerciale di una chiamata (Editor e Admin).
+// esito null = torna a quello automatico.
+app.put("/api/live/calls/:id/esito", requireAuth, async (req: any, res) => {
+  const user = await findSessionUser(req.session.username);
+  if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
+  if (user.role === "Viewer") return res.status(403).json({ ok: false, error: "Non autorizzato" });
+  const id = parseInt(String(req.params.id), 10);
+  const esito = req.body?.esito == null || req.body.esito === "" ? null : String(req.body.esito);
+  if (!sql || !(id > 0)) return res.status(404).json({ ok: false, error: "Chiamata non trovata" });
+  if (esito !== null && !ESITI_COMMERCIALI_VALIDI.includes(esito as EsitoCommerciale)) {
+    return res.status(400).json({ ok: false, error: "Esito non valido" });
+  }
+  try {
+    await ensureLiveSchema();
+    const righe = (await sql`
+      UPDATE live_calls SET esito_manuale = ${esito}, esito_manuale_da = ${esito ? user.nome || user.username : null}
+      WHERE id = ${id} RETURNING id
+    `) as any[];
+    if (righe.length === 0) return res.status(404).json({ ok: false, error: "Chiamata non trovata" });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Errore PUT /api/live/calls/:id/esito:", err);
+    res.status(500).json({ ok: false, error: "Errore salvataggio esito" });
   }
 });
 
@@ -3783,6 +3839,7 @@ const ESITO_VOICEBOT_COMMERCIALE: Record<string, EsitoCommerciale> = {
   RICHIAMARE: "richiamare",
   NON_INTERESSATO: "non_interessato",
   NON_CHIAMARE: "non_chiamare",
+  NESSUNA_RISPOSTA: "nessun_dialogo",
 };
 
 let esitiVoicebotReady: Promise<void> | null = null;

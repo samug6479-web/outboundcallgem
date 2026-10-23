@@ -30,6 +30,8 @@ interface Chiamata {
   riassunto: Riassunto | null;
   trascrizione: string | null;
   esito_commerciale: EsitoCommerciale | null;
+  esito_manuale: EsitoCommerciale | null;
+  esito_manuale_da: string | null;
   non_chiamare: boolean;
   // Dati raccolti da Wilma con salva_lead
   lead: {
@@ -56,7 +58,8 @@ interface Campagna {
 
 // Ordine dei filtri: prima chi ha parlato con il voicebot.
 const ORDINE: Stato[] = ['risposta', 'interrotta', 'non_risposta', 'non_partita', 'errore', 'senza_esito', 'avviata', 'programmata', 'in_coda', 'escluso', 'annullata'];
-const ORDINE_COMM: EsitoCommerciale[] = ['appuntamento', 'interessato', 'richiamare', 'non_interessato', 'non_chiamare', 'da_valutare'];
+const ORDINE_COMM: EsitoCommerciale[] = ['appuntamento', 'interessato', 'richiamare', 'non_interessato', 'non_chiamare',
+  'segreteria', 'numero_errato', 'nessun_dialogo', 'da_valutare'];
 
 const durata = (ms: number | null) => {
   if (!ms) return '';
@@ -66,7 +69,9 @@ const durata = (ms: number | null) => {
 const dataOra = (iso: string) => new Date(iso).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 const lista = (v: unknown) => (Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.trim()) as string[] : []);
 
-function RigaChiamata({ c, onNonChiamare, busy }: { c: Chiamata; onNonChiamare: (c: Chiamata) => void; busy: boolean }) {
+function RigaChiamata({ c, onNonChiamare, onEsito, busy }: {
+  c: Chiamata; onNonChiamare: (c: Chiamata) => void; onEsito: (c: Chiamata, esito: EsitoCommerciale | null) => void; busy: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const st = STATI[c.stato] || STATI.in_coda;
   const Icon = st.icon;
@@ -82,7 +87,9 @@ function RigaChiamata({ c, onNonChiamare, busy }: { c: Chiamata; onNonChiamare: 
   const argomenti = lista(c.riassunto?.argomenti);
   const problemi = lista(c.riassunto?.problemi);
   const dettagli = !!(c.trascrizione || decisioni.length || argomenti.length || problemi.length);
-  const ec = c.esito_commerciale && c.esito_commerciale !== 'da_valutare' ? ESITI_COMMERCIALI[c.esito_commerciale] : null;
+  const ec = c.esito_commerciale ? ESITI_COMMERCIALI[c.esito_commerciale] : null;
+  // L'esito si può correggere sulle chiamate in cui qualcuno ha risposto.
+  const correggibile = !!c.esito_commerciale || c.stato === 'risposta' || c.stato === 'interrotta';
   const precedente = c.esito_precedente ? STATI[c.esito_precedente as Stato]?.label : null;
 
   return (
@@ -93,7 +100,20 @@ function RigaChiamata({ c, onNonChiamare, busy }: { c: Chiamata; onNonChiamare: 
           <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
             <span className="font-semibold text-sm text-slate-900 dark:text-white truncate">{c.nome || c.numero}</span>
             {c.nome && <span className="text-xs font-mono text-slate-400">{c.numero}</span>}
-            {ec && <span className={cn('text-[11px] font-bold px-2 py-0.5 rounded-full', ec.cls)}>{ec.label}</span>}
+            {correggibile && (
+              busy ? (ec && <span className={cn('text-[11px] font-bold px-2 py-0.5 rounded-full', ec.cls)}>{ec.label}</span>) : (
+                <select value={c.esito_commerciale || ''} title={c.esito_manuale ? `Corretto a mano${c.esito_manuale_da ? ` da ${c.esito_manuale_da}` : ''}` : 'Cambia esito commerciale'}
+                  aria-label={`Esito commerciale di ${c.nome || c.numero}`}
+                  onChange={e => onEsito(c, e.target.value === '__auto' ? null : (e.target.value as EsitoCommerciale))}
+                  className={cn('text-[11px] font-bold pl-2 pr-1 py-0.5 rounded-full border-0 cursor-pointer focus:outline-none focus:ring-2 focus:ring-brand-500',
+                    ec ? ec.cls : 'bg-slate-50 text-slate-400 dark:bg-slate-800/60')}>
+                  {!c.esito_commerciale && <option value="">Esito?</option>}
+                  {ORDINE_COMM.map(s => <option key={s} value={s}>{ESITI_COMMERCIALI[s].label}</option>)}
+                  {c.esito_manuale && <option value="__auto">↺ Torna automatico</option>}
+                </select>
+              )
+            )}
+            {c.esito_manuale && <span className="text-[10px] text-slate-400" title={c.esito_manuale_da ? `Corretto da ${c.esito_manuale_da}` : undefined}>corretto a mano</span>}
             {c.non_chiamare && c.stato !== 'escluso' && (
               <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300">Non chiamare</span>
             )}
@@ -283,6 +303,23 @@ export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: 
     setBusy(false);
   };
 
+  const cambiaEsito = async (c: Chiamata, esito: EsitoCommerciale | null) => {
+    setBusy(true);
+    try {
+      const res = await authFetch(`/api/live/calls/${c.id}/esito`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ esito }),
+      });
+      const data = await res.json().catch(() => ({}));
+      setMsg(res.ok && data.ok
+        ? (esito ? `${c.nome || c.numero}: esito impostato a "${ESITI_COMMERCIALI[esito].label}".` : `${c.nome || c.numero}: torna l'esito automatico.`)
+        : data.error || 'Esito non salvato');
+      await load();
+    } catch {
+      setMsg('Errore di rete');
+    }
+    setBusy(false);
+  };
+
   const nuovaCampagna = () => {
     avviaConContatti(richiamabili.map(c => ({ nome: c.nome, numero: c.numero })));
     onClose();
@@ -412,7 +449,7 @@ export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: 
             <div className="p-8 text-center text-sm text-slate-500">Nessuna chiamata con questi filtri.</div>
           ) : (
             <ul className="divide-y divide-slate-100 dark:divide-slate-800">
-              {filtrate.map(c => <RigaChiamata key={c.id} c={c} onNonChiamare={nonChiamare} busy={busy || isViewer} />)}
+              {filtrate.map(c => <RigaChiamata key={c.id} c={c} onNonChiamare={nonChiamare} onEsito={cambiaEsito} busy={busy || isViewer} />)}
             </ul>
           )}
         </div>
