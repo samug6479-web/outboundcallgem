@@ -3500,6 +3500,35 @@ app.post("/api/live/campaigns/:id/pausa", requireAuth, async (req: any, res) => 
   }
 });
 
+// Eliminazione di una campagna (solo Admin): toglie la campagna e le sue
+// chiamate da "In diretta" (e dal confronto voicebot delle Statistiche).
+// Esiti Chiamate, follow-up e Storico Campagne restano. Una campagna con
+// chiamate ancora da fare va prima fermata.
+app.delete("/api/live/campaigns/:id", requireAuth, requireAdmin, async (req: any, res) => {
+  const id = parseInt(String(req.params.id), 10);
+  if (!sql || !(id > 0)) return res.status(400).json({ ok: false, error: "Richiesta non valida" });
+  try {
+    await ensureLiveSchema();
+    const aperte = (await sql`
+      SELECT count(*)::int AS n FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
+      WHERE l.campaign_id = ${id} AND c.fermata_at IS NULL
+        AND ((l.stato = 'in_coda' AND l.inviata_at IS NULL AND c.modalita_coda)
+          OR (l.stato = 'avviata' AND l.updated_at > now() - make_interval(mins => ${LIVE_SENZA_ESITO_MIN}::int)))
+    `) as any[];
+    if (aperte[0]?.n > 0) {
+      return res.status(409).json({ ok: false, error: "La campagna ha ancora chiamate in corso o da fare: fermala prima di eliminarla." });
+    }
+    await sql`DELETE FROM live_calls WHERE campaign_id = ${id}`;
+    const r = (await sql`DELETE FROM live_campaigns WHERE id = ${id} RETURNING id`) as any[];
+    if (!r[0]) return res.status(404).json({ ok: false, error: "Campagna non trovata" });
+    await aggiornaSveglia();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Errore eliminazione campagna:", err);
+    res.status(500).json({ ok: false, error: "Errore eliminazione" });
+  }
+});
+
 // Stop definitivo: i contatti non ancora chiamati diventano "annullata".
 app.post("/api/live/campaigns/:id/ferma", requireAuth, async (req: any, res) => {
   const user = await requireEditor(req, res);

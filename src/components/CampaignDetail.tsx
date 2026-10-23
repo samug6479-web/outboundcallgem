@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { X, Search, Download, RefreshCw, ChevronDown, Clock, Ban, Pause, Play, Square, Rocket, Save, RotateCcw } from 'lucide-react';
+import { X, Search, Download, RefreshCw, ChevronDown, Clock, Ban, Pause, Play, Square, Rocket, Save, RotateCcw, Trash2 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { authFetch } from '../lib/authFetch';
 import { cn } from '../lib/utils';
@@ -159,6 +159,7 @@ export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: 
   const [search, setSearch] = useState('');
   const [busy, setBusy] = useState(false);
   const [chiediStop, setChiediStop] = useState(false);
+  const [chiediElimina, setChiediElimina] = useState(false);
   const [nomeLista, setNomeLista] = useState<string | null>(null);
 
   const load = async () => {
@@ -180,12 +181,12 @@ export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: 
 
   // Esc chiude il pannello; la pagina sotto non scorre.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !chiediStop) onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !chiediStop && !chiediElimina) onClose(); };
     window.addEventListener('keydown', onKey);
     const prev = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
     return () => { window.removeEventListener('keydown', onKey); document.body.style.overflow = prev; };
-  }, [onClose, chiediStop]);
+  }, [onClose, chiediStop, chiediElimina]);
 
   const conteggi = useMemo(() => {
     const m = new Map<Stato, number>();
@@ -233,9 +234,10 @@ export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: 
     XLSX.writeFile(wb, `campagna-${giorno}-${campaignId}.xlsx`);
   };
 
-  const azione = async (a: 'pausa' | 'riprendi' | 'ferma') => {
+  const azione = async (a: 'pausa' | 'riprendi' | 'ferma' | 'elimina') => {
     setBusy(true);
     const r = await azioneCampagna(campaignId, a);
+    if (a === 'elimina' && r.ok) { onChange?.(); onClose(); return; }
     setMsg(r.ok ? (a === 'pausa' ? 'Campagna in pausa: non partono nuove chiamate.' : a === 'riprendi' ? 'Campagna ripresa.' : 'Campagna fermata.') : r.error || 'Operazione non riuscita');
     await load();
     onChange?.();
@@ -274,6 +276,7 @@ export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: 
   const daChiamare = chiamate.filter(c => c.stato === 'in_coda' || c.stato === 'programmata').length;
   const attiva = !!campagna?.modalita_coda && !campagna.fermata_at && daChiamare + chiamate.filter(c => c.stato === 'avviata').length > 0;
   const isViewer = user?.role === 'Viewer';
+  const isAdmin = !!(user?.isAdmin || user?.role === 'Admin');
 
   // Nel body: i contenitori animati della pagina limiterebbero il "fixed".
   return createPortal(
@@ -297,6 +300,12 @@ export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: 
               </div>
             )}
           </div>
+          {isAdmin && campagna && !attiva && !chiamate.some(c => c.stato === 'avviata') && (
+            <button onClick={() => setChiediElimina(true)} disabled={busy} aria-label="Elimina la campagna" title="Elimina la campagna"
+              className="p-2 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40">
+              <Trash2 className="w-4 h-4" />
+            </button>
+          )}
           <button onClick={load} disabled={loading} aria-label="Aggiorna"
             className="p-2 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 dark:hover:text-white">
             <RefreshCw className={cn('w-4 h-4', loading && 'animate-spin')} />
@@ -421,6 +430,14 @@ export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: 
         confirmLabel="Ferma campagna"
         onCancel={() => setChiediStop(false)}
         onConfirm={() => { setChiediStop(false); azione('ferma'); }}
+      />
+      <ConfirmModal
+        open={chiediElimina}
+        title="Eliminare la campagna?"
+        message="La campagna e l'elenco delle sue chiamate spariscono da In diretta per tutti. Esiti Chiamate, follow-up e Storico Campagne restano; esce invece dal confronto tra voicebot nelle Statistiche. Non si può annullare."
+        confirmLabel="Elimina"
+        onCancel={() => setChiediElimina(false)}
+        onConfirm={() => { setChiediElimina(false); azione('elimina'); }}
       />
     </div>,
     document.body,

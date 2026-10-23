@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Radio, RefreshCw, AlertTriangle, PhoneCall, PhoneMissed, Phone, Clock, XCircle, ChevronDown, ChevronRight, Pause, Play, Square, Moon } from 'lucide-react';
+import { Radio, RefreshCw, AlertTriangle, PhoneCall, PhoneMissed, Phone, Clock, XCircle, ChevronDown, ChevronRight, Pause, Play, Square, Moon, Trash2 } from 'lucide-react';
 import { authFetch } from '../lib/authFetch';
 import { useCampaign } from '../context/CampaignContext';
 import { cn } from '../lib/utils';
@@ -96,9 +96,11 @@ export function LiveSection() {
   const [aperta, setAperta] = useState<number | null>(null);
   const [orari, setOrari] = useState<OrariLive | null>(null);
   const [daFermare, setDaFermare] = useState<LiveCampaign | null>(null);
+  const [daEliminare, setDaEliminare] = useState<LiveCampaign | null>(null);
+  const isAdmin = !!(user?.isAdmin || user?.role === 'Admin');
   const [azioneErr, setAzioneErr] = useState('');
   const [busy, setBusy] = useState<number | null>(null);
-  const esegui = async (id: number, azione: 'pausa' | 'riprendi' | 'ferma') => {
+  const esegui = async (id: number, azione: 'pausa' | 'riprendi' | 'ferma' | 'elimina') => {
     setBusy(id);
     const r = await azioneCampagna(id, azione);
     setAzioneErr(r.ok ? '' : r.error || 'Operazione non riuscita');
@@ -193,6 +195,14 @@ export function LiveSection() {
         confirmLabel="Ferma campagna"
         onCancel={() => setDaFermare(null)}
         onConfirm={() => { const c = daFermare; setDaFermare(null); if (c) esegui(c.id, 'ferma'); }}
+      />
+      <ConfirmModal
+        open={!!daEliminare}
+        title="Eliminare la campagna?"
+        message={daEliminare ? `La campagna di ${daEliminare.operatore || '—'} delle ${ora(daEliminare.created_at).slice(0, 5)} sparisce da In diretta per tutti. Esiti Chiamate, follow-up e Storico Campagne restano; esce invece dal confronto tra voicebot nelle Statistiche. Non si può annullare.` : ''}
+        confirmLabel="Elimina"
+        onCancel={() => setDaEliminare(null)}
+        onConfirm={() => { const c = daEliminare; setDaEliminare(null); if (c) esegui(c.id, 'elimina'); }}
       />
       {/* Barra superiore */}
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -320,6 +330,15 @@ export function LiveSection() {
                   <span className="text-xs font-semibold text-brand-600 dark:text-brand-400 inline-flex items-center gap-1">
                     Vedi numeri e riassunti <ChevronRight className="w-3.5 h-3.5 transition-transform group-hover:translate-x-0.5" />
                   </span>
+                  {isAdmin && finita && (
+                    <span onClick={e => e.stopPropagation()} onKeyDown={e => e.stopPropagation()}>
+                      <button type="button" disabled={busy === c.id} onClick={() => setDaEliminare(c)}
+                        title="Elimina la campagna" aria-label="Elimina la campagna"
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-50">
+                        <Trash2 className="w-3.5 h-3.5" /> Elimina
+                      </button>
+                    </span>
+                  )}
                   {azioni && (
                     <span className="flex items-center gap-1.5" onClick={e => e.stopPropagation()} onKeyDown={e => e.stopPropagation()}>
                       {c.in_pausa ? (

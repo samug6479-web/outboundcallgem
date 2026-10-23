@@ -35,10 +35,12 @@ export const ESITI_COMMERCIALI: Record<EsitoCommerciale, { label: string; cls: s
 };
 
 // Pausa, ripresa e stop di una campagna (solo con la coda del sito).
-export async function azioneCampagna(id: number, azione: 'pausa' | 'riprendi' | 'ferma'): Promise<{ ok: boolean; error?: string }> {
+export async function azioneCampagna(id: number, azione: 'pausa' | 'riprendi' | 'ferma' | 'elimina'): Promise<{ ok: boolean; error?: string }> {
   const { authFetch } = await import('../lib/authFetch');
   try {
-    const res = azione === 'ferma'
+    const res = azione === 'elimina'
+      ? await authFetch(`/api/live/campaigns/${id}`, { method: 'DELETE' })
+      : azione === 'ferma'
       ? await authFetch(`/api/live/campaigns/${id}/ferma`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
       : await authFetch(`/api/live/campaigns/${id}/pausa`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pausa: azione === 'pausa' }),
