@@ -41,6 +41,7 @@ interface Modulo {
   puoEsportare: boolean;
   limiteNumeri: string;
   invito: boolean;
+  inviaCredenziali: boolean;
 }
 
 const RUOLI: { id: Ruolo; descr: string }[] = [
@@ -94,7 +95,7 @@ export function AdminUsers() {
   const [modulo, setModulo] = useState<Modulo | null>(null);
   const [salvando, setSalvando] = useState(false);
   const [errore, setErrore] = useState('');
-  const [creato, setCreato] = useState<{ username: string; password: string; invitoA?: string; invitoInviato?: boolean } | null>(null);
+  const [creato, setCreato] = useState<{ username: string; password: string; invitoA?: string; invitoInviato?: boolean; credenzialiA?: string; credenzialiInviate?: boolean } | null>(null);
   const [invitando, setInvitando] = useState<string | null>(null);
   const [copiato, setCopiato] = useState(false);
   const [msg, setMsg] = useState('');
@@ -126,12 +127,12 @@ export function AdminUsers() {
 
   const apriNuovo = () => {
     setErrore(''); setCreato(null); setCopiato(false);
-    setModulo({ nuovo: true, username: '', nome: '', email: '', telefono: '', role: 'Editor', canSchedule: true, password: generaPassword(), soloPropriFollowup: false, puoEsportare: true, limiteNumeri: '', invito: true });
+    setModulo({ nuovo: true, username: '', nome: '', email: '', telefono: '', role: 'Editor', canSchedule: true, password: generaPassword(), soloPropriFollowup: false, puoEsportare: true, limiteNumeri: '', invito: true, inviaCredenziali: true });
   };
   const apriModifica = (u: Utente) => {
     setErrore(''); setCreato(null); setCopiato(false);
     setModulo({ nuovo: false, username: u.username, nome: u.nome, email: u.email, telefono: u.telefono, role: u.role, canSchedule: u.canSchedule, password: '',
-      soloPropriFollowup: u.soloPropriFollowup, puoEsportare: u.puoEsportare, limiteNumeri: u.limiteNumeri ? String(u.limiteNumeri) : '', invito: false });
+      soloPropriFollowup: u.soloPropriFollowup, puoEsportare: u.puoEsportare, limiteNumeri: u.limiteNumeri ? String(u.limiteNumeri) : '', invito: false, inviaCredenziali: false });
   };
   const chiudi = () => { setModulo(null); setCreato(null); };
 
@@ -166,7 +167,7 @@ export function AdminUsers() {
         soloPropriFollowup: modulo.soloPropriFollowup, puoEsportare: modulo.puoEsportare,
         limiteNumeri: modulo.limiteNumeri.trim() ? parseInt(modulo.limiteNumeri, 10) || null : null,
         password: conInvito ? undefined : modulo.password || undefined,
-        ...(modulo.nuovo ? { username: modulo.username.trim(), invito: conInvito } : {}),
+        ...(modulo.nuovo ? { username: modulo.username.trim(), invito: conInvito, inviaCredenziali: !conInvito && !!modulo.email.trim() && modulo.inviaCredenziali } : {}),
       };
       const res = await authFetch(modulo.nuovo ? '/api/users' : `/api/users/${encodeURIComponent(modulo.username)}`, {
         method: modulo.nuovo ? 'POST' : 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -177,7 +178,8 @@ export function AdminUsers() {
       if (conInvito) {
         setCreato({ username: modulo.username.trim(), password: '', invitoA: modulo.email.trim(), invitoInviato: data.invitoInviato === true });
       } else if (modulo.nuovo || modulo.password) {
-        setCreato({ username: modulo.username.trim(), password: modulo.password });
+        setCreato({ username: modulo.username.trim(), password: modulo.password,
+          ...(modulo.nuovo && modulo.email.trim() && modulo.inviaCredenziali ? { credenzialiA: modulo.email.trim(), credenzialiInviate: data.credenzialiInviate === true } : {}) });
       } else {
         setMsg(`Modifiche a ${modulo.nome} salvate.`);
         chiudi();
@@ -386,7 +388,11 @@ export function AdminUsers() {
               <div className="p-5 space-y-4 overflow-y-auto">
                 <div className="flex items-start gap-2 p-3 rounded-xl bg-green-50 text-green-800 dark:bg-green-900/20 dark:text-green-300 text-sm">
                   <Check className="w-4 h-4 mt-0.5 shrink-0" />
-                  <span>{modulo.nuovo ? `${modulo.nome} può entrare con questi dati.` : `Nuova password salvata per ${modulo.nome}.`} Copiali e mandali tu: la password non sarà più visibile.</span>
+                  <span>{creato.credenzialiA
+                    ? (creato.credenzialiInviate
+                      ? <>{modulo.nome} può entrare: gli abbiamo mandato i dati di accesso a <strong>{creato.credenzialiA}</strong>. Qui sotto una copia, la password non sarà più visibile.</>
+                      : <>{modulo.nome} può entrare con questi dati. L'email a {creato.credenzialiA} non è partita: copiali e mandali tu.</>)
+                    : <>{modulo.nuovo ? `${modulo.nome} può entrare con questi dati.` : `Nuova password salvata per ${modulo.nome}.`} Copiali e mandali tu: la password non sarà più visibile.</>}</span>
                 </div>
                 <pre className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-sm text-slate-800 dark:text-slate-100 whitespace-pre-wrap font-mono">{testoAccesso}</pre>
                 <div className="flex gap-2">
@@ -488,6 +494,15 @@ export function AdminUsers() {
                       <input type="checkbox" checked={modulo.invito} onChange={e => setModulo({ ...modulo, invito: e.target.checked })} className="w-4 h-4 text-brand-600 rounded focus:ring-brand-500" />
                     </label>
                   )}
+                  {modulo.nuovo && !modulo.invito && (
+                    <label className={cn('flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-200 dark:border-slate-700', modulo.email.trim() ? 'cursor-pointer' : 'opacity-60')}>
+                      <span>
+                        <span className="block text-sm font-semibold text-slate-900 dark:text-white">Manda i dati di accesso per email</span>
+                        <span className="block text-xs text-slate-500">{modulo.email.trim() ? `Nome utente e password arrivano a ${modulo.email.trim()}.` : "Scrivi l'email qui sopra per mandarli."}</span>
+                      </span>
+                      <input type="checkbox" disabled={!modulo.email.trim()} checked={!!modulo.email.trim() && modulo.inviaCredenziali} onChange={e => setModulo({ ...modulo, inviaCredenziali: e.target.checked })} className="w-4 h-4 text-brand-600 rounded focus:ring-brand-500" />
+                    </label>
+                  )}
                   {!(modulo.nuovo && modulo.invito) && <div>
                     <label className={etichetta} htmlFor="u-pw">{modulo.nuovo ? 'Password' : 'Nuova password'}</label>
                     <div className="flex gap-2">
@@ -506,7 +521,7 @@ export function AdminUsers() {
                 <div className="p-4 border-t border-slate-200 dark:border-slate-800 flex gap-2">
                   <button type="submit" disabled={salvando}
                     className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-bold bg-brand-600 hover:bg-brand-700 text-white disabled:opacity-60">
-                    {salvando && <Loader2 className="w-4 h-4 animate-spin" />}{modulo.nuovo ? (modulo.invito ? 'Crea e manda invito' : 'Crea utente') : 'Salva modifiche'}
+                    {salvando && <Loader2 className="w-4 h-4 animate-spin" />}{modulo.nuovo ? (modulo.invito ? 'Crea e manda invito' : modulo.email.trim() && modulo.inviaCredenziali ? 'Crea e manda i dati' : 'Crea utente') : 'Salva modifiche'}
                   </button>
                   <button type="button" onClick={chiudi} className="px-4 py-2.5 rounded-lg text-sm font-semibold border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">Annulla</button>
                 </div>

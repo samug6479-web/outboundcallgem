@@ -2033,6 +2033,11 @@ app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
     const inviato = await creaEInviaInvito(username, (req as any).session.username).catch(err => { console.error("Errore invito:", err); return false; });
     return res.json({ ok: true, invitoInviato: inviato });
   }
+  // Senza invito ma con l'email: benvenuto con i dati di accesso (se l'Admin lo lascia attivo).
+  if (email && req.body.inviaCredenziali !== false) {
+    const inviata = await inviaCredenziali(username, String(password), (req as any).session.username).catch(err => { console.error("Errore email credenziali:", err); return false; });
+    return res.json({ ok: true, credenzialiInviate: inviata });
+  }
   res.json({ ok: true });
 });
 
@@ -2055,6 +2060,46 @@ function ensureInviti(): Promise<void> {
   return invitiReady;
 }
 const hashToken = (t: string) => crypto.createHash("sha256").update(t).digest("hex");
+
+// Email di benvenuto con nome utente e password scelti dall'Admin.
+async function inviaCredenziali(username: string, password: string, daUsername: string): Promise<boolean> {
+  if (!process.env.SMTP_USER) return false;
+  const u = (await readUsers()).find((x: any) => x.username.toLowerCase() === username.toLowerCase());
+  if (!u?.email || !EMAIL_VALIDA.test(u.email)) return false;
+  const da = await findSessionUser(daUsername).catch(() => null);
+  const daNome = da?.nome || daUsername;
+  const appUrl = (process.env.APP_URL || "https://outboundcallgem.vercel.app").replace(/\/$/, "");
+  const nome = String(u.nome || "").split(" ")[0];
+  const ruolo = ruoloDi(u);
+  const riga = (k: string, v: string, ultima = false) => `<tr><td style="padding:11px 0;${ultima ? "" : "border-bottom:1px solid #eef1f6;"}font-size:14px;color:#64748b;">${k}</td><td style="padding:11px 0;${ultima ? "" : "border-bottom:1px solid #eef1f6;"}font-size:14px;color:#0f172a;font-weight:700;text-align:right;font-family:monospace;">${escapeHtml(v)}</td></tr>`;
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || "smtp.gmail.com",
+    port: parseInt(process.env.SMTP_PORT || "587"),
+    secure: process.env.SMTP_SECURE === "true",
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  });
+  await transporter.sendMail({
+    from: `"GEM Outbound" <${process.env.SMTP_USER}>`,
+    to: u.email,
+    subject: `${daNome} ti ha dato accesso a GEM Outbound`,
+    text: [`Ciao${nome ? ` ${nome}` : ""}, ${daNome} ti ha dato accesso a GEM Outbound.`, "", `Sito: ${appUrl}`, `Nome utente: ${u.username}`, `Password: ${password}`, `Ruolo: ${ruolo}`, "", "Ti consigliamo di non inoltrare questa email e di cancellarla dopo il primo accesso."].join("\n"),
+    html: `
+<div style="background:#eef1f6;padding:28px 12px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0;">
+  <tr><td style="padding:28px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+    <td><img src="${appUrl}/gem-logo-color.png" width="96" alt="GEM Group" style="display:block;width:96px;height:auto;"></td>
+    <td style="text-align:right;"><span style="display:inline-block;background:#dcfce7;color:#166534;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;">&#9679; Nuovo accesso</span></td></tr></table></td></tr>
+  <tr><td style="padding:26px 40px 6px;font-size:24px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">Benvenuto in GEM Outbound</td></tr>
+  <tr><td style="padding:0 40px 20px;font-size:15px;color:#475569;line-height:1.6;">Ciao${nome ? ` ${escapeHtml(nome)}` : ""}, <strong style="color:#0f172a;">${escapeHtml(daNome)}</strong> ti ha dato accesso alla piattaforma delle campagne di chiamate con Wilma. Ecco i tuoi dati.</td></tr>
+  <tr><td style="padding:0 40px 8px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border-radius:10px;"><tr><td style="padding:6px 20px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${riga("Nome utente", u.username)}${riga("Password", password)}${riga("Ruolo", ruolo, true)}</table></td></tr></table></td></tr>
+  <tr><td style="padding:20px 40px 8px;"><a href="${appUrl}" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:14px 20px;border-radius:9px;">Accedi a GEM Outbound</a></td></tr>
+  <tr><td style="padding:4px 40px 30px;font-size:13px;color:#64748b;line-height:1.5;text-align:center;">Non inoltrare questa email e cancellala dopo il primo accesso.</td></tr>
+  <tr><td style="padding:18px 40px;border-top:1px solid #eef1f6;font-size:12px;color:#94a3b8;line-height:1.6;">GEM Group &middot; Soluzioni di comunicazione e automazione AI su tecnologia Wildix<br>Se non aspettavi questa email puoi ignorarla.</td></tr>
+</table></div>`,
+  });
+  return true;
+}
 
 // Crea un link nuovo (quelli vecchi non usati smettono di valere) e lo manda per email.
 async function creaEInviaInvito(username: string, daUsername: string): Promise<boolean> {
