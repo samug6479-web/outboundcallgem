@@ -69,8 +69,8 @@ const durata = (ms: number | null) => {
 const dataOra = (iso: string) => new Date(iso).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 const lista = (v: unknown) => (Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.trim()) as string[] : []);
 
-function RigaChiamata({ c, onNonChiamare, onEsito, busy }: {
-  c: Chiamata; onNonChiamare: (c: Chiamata) => void; onEsito: (c: Chiamata, esito: EsitoCommerciale | null) => void; busy: boolean;
+function RigaChiamata({ c, onNonChiamare, onEsito, busy, lettura }: {
+  c: Chiamata; onNonChiamare: (c: Chiamata) => void; onEsito: (c: Chiamata, esito: EsitoCommerciale | null) => void; busy: boolean; lettura: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const st = STATI[c.stato] || STATI.in_coda;
@@ -136,7 +136,7 @@ function RigaChiamata({ c, onNonChiamare, onEsito, busy }: {
           )}
         </div>
         <div className="flex items-center gap-1 shrink-0">
-          {!c.non_chiamare && (
+          {!c.non_chiamare && !lettura && (
             <button onClick={() => onNonChiamare(c)} disabled={busy} title="Aggiungi alla lista Non chiamare" aria-label={`Non chiamare più ${c.nome || c.numero}`}
               className="p-1.5 rounded-lg text-slate-300 hover:text-rose-600 hover:bg-rose-50 dark:text-slate-600 dark:hover:text-rose-400 dark:hover:bg-rose-950/40 disabled:opacity-40">
               <Ban className="w-4 h-4" />
@@ -431,10 +431,10 @@ export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: 
               <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cerca nome, numero o riassunto..."
                 className="w-full pl-9 pr-3 py-2 text-sm rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-brand-500" />
             </div>
-            <button onClick={esporta} disabled={filtrate.length === 0}
+            {user?.puoEsportare !== false && <button onClick={esporta} disabled={filtrate.length === 0}
               className="inline-flex items-center gap-1.5 px-3 py-2 text-sm font-semibold rounded-xl border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50">
               <Download className="w-4 h-4" /><span className="hidden sm:inline">Excel</span>
-            </button>
+            </button>}
           </div>
           {msg && <p className="text-xs font-medium text-brand-700 dark:text-brand-300">{msg}</p>}
         </div>
@@ -449,7 +449,7 @@ export function CampaignDetail({ campaignId, onClose, onChange }: { campaignId: 
             <div className="p-8 text-center text-sm text-slate-500">Nessuna chiamata con questi filtri.</div>
           ) : (
             <ul className="divide-y divide-slate-100 dark:divide-slate-800">
-              {filtrate.map(c => <RigaChiamata key={c.id} c={c} onNonChiamare={nonChiamare} onEsito={cambiaEsito} busy={busy || isViewer} />)}
+              {filtrate.map(c => <RigaChiamata key={c.id} c={c} onNonChiamare={nonChiamare} onEsito={cambiaEsito} busy={busy || isViewer} lettura={isViewer} />)}
             </ul>
           )}
         </div>

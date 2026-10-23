@@ -44,6 +44,8 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
     historyFilter, setHistoryFilter, filteredHistory, exportHistoryToXLSX,
     history, clearHistory, saveList,
   } = useCampaign();
+  const puoEsportare = user?.puoEsportare !== false;
+  const oltreLimite = !!user?.limiteNumeri && validContacts.length > user.limiteNumeri;
 
   const [expandedHistory, setExpandedHistory] = useState<string | null>(null);
   const [isSavingList, setIsSavingList] = useState(false);
@@ -301,11 +303,19 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
             </div>
           )}
 
+          {/* Limite di numeri per campagna impostato dall'Admin */}
+          {oltreLimite && (
+            <div className="mb-3 flex items-start gap-2 p-3 rounded-xl border border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/10 dark:text-amber-300 text-xs">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>Puoi lanciare al massimo <strong>{user?.limiteNumeri}</strong> numeri per campagna: questa ne ha {validContacts.length}. Dividi la lista o chiedi all'Admin.</span>
+            </div>
+          )}
+
           {/* Launch button */}
-          <button onClick={launchCampaign} disabled={isLaunching || validContacts.length === 0}
+          <button onClick={launchCampaign} disabled={isLaunching || validContacts.length === 0 || oltreLimite}
             className={cn(
               "w-full py-4 px-6 rounded-xl font-display font-extrabold text-base flex items-center justify-center gap-3 transition-all duration-200",
-              validContacts.length === 0 ? "bg-slate-100 dark:bg-slate-800 text-slate-400 cursor-not-allowed"
+              validContacts.length === 0 || oltreLimite ? "bg-slate-100 dark:bg-slate-800 text-slate-400 cursor-not-allowed"
                 : "bg-brand-600 hover:bg-brand-700 text-white shadow-soft-blue hover:shadow-lg hover:-translate-y-0.5",
               isLaunching && "opacity-80 pointer-events-none"
             )}>
@@ -350,10 +360,10 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
         <div className="p-5 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/30 flex items-center justify-between">
           <h2 className="text-base font-bold text-slate-900 dark:text-white font-display">Storico Campagne</h2>
           <div className="flex items-center gap-2">
-            <button onClick={exportHistoryToXLSX} title="Esporta tutto in Excel" aria-label="Esporta tutto in Excel"
+            {puoEsportare && <button onClick={exportHistoryToXLSX} title="Esporta tutto in Excel" aria-label="Esporta tutto in Excel"
               className="p-1.5 text-slate-400 hover:text-brand-600 hover:bg-brand-50 rounded-lg transition-colors">
               <DownloadCloud className="w-4 h-4" />
-            </button>
+            </button>}
             <button onClick={() => setShowFilters(!showFilters)} aria-label="Mostra filtri" aria-pressed={showFilters}
               className={cn("p-1.5 rounded-lg transition-colors", showFilters ? "text-brand-600 bg-brand-50" : "text-slate-400 hover:text-brand-600 hover:bg-brand-50")}>
               <Filter className="w-4 h-4" />
@@ -451,7 +461,7 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
                           </div>
                         </div>
 
-                        {h.contactsList && h.contactsList.length > 0 && (
+                        {puoEsportare && h.contactsList && h.contactsList.length > 0 && (
                           <button onClick={() => exportSingleHistory(h)} title="Esporta in Excel" aria-label="Esporta in Excel"
                             className="p-1.5 text-slate-400 hover:text-brand-600 hover:bg-brand-50 dark:hover:bg-brand-900/20 rounded-lg transition-colors shrink-0">
                             <DownloadCloud className="w-3.5 h-3.5" />

@@ -54,7 +54,7 @@ const NAV_GROUPS: NavGroup[] = [
   {
     label: 'Monitoraggio',
     items: [
-      { id: 'live' as Tab, label: 'In diretta', icon: Radio, viewerHidden: true, badge: 'live' },
+      { id: 'live' as Tab, label: 'In diretta', icon: Radio, badge: 'live' },
       { id: 'callresults' as Tab, label: 'Esiti Chiamate', icon: Phone },
       { id: 'followups' as Tab, label: 'Follow-up', icon: BellRing, badge: 'followups' },
     ]
@@ -142,7 +142,7 @@ export function Dashboard() {
   // ?tab=... nell'indirizzo (es. il pulsante "Segui in diretta" dell'email)
   // ha la precedenza sulla scheda ricordata. I Viewer non aprono pagine a loro nascoste.
   const urlTab = new URLSearchParams(window.location.search).get('tab') as Tab | null;
-  const viewerHiddenTabs: Tab[] = ['campaign', 'appointments', 'lists', 'live', 'dnc'];
+  const viewerHiddenTabs: Tab[] = ['campaign', 'appointments', 'lists', 'dnc'];
   const linkTab = urlTab && urlTab in TAB_META && !(isViewer && viewerHiddenTabs.includes(urlTab)) ? urlTab : null;
   const savedTab = sessionStorage.getItem('gem_active_tab') as Tab | null;
   const [activeTab, setActiveTab] = useState<Tab>(linkTab || savedTab || (isViewer ? 'callresults' : 'campaign'));
@@ -232,7 +232,6 @@ export function Dashboard() {
         const d = await r.json();
         if (!stopped && r.ok && d.ok) setFollowupCount((d.followups || []).length);
       } catch { /* il contatore è solo un aiuto: si riprova al prossimo giro */ }
-      if (isViewer) return;
       try {
         const r = await authFetch('/api/live?hours=12');
         const d = await r.json();
@@ -360,7 +359,7 @@ export function Dashboard() {
             <div className="grid grid-cols-3 gap-1">
               {/* Guida utente in PDF (file in public/) */}
               <a
-                href="/guida-gem-outbound.pdf?v=2026-10-23h"
+                href="/guida-gem-outbound.pdf?v=2026-10-23i"
                 download="GEM-Outbound-Guida-utente.pdf"
                 title="Scarica la guida utente (PDF)"
                 className="flex flex-col items-center justify-center gap-1 py-2 text-[11px] font-semibold text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
@@ -534,7 +533,7 @@ export function Dashboard() {
             <FollowupsSection />
           )}
 
-          {activeTab === 'live' && !isViewer && (
+          {activeTab === 'live' && (
             <LiveSection />
           )}
 

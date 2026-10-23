@@ -98,6 +98,7 @@ export function LiveSection() {
   const [daFermare, setDaFermare] = useState<LiveCampaign | null>(null);
   const [daEliminare, setDaEliminare] = useState<LiveCampaign | null>(null);
   const isAdmin = !!(user?.isAdmin || user?.role === 'Admin');
+  const isViewer = user?.role === 'Viewer';
   const [azioneErr, setAzioneErr] = useState('');
   const [busy, setBusy] = useState<number | null>(null);
   const esegui = async (id: number, azione: 'pausa' | 'riprendi' | 'ferma' | 'elimina') => {
@@ -284,7 +285,7 @@ export function LiveSection() {
             ];
             const st = statoCampagna(c, orari);
             const finita = st.label === 'Conclusa' || st.label === 'Fermata';
-            const azioni = c.modalita_coda && !finita;
+            const azioni = c.modalita_coda && !finita && !isViewer;
             return (
               <div key={c.id} role="button" tabIndex={0} onClick={() => setAperta(c.id)}
                 onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setAperta(c.id); } }}

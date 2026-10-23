@@ -22,6 +22,9 @@ interface Utente {
   telefono: string;
   ultimoAccesso: string | null;
   followupAperti: number;
+  soloPropriFollowup: boolean;
+  puoEsportare: boolean;
+  limiteNumeri: number | null;
 }
 
 interface Modulo {
@@ -33,12 +36,15 @@ interface Modulo {
   role: Ruolo;
   canSchedule: boolean;
   password: string;
+  soloPropriFollowup: boolean;
+  puoEsportare: boolean;
+  limiteNumeri: string;
 }
 
 const RUOLI: { id: Ruolo; descr: string }[] = [
   { id: 'Admin', descr: 'Tutto, più utenti, voicebot e impostazioni.' },
   { id: 'Editor', descr: 'Carica liste, lancia campagne, gestisce follow-up e Non chiamare.' },
-  { id: 'Viewer', descr: 'Solo lettura: esiti, follow-up e statistiche.' },
+  { id: 'Viewer', descr: 'Solo lettura: In diretta, esiti, follow-up e statistiche. Non può modificare nulla.' },
 ];
 
 const ruoloCls = (r: Ruolo) =>
@@ -117,11 +123,12 @@ export function AdminUsers() {
 
   const apriNuovo = () => {
     setErrore(''); setCreato(null); setCopiato(false);
-    setModulo({ nuovo: true, username: '', nome: '', email: '', telefono: '', role: 'Editor', canSchedule: true, password: generaPassword() });
+    setModulo({ nuovo: true, username: '', nome: '', email: '', telefono: '', role: 'Editor', canSchedule: true, password: generaPassword(), soloPropriFollowup: false, puoEsportare: true, limiteNumeri: '' });
   };
   const apriModifica = (u: Utente) => {
     setErrore(''); setCreato(null); setCopiato(false);
-    setModulo({ nuovo: false, username: u.username, nome: u.nome, email: u.email, telefono: u.telefono, role: u.role, canSchedule: u.canSchedule, password: '' });
+    setModulo({ nuovo: false, username: u.username, nome: u.nome, email: u.email, telefono: u.telefono, role: u.role, canSchedule: u.canSchedule, password: '',
+      soloPropriFollowup: u.soloPropriFollowup, puoEsportare: u.puoEsportare, limiteNumeri: u.limiteNumeri ? String(u.limiteNumeri) : '' });
   };
   const chiudi = () => { setModulo(null); setCreato(null); };
 
@@ -151,6 +158,8 @@ export function AdminUsers() {
       const body = {
         nome: modulo.nome.trim(), role: modulo.role, canSchedule: modulo.canSchedule,
         email: modulo.email.trim(), telefono: modulo.telefono.trim(),
+        soloPropriFollowup: modulo.soloPropriFollowup, puoEsportare: modulo.puoEsportare,
+        limiteNumeri: modulo.limiteNumeri.trim() ? parseInt(modulo.limiteNumeri, 10) || null : null,
         password: modulo.password || undefined,
         ...(modulo.nuovo ? { username: modulo.username.trim() } : {}),
       };
@@ -288,11 +297,14 @@ export function AdminUsers() {
                     </div>
                     <div className="text-xs mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-slate-500">
                       <Stato2FA u={u} />
-                      <span className={cn('inline-flex items-center gap-1', u.canSchedule ? 'text-slate-600 dark:text-slate-300' : 'text-slate-400')}>
+                      {u.role !== 'Viewer' && <span className={cn('inline-flex items-center gap-1', u.canSchedule ? 'text-slate-600 dark:text-slate-300' : 'text-slate-400')}>
                         <CalendarClock className="w-3.5 h-3.5" />{u.canSchedule ? 'Può pianificare' : 'Non pianifica'}
-                      </span>
+                      </span>}
                       <span>Ultimo accesso: <strong className="font-semibold text-slate-600 dark:text-slate-300">{quandoFa(u.ultimoAccesso)}</strong></span>
                       {u.followupAperti > 0 && <span className="inline-flex items-center gap-1"><BellRing className="w-3.5 h-3.5" />{u.followupAperti} follow-up aperti</span>}
+                      {u.role !== 'Admin' && u.soloPropriFollowup && <span className="text-slate-600 dark:text-slate-300">Solo i propri follow-up</span>}
+                      {u.role !== 'Admin' && !u.puoEsportare && <span className="text-slate-600 dark:text-slate-300">Niente Excel</span>}
+                      {u.role === 'Editor' && u.limiteNumeri && <span className="text-slate-600 dark:text-slate-300">Max {u.limiteNumeri} numeri</span>}
                     </div>
                   </div>
                   <div className="flex items-center gap-1 shrink-0 ml-auto">
@@ -384,13 +396,47 @@ export function AdminUsers() {
                     </div>
                   </fieldset>
 
-                  <label className="flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-200 dark:border-slate-700 cursor-pointer">
-                    <span>
-                      <span className="block text-sm font-semibold text-slate-900 dark:text-white">Può pianificare campagne</span>
-                      <span className="block text-xs text-slate-500">Lanciarle a una data e ora future.</span>
-                    </span>
-                    <input type="checkbox" checked={modulo.canSchedule} onChange={e => setModulo({ ...modulo, canSchedule: e.target.checked })} className="w-4 h-4 text-brand-600 rounded focus:ring-brand-500" />
-                  </label>
+                  {(
+                    <fieldset className="rounded-xl border border-slate-200 dark:border-slate-700 divide-y divide-slate-100 dark:divide-slate-800">
+                      <legend className="sr-only">Permessi</legend>
+                      {modulo.role !== 'Viewer' && (
+                        <label className="flex items-center justify-between gap-3 p-3 cursor-pointer">
+                          <span>
+                            <span className="block text-sm font-semibold text-slate-900 dark:text-white">Può pianificare campagne</span>
+                            <span className="block text-xs text-slate-500">Lanciarle a una data e ora future.</span>
+                          </span>
+                          <input type="checkbox" checked={modulo.canSchedule} onChange={e => setModulo({ ...modulo, canSchedule: e.target.checked })} className="w-4 h-4 text-brand-600 rounded focus:ring-brand-500" />
+                        </label>
+                      )}
+                      {modulo.role !== 'Admin' && <>
+                      <label className="flex items-center justify-between gap-3 p-3 cursor-pointer">
+                        <span>
+                          <span className="block text-sm font-semibold text-slate-900 dark:text-white">Vede solo i propri follow-up</span>
+                          <span className="block text-xs text-slate-500">Solo quelli assegnati a lui, non quelli dei colleghi.</span>
+                        </span>
+                        <input type="checkbox" checked={modulo.soloPropriFollowup} onChange={e => setModulo({ ...modulo, soloPropriFollowup: e.target.checked })} className="w-4 h-4 text-brand-600 rounded focus:ring-brand-500" />
+                      </label>
+                      <label className="flex items-center justify-between gap-3 p-3 cursor-pointer">
+                        <span>
+                          <span className="block text-sm font-semibold text-slate-900 dark:text-white">Può esportare in Excel</span>
+                          <span className="block text-xs text-slate-500">Scaricare elenchi di contatti, esiti e follow-up.</span>
+                        </span>
+                        <input type="checkbox" checked={modulo.puoEsportare} onChange={e => setModulo({ ...modulo, puoEsportare: e.target.checked })} className="w-4 h-4 text-brand-600 rounded focus:ring-brand-500" />
+                      </label>
+                      </>}
+                      {modulo.role === 'Editor' && (
+                        <div className="flex items-center justify-between gap-3 p-3">
+                          <label htmlFor="u-lim">
+                            <span className="block text-sm font-semibold text-slate-900 dark:text-white">Massimo numeri per campagna</span>
+                            <span className="block text-xs text-slate-500">Vuoto = nessun limite.</span>
+                          </label>
+                          <input id="u-lim" type="number" min={1} max={5000} inputMode="numeric" value={modulo.limiteNumeri}
+                            onChange={e => setModulo({ ...modulo, limiteNumeri: e.target.value })} placeholder="—"
+                            className="w-24 px-2.5 py-1.5 text-sm text-right rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-none focus:border-brand-500" />
+                        </div>
+                      )}
+                    </fieldset>
+                  )}
 
                   <div>
                     <label className={etichetta} htmlFor="u-pw">{modulo.nuovo ? 'Password' : 'Nuova password'}</label>

@@ -4,6 +4,7 @@ import * as XLSX from 'xlsx';
 import { cn } from '../lib/utils';
 import { authFetch } from '../lib/authFetch';
 import { ESITI_COMMERCIALI, EsitoCommerciale } from './liveStati';
+import { useCampaign } from '../context/CampaignContext';
 
 interface CallResult {
   callId: string;
@@ -191,6 +192,8 @@ function StatsBar() {
 }
 
 export function CallResultsSection() {
+  const { user } = useCampaign();
+  const puoEsportare = user?.puoEsportare !== false;
   const [results, setResults] = useState<CallResult[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
@@ -272,13 +275,13 @@ export function CallResultsSection() {
           <option value="altro">Altro</option>
         </select>
 
-        <button
+        {puoEsportare && <button
           onClick={exportExcel}
           disabled={filtered.length === 0}
           className="flex items-center justify-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 disabled:opacity-40 disabled:cursor-not-allowed text-white shrink-0"
         >
           <Download className="w-3.5 h-3.5" /> Esporta
-        </button>
+        </button>}
 
         <button
           onClick={() => load()}

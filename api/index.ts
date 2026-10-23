@@ -514,12 +514,16 @@ async function closeAutoFollowups(numero: string | null, motivi: string[]) {
   }
 }
 
-app.get("/api/followups", requireAuth, async (req, res) => {
+app.get("/api/followups", requireAuth, async (req: any, res) => {
   const stato = (req.query.stato as string) || "pending";
   try {
     await ensureFollowupsExtra().catch(err => console.error("Colonne follow-up:", err));
+    const me = await findSessionUser(req.session.username);
+    const solo = permessiUtente(me).soloPropriFollowup ? String(req.session.username).toLowerCase() : null;
     const rows = await sql`
-      SELECT * FROM followups WHERE stato = ${stato} ORDER BY created_at DESC LIMIT 500
+      SELECT * FROM followups WHERE stato = ${stato}
+        AND (${solo}::text IS NULL OR lower(assegnato_a) = ${solo})
+      ORDER BY created_at DESC LIMIT 500
     `;
     res.json({ ok: true, followups: rows });
   } catch (err) {
@@ -527,6 +531,21 @@ app.get("/api/followups", requireAuth, async (req, res) => {
     res.status(500).json({ ok: false, followups: [] });
   }
 });
+
+// Chi può modificare un follow-up: non i Viewer; chi vede solo i propri, solo quelli assegnati a sé.
+async function puoModificareFollowup(req: any, res: any, id: number): Promise<boolean> {
+  const me = await findSessionUser(req.session.username);
+  if (!me) { res.status(401).json({ ok: false, error: "Utente non trovato" }); return false; }
+  if (me.role === "Viewer") { res.status(403).json({ ok: false, error: "In sola lettura" }); return false; }
+  if (permessiUtente(me).soloPropriFollowup) {
+    const r = (await sql!`SELECT assegnato_a FROM followups WHERE id = ${id}`) as any[];
+    if (r[0] && (r[0].assegnato_a || "").toLowerCase() !== String(req.session.username).toLowerCase()) {
+      res.status(403).json({ ok: false, error: "Puoi gestire solo i follow-up assegnati a te" });
+      return false;
+    }
+  }
+  return true;
+}
 
 // Azioni su più follow-up insieme (Admin ed Editor): assegna a una persona o segna fatti.
 // Chi riceve l'assegnazione ha un avviso nel sito per ogni contatto e una sola email riepilogativa.
@@ -540,6 +559,10 @@ app.post("/api/followups/bulk", requireAuth, express.json(), async (req: any, re
   if (ids.length > 500) return res.status(400).json({ ok: false, error: "Massimo 500 follow-up per volta" });
   try {
     await ensureFollowupsExtra();
+    if (permessiUtente(me).soloPropriFollowup) {
+      const miei = (await sql`SELECT id FROM followups WHERE id = ANY(${ids}::int[]) AND lower(assegnato_a) = ${String(req.session.username).toLowerCase()}`) as any[];
+      if (miei.length !== ids.length) return res.status(403).json({ ok: false, error: "Puoi gestire solo i follow-up assegnati a te" });
+    }
     if (b.azione === "fatto") {
       const r = (await sql`UPDATE followups SET stato = 'done', aggiornato_at = now(), aggiornato_da = ${req.session.username} WHERE id = ANY(${ids}::int[]) AND stato = 'pending' RETURNING id`) as any[];
       return res.json({ ok: true, aggiornati: r.length });
@@ -573,6 +596,7 @@ app.post("/api/followups/bulk", requireAuth, express.json(), async (req: any, re
 app.put("/api/followups/:id", requireAuth, express.json(), async (req: any, res) => {
   const id = parseInt(req.params.id, 10);
   if (!sql || !(id > 0)) return res.status(400).json({ ok: false, error: "Richiesta non valida" });
+  if (!(await puoModificareFollowup(req, res, id))) return;
   const body = req.body || {};
   const nota = body.nota === undefined ? undefined : (cleanText(body.nota, 2000) || null);
   let assegnato: string | null | undefined = undefined;
@@ -892,6 +916,9 @@ app.get("/api/utenti/nomi", requireAuth, async (_req, res) => {
 });
 
 app.post("/api/followups/:id/done", requireAuth, express.json(), async (req, res) => {
+  const fid = parseInt(req.params.id, 10);
+  if (!sql || !(fid > 0)) return res.status(400).json({ ok: false });
+  if (!(await puoModificareFollowup(req, res, fid))) return;
   try {
     await sql`UPDATE followups SET stato = 'done' WHERE id = ${parseInt(req.params.id)}`;
     res.json({ ok: true });
@@ -1611,6 +1638,7 @@ app.post("/api/login", async (req, res) => {
       canSchedule: user.canSchedule === true,
       email: user.email || "",
       telefono: user.telefono || "",
+      ...permessiUtente(user),
       twoFactorEnabled: false,
       twoFactorRequired: false,
     });
@@ -1708,6 +1736,7 @@ app.post("/api/verify-otp", async (req, res) => {
     canSchedule: user.canSchedule === true,
     email: user.email || "",
     telefono: user.telefono || "",
+    ...permessiUtente(user),
     twoFactorEnabled: true,
     twoFactorRequired: true,
   });
@@ -1738,6 +1767,9 @@ app.get("/api/users", requireAuth, requireAdmin, async (req, res) => {
     email: u.email || "",
     telefono: u.telefono || "",
     ultimoAccesso: accessi.get(String(u.username).toLowerCase()) || null,
+    soloPropriFollowup: u.soloPropriFollowup === true,
+    puoEsportare: u.puoEsportare !== false,
+    limiteNumeri: parseInt(u.limiteNumeri, 10) > 0 ? parseInt(u.limiteNumeri, 10) : null,
     followupAperti: followup.get(String(u.username).toLowerCase()) || 0,
   }));
   res.json(safeUsers);
@@ -1746,6 +1778,17 @@ app.get("/api/users", requireAuth, requireAdmin, async (req, res) => {
 const EMAIL_VALIDA = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const RUOLI = ["Admin", "Editor", "Viewer"];
 const ruoloDi = (u: any) => u.role || (u.isAdmin ? "Admin" : "Editor");
+// Permessi in più dal modulo Admin (campi assenti = lasciati com'erano).
+function leggiPermessi(b: any): Record<string, any> {
+  const p: Record<string, any> = {};
+  if (typeof b.soloPropriFollowup === "boolean") p.soloPropriFollowup = b.soloPropriFollowup;
+  if (typeof b.puoEsportare === "boolean") p.puoEsportare = b.puoEsportare;
+  if (b.limiteNumeri !== undefined) {
+    const n = parseInt(b.limiteNumeri, 10);
+    p.limiteNumeri = n > 0 ? Math.min(n, MAX_CONTACTS_PER_LAUNCH) : null;
+  }
+  return p;
+}
 
 app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
   const { username, password, nome, role, canSchedule } = req.body;
@@ -1766,7 +1809,7 @@ app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
   }
 
   const hashed = await bcrypt.hash(password, 12);
-  users.push({ username, password: hashed, nome, role, isAdmin: role === 'Admin', canSchedule: canSchedule === true, twoFactorRequired: false, twoFactorEnabled: false, ...(email ? { email } : {}), ...(telefono ? { telefono } : {}) });
+  users.push({ username, password: hashed, nome, role, isAdmin: role === 'Admin', canSchedule: canSchedule === true, twoFactorRequired: false, twoFactorEnabled: false, ...(email ? { email } : {}), ...(telefono ? { telefono } : {}), ...leggiPermessi(req.body) });
   await writeUsers(users);
 
   res.json({ ok: true });
@@ -1810,6 +1853,7 @@ app.put("/api/users/:username", requireAuth, requireAdmin, async (req, res) => {
     canSchedule: canSchedule === true,
     ...(email !== undefined ? { email } : {}),
     ...(telefono !== undefined ? { telefono } : {}),
+    ...leggiPermessi(req.body),
   };
   await writeUsers(users);
   
@@ -1962,6 +2006,9 @@ app.get("/api/me", requireAuth, async (req: any, res) => {
     telefono: user.telefono || '',
     twoFactorEnabled: user.twoFactorEnabled === true,
     twoFactorRequired: isTwoFactorRequired(user),
+    role: user.role || (user.isAdmin ? "Admin" : "Editor"),
+    canSchedule: user.canSchedule === true,
+    ...permessiUtente(user),
   });
 });
 
@@ -3719,6 +3766,20 @@ function mapHistoryRow(r: any) {
   };
 }
 
+// Permessi in più, impostati dall'Admin per ogni persona.
+// soloPropriFollowup: vede e gestisce solo i follow-up assegnati a sé (non vale per gli Admin).
+// puoEsportare: può scaricare Excel (predefinito sì).
+// limiteNumeri: massimo di numeri per campagna (vuoto = nessun limite oltre quello del sito).
+function permessiUtente(u: any) {
+  const admin = u?.role === "Admin" || u?.isAdmin === true;
+  const lim = parseInt(u?.limiteNumeri, 10);
+  return {
+    soloPropriFollowup: !admin && u?.soloPropriFollowup === true,
+    puoEsportare: admin || u?.puoEsportare !== false,
+    limiteNumeri: !admin && lim > 0 ? lim : null,
+  };
+}
+
 async function requireEditor(req: any, res: any): Promise<any | null> {
   const user = await findSessionUser(req.session.username);
   if (!user) { res.status(401).json({ ok: false, error: "Utente non trovato" }); return null; }
@@ -3872,10 +3933,9 @@ const LIVE_SENZA_ESITO_MIN = 30;
 // Dati per la pagina "In diretta": campagne delle ultime ore con i conteggi
 // per stato, ultimi eventi e (per gli admin) gli eventi ricevuti da Wildix.
 app.get("/api/live", requireAuth, async (req: any, res) => {
-  // Solo Editor e Admin: i Viewer non vedono la pagina "In diretta".
+  // Tutti la vedono; i Viewer solo in lettura (le azioni sono bloccate nelle loro rotte).
   const user = await findSessionUser(req.session.username);
   if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
-  if (user.role === "Viewer") return res.status(403).json({ ok: false, error: "Non autorizzato" });
   if (!sql) return res.json({ ok: true, campaigns: [], events: [], diagnostics: null });
   const hours = Math.min(Math.max(parseInt(String(req.query.hours || "12"), 10) || 12, 1), 72);
   try {
@@ -3947,11 +4007,11 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
 });
 
 // Dettaglio di una campagna della pagina "In diretta": tutti i numeri con
-// esito, durata e riassunto di Wilma. Solo Editor e Admin.
+// esito, durata e riassunto di Wilma. I Viewer la vedono in sola lettura.
 app.get("/api/live/campaigns/:id", requireAuth, async (req: any, res) => {
   const user = await findSessionUser(req.session.username);
   if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
-  if (user.role === "Viewer") return res.status(403).json({ ok: false, error: "Non autorizzato" });
+  
   const id = parseInt(String(req.params.id), 10);
   if (!sql || !(id > 0)) return res.status(404).json({ ok: false, error: "Campagna non trovata" });
   try {
@@ -4511,6 +4571,11 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
 
   const user = await findSessionUser(req.session.username);
   if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
+  if (user.role === "Viewer") return res.status(403).json({ ok: false, error: "Non autorizzato" });
+  const limite = permessiUtente(user).limiteNumeri;
+  if (limite && contacts.length > limite) {
+    return res.status(400).json({ ok: false, error: `Puoi lanciare al massimo ${limite} numeri per campagna (questa ne ha ${contacts.length}). Dividila o chiedi all'Admin.` });
+  }
 
   // Voicebot: estensione e contesto vengono dalla configurazione salvata,
   // non dal browser, così non si possono indirizzare chiamate altrove.

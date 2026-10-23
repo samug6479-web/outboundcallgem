@@ -24,6 +24,10 @@ export interface User {
   telefono?: string;
   twoFactorEnabled?: boolean;
   twoFactorRequired?: boolean;
+  // Permessi in più impostati dall'Admin
+  soloPropriFollowup?: boolean;
+  puoEsportare?: boolean;
+  limiteNumeri?: number | null;
 }
 
 export interface Contact {
@@ -205,7 +209,9 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
         .then(r => r.ok ? r.json() : null)
         .then(data => {
           if (data?.ok) {
-            const updated = { ...cachedUser, twoFactorEnabled: data.twoFactorEnabled, twoFactorRequired: data.twoFactorRequired, email: data.email, telefono: data.telefono };
+            const updated = { ...cachedUser, twoFactorEnabled: data.twoFactorEnabled, twoFactorRequired: data.twoFactorRequired, email: data.email, telefono: data.telefono,
+              ...(data.role ? { role: data.role, canSchedule: data.canSchedule } : {}),
+              soloPropriFollowup: data.soloPropriFollowup === true, puoEsportare: data.puoEsportare !== false, limiteNumeri: data.limiteNumeri ?? null };
             setUser(updated);
             sessionStorage.setItem('gem_session', JSON.stringify(updated));
           }
@@ -354,7 +360,7 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       const data = await res.json();
       
       if (res.ok && data.ok) {
-        const loggedUser = { username: data.username, nome: data.nome, role: data.role, isAdmin: data.isAdmin, canSchedule: data.canSchedule, email: data.email || '', telefono: data.telefono || '', twoFactorEnabled: data.twoFactorEnabled, twoFactorRequired: data.twoFactorRequired };
+        const loggedUser = { username: data.username, nome: data.nome, role: data.role, isAdmin: data.isAdmin, canSchedule: data.canSchedule, email: data.email || '', telefono: data.telefono || '', twoFactorEnabled: data.twoFactorEnabled, twoFactorRequired: data.twoFactorRequired, soloPropriFollowup: data.soloPropriFollowup === true, puoEsportare: data.puoEsportare !== false, limiteNumeri: data.limiteNumeri ?? null };
         setUser(loggedUser);
         sessionStorage.setItem('gem_session', JSON.stringify(loggedUser));
         if (data.token) sessionStorage.setItem('gem_token', data.token);

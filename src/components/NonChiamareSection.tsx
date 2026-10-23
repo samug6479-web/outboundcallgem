@@ -208,10 +208,10 @@ export function NonChiamareSection() {
             <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cerca numero, nome o motivo..."
               className="w-full pl-9 pr-3 py-1.5 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-brand-500" />
           </div>
-          <button onClick={esporta} disabled={filtrate.length === 0} aria-label="Esporta in Excel" title="Esporta in Excel"
+          {user?.puoEsportare !== false && <button onClick={esporta} disabled={filtrate.length === 0} aria-label="Esporta in Excel" title="Esporta in Excel"
             className="p-1.5 text-slate-400 hover:text-brand-600 hover:bg-brand-50 rounded-lg transition-colors disabled:opacity-40">
             <Download className="w-4 h-4" />
-          </button>
+          </button>}
         </div>
         {loading ? (
           <div className="p-10 flex justify-center text-slate-400"><Loader2 className="w-5 h-5 animate-spin" /></div>
