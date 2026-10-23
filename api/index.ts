@@ -519,12 +519,53 @@ app.get("/api/followups", requireAuth, async (req, res) => {
   try {
     await ensureFollowupsExtra().catch(err => console.error("Colonne follow-up:", err));
     const rows = await sql`
-      SELECT * FROM followups WHERE stato = ${stato} ORDER BY created_at DESC LIMIT 200
+      SELECT * FROM followups WHERE stato = ${stato} ORDER BY created_at DESC LIMIT 500
     `;
     res.json({ ok: true, followups: rows });
   } catch (err) {
     console.error("Error reading followups:", err);
     res.status(500).json({ ok: false, followups: [] });
+  }
+});
+
+// Azioni su più follow-up insieme (Admin ed Editor): assegna a una persona o segna fatti.
+// Chi riceve l'assegnazione ha un avviso nel sito per ogni contatto e una sola email riepilogativa.
+app.post("/api/followups/bulk", requireAuth, express.json(), async (req: any, res) => {
+  const me = await findSessionUser(req.session.username);
+  if (!me) return res.status(401).json({ ok: false, error: "Utente non trovato" });
+  if (me.role === "Viewer") return res.status(403).json({ ok: false, error: "Non autorizzato" });
+  const b = req.body || {};
+  const ids = [...new Set((Array.isArray(b.ids) ? b.ids : []).map((x: any) => parseInt(x, 10)).filter((x: number) => x > 0))] as number[];
+  if (!sql || ids.length === 0) return res.status(400).json({ ok: false, error: "Nessun follow-up selezionato" });
+  if (ids.length > 500) return res.status(400).json({ ok: false, error: "Massimo 500 follow-up per volta" });
+  try {
+    await ensureFollowupsExtra();
+    if (b.azione === "fatto") {
+      const r = (await sql`UPDATE followups SET stato = 'done', aggiornato_at = now(), aggiornato_da = ${req.session.username} WHERE id = ANY(${ids}::int[]) AND stato = 'pending' RETURNING id`) as any[];
+      return res.json({ ok: true, aggiornati: r.length });
+    }
+    if (b.azione !== "assegna") return res.status(400).json({ ok: false, error: "Azione non valida" });
+    let assegnato: string | null = null;
+    if (b.assegnato_a) {
+      const u = await findSessionUser(String(b.assegnato_a));
+      if (!u) return res.status(400).json({ ok: false, error: "Utente non trovato" });
+      assegnato = u.username;
+    }
+    const messaggio = cleanText(b.messaggio, 500) || null;
+    const prima = new Map(((await sql`SELECT id, assegnato_a FROM followups WHERE id = ANY(${ids}::int[])`) as any[]).map(x => [x.id, (x.assegnato_a || "").toLowerCase()]));
+    const r = (await sql`
+      UPDATE followups SET assegnato_a = ${assegnato}, aggiornato_at = now(), aggiornato_da = ${req.session.username}
+      WHERE id = ANY(${ids}::int[]) RETURNING *
+    `) as any[];
+    let avvisato = false;
+    if (assegnato && assegnato.toLowerCase() !== String(req.session.username).toLowerCase()) {
+      const cambiati = r.filter(x => prima.get(x.id) !== assegnato!.toLowerCase());
+      if (cambiati.length) avvisato = await avvisaAssegnazioni(cambiati, assegnato, req.session.username, messaggio);
+    }
+    res.json({ ok: true, aggiornati: r.length, avvisato, followups: r });
+  } catch (err) {
+    console.error("Errore azione su più follow-up:", err);
+    res.status(500).json({ ok: false, error: "Errore aggiornamento" });
   }
 });
 
@@ -706,6 +747,101 @@ async function avvisaAssegnazione(f: any, username: string, daUsername: string):
       from: `"GEM Outbound" <${process.env.SMTP_USER}>`,
       to,
       subject: `Nuovo follow-up per te: ${chi}${f.motivo ? ` · ${f.motivo}` : ""}`,
+      text,
+      html,
+    });
+    return true;
+  } catch (err) {
+    console.error("Errore email assegnazione follow-up:", err);
+    return false;
+  }
+}
+
+// Più follow-up assegnati insieme: un avviso nel sito per ciascuno, una sola email.
+async function avvisaAssegnazioni(fs: any[], username: string, daUsername: string, messaggio: string | null): Promise<boolean> {
+  if (fs.length === 1 && !messaggio) return avvisaAssegnazione(fs[0], username, daUsername);
+  const destinatario = await findSessionUser(username).catch(() => null);
+  const da = await findSessionUser(daUsername).catch(() => null);
+  const daNome = da?.nome || daUsername;
+  try {
+    await ensureNotifiche();
+    const u = username.toLowerCase();
+    const idsF = fs.map(f => f.id);
+    await sql!`DELETE FROM notifiche WHERE username = ${u} AND followup_id = ANY(${idsF}::int[]) AND letta_at IS NULL`;
+    for (const f of fs) {
+      const chi = f.nome || f.numero || "Contatto";
+      const testo = [f.motivo, f.numero, messaggio].filter(Boolean).join(" · ");
+      await sql!`
+        INSERT INTO notifiche (username, tipo, titolo, testo, followup_id, creata_da)
+        VALUES (${u}, 'followup_assegnato', ${`${daNome} ti ha assegnato un follow-up: ${chi}`}, ${testo || null}, ${f.id}, ${daNome})
+      `;
+    }
+  } catch (err) {
+    console.error("Errore creazione notifiche:", err);
+  }
+
+  if (!process.env.SMTP_USER) return false;
+  const to = destinatario?.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(destinatario.email) ? destinatario.email : null;
+  if (!to) return false;
+  if ((await preferenzeDi(username)).emailAssegnazioni === false) return false;
+  const appUrl = (process.env.APP_URL || "https://outboundcallgem.vercel.app").replace(/\/$/, "");
+  const link = `${appUrl}/?tab=followups&miei=1`;
+  const nomeDest = (destinatario?.nome || "").split(" ")[0];
+  const n = fs.length;
+  const MAX_RIGHE = 25;
+  const mostrati = fs.slice(0, MAX_RIGHE);
+  const righe = mostrati.map((f, i) => {
+    const border = i < mostrati.length - 1 ? "border-bottom:1px solid #eef1f6;" : "";
+    const chi = f.nome || f.numero || "Contatto";
+    return `<tr>
+      <td style="padding:10px 0;${border}font-size:14px;color:#0f172a;font-weight:600;">${escapeHtml(chi)}${f.numero && f.nome ? `<br><a href="tel:${escapeHtml(f.numero)}" style="font-size:13px;color:#1e3dc8;font-weight:500;text-decoration:none;">${escapeHtml(f.numero)}</a>` : ""}</td>
+      <td style="padding:10px 0;${border}font-size:13px;color:#64748b;text-align:right;">${escapeHtml(f.motivo || "")}</td></tr>`;
+  }).join("");
+  const step = (k: number, t: string, d: string) => `<tr>
+      <td style="vertical-align:top;width:34px;padding:0 0 14px;"><div style="width:24px;height:24px;line-height:24px;border-radius:999px;background:#e0e7ff;color:#1e3dc8;font-size:12px;font-weight:700;text-align:center;">${k}</div></td>
+      <td style="padding:2px 0 14px;font-size:14px;color:#475569;line-height:1.5;"><strong style="color:#0f172a;">${t}</strong> ${d}</td></tr>`;
+  const titolo = n === 1 ? "Nuovo follow-up da gestire" : `${n} nuovi follow-up da gestire`;
+  const html = `
+<div style="background:#eef1f6;padding:28px 12px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0;">
+  <tr><td style="padding:28px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+    <td><img src="${appUrl}/gem-logo-color.png" width="96" alt="GEM Group" style="display:block;width:96px;height:auto;"></td>
+    <td style="text-align:right;"><span style="display:inline-block;background:#e0e7ff;color:#1e3dc8;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;">&#9679; Assegnati a te</span></td></tr></table></td></tr>
+  <tr><td style="padding:26px 40px 6px;font-size:24px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">${titolo}</td></tr>
+  <tr><td style="padding:0 40px 20px;font-size:15px;color:#475569;line-height:1.6;">Ciao${nomeDest ? ` ${escapeHtml(nomeDest)}` : ""}, <strong style="color:#0f172a;">${escapeHtml(daNome)}</strong> ti ha assegnato ${n === 1 ? "questo contatto" : `questi ${n} contatti`} da ricontattare.</td></tr>
+  ${messaggio ? `<tr><td style="padding:0 40px 16px;"><div style="background:#f8fafc;border-left:3px solid #1e3dc8;padding:12px 16px;font-size:14px;color:#475569;line-height:1.5;"><strong style="color:#0f172a;">Messaggio di ${escapeHtml(daNome)}:</strong> ${escapeHtml(messaggio)}</div></td></tr>` : ""}
+  <tr><td style="padding:0 40px 8px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border-radius:10px;"><tr><td style="padding:6px 20px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${righe}</table></td></tr></table></td></tr>
+  ${n > MAX_RIGHE ? `<tr><td style="padding:4px 40px 0;font-size:13px;color:#64748b;">e altri ${n - MAX_RIGHE}: li trovi tutti nel sito.</td></tr>` : ""}
+  <tr><td style="padding:24px 40px 4px;font-size:13px;font-weight:700;color:#0f172a;text-transform:uppercase;letter-spacing:0.6px;">Cosa fare</td></tr>
+  <tr><td style="padding:8px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+    ${step(1, "Richiama i contatti", "partendo da quelli più recenti.")}
+    ${step(2, "Aggiungi una nota", "in ogni follow-up con l'esito della telefonata.")}
+    ${step(3, "Premi Fatto", "quando un contatto è gestito: sparisce dalla lista Da gestire.")}
+  </table></td></tr>
+  <tr><td style="padding:12px 40px 34px;"><a href="${link}" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:14px 20px;border-radius:9px;">Apri i miei follow-up</a></td></tr>
+  <tr><td style="padding:18px 40px;border-top:1px solid #eef1f6;font-size:12px;color:#94a3b8;line-height:1.6;">GEM Group &middot; Soluzioni di comunicazione e automazione AI su tecnologia Wildix<br>Email automatica inviata da GEM Outbound. Puoi disattivarla da Il Mio Profilo &rsaquo; Avvisi.</td></tr>
+</table></div>`;
+  const text = [
+    titolo, "",
+    `Ciao${nomeDest ? ` ${nomeDest}` : ""}, ${daNome} ti ha assegnato ${n === 1 ? "questo contatto" : `questi ${n} contatti`} da ricontattare.`,
+    ...(messaggio ? ["", `Messaggio di ${daNome}: ${messaggio}`] : []),
+    "",
+    ...mostrati.map(f => `- ${f.nome || f.numero || "Contatto"}${f.numero && f.nome ? ` (${f.numero})` : ""}${f.motivo ? ` · ${f.motivo}` : ""}`),
+    ...(n > MAX_RIGHE ? [`e altri ${n - MAX_RIGHE}`] : []),
+    "", `Apri i miei follow-up: ${link}`,
+  ].join("\n");
+  try {
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || "smtp.gmail.com",
+      port: parseInt(process.env.SMTP_PORT || "587"),
+      secure: process.env.SMTP_SECURE === "true",
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+    await transporter.sendMail({
+      from: `"GEM Outbound" <${process.env.SMTP_USER}>`,
+      to,
+      subject: n === 1 ? `Nuovo follow-up per te: ${fs[0].nome || fs[0].numero || "Contatto"}` : `${n} nuovi follow-up per te, da ${daNome}`,
       text,
       html,
     });
