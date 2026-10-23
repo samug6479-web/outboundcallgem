@@ -16,6 +16,7 @@ interface LiveCampaign {
   registrate: number;
   in_coda: number;
   avviate: number;
+  senza_esito: number;
   risposte: number;
   interrotte: number;
   non_risposte: number;
@@ -39,7 +40,7 @@ interface LiveEvent {
   voicebot_nome: string | null;
 }
 
-type Stato = 'in_coda' | 'avviata' | 'risposta' | 'interrotta' | 'non_risposta' | 'non_partita' | 'errore';
+type Stato = 'in_coda' | 'avviata' | 'senza_esito' | 'risposta' | 'interrotta' | 'non_risposta' | 'non_partita' | 'errore';
 
 const POLL_MS = 4000;
 // Oltre questi minuti senza avanzamenti la coda viene segnalata come ferma.
@@ -56,6 +57,8 @@ const STATI: Record<Stato, { label: string; color: string; bar: string; icon: Re
   // Wildix non ha completato la chiamata: rifiutata, occupato, nessuna risposta o numero non raggiungibile
   non_partita: { label: 'Non partita', color: 'text-orange-600 dark:text-orange-400', bar: 'bg-orange-400', icon: PhoneForwarded },
   errore: { label: 'Errore', color: 'text-red-600 dark:text-red-400', bar: 'bg-red-500', icon: XCircle },
+  // Wildix ha accettato la chiamata ma da oltre 30 minuti non è arrivato l'evento di fine
+  senza_esito: { label: 'Senza esito', color: 'text-slate-500 dark:text-slate-400', bar: 'bg-slate-300 dark:bg-slate-600', icon: AlertTriangle },
 };
 
 const minutiDa = (iso: string | null, now: number) => (iso ? (now - new Date(iso).getTime()) / 60000 : Infinity);
@@ -222,7 +225,7 @@ export function LiveSection() {
             const gestite = c.registrate - c.in_coda;
             const parts: [Stato, number][] = [
               ['risposta', c.risposte], ['interrotta', c.interrotte], ['non_risposta', c.non_risposte],
-              ['non_partita', c.non_partite], ['errore', c.errori], ['avviata', c.avviate], ['in_coda', c.in_coda],
+              ['non_partita', c.non_partite], ['errore', c.errori], ['senza_esito', c.senza_esito || 0], ['avviata', c.avviate], ['in_coda', c.in_coda],
             ];
             const finita = c.in_coda === 0 && c.avviate === 0;
             return (
@@ -338,6 +341,7 @@ export function LiveSection() {
         "In corso" significa che Wildix ha accettato la chiamata: l'esito arriva quando la chiamata finisce.
         "Non partita": Wildix non ha completato la chiamata (rifiutata, occupato, nessuna risposta o numero non raggiungibile).
         "Errore": la richiesta non è arrivata a Wildix.
+        "Senza esito": Wildix ha accettato la chiamata ma dopo 30 minuti non ha ancora comunicato come è finita.
       </p>
 
       {/* Diagnostica (solo admin): eventi Wildix non usati */}

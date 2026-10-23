@@ -2807,6 +2807,12 @@ app.post("/api/archivio/importa", requireAuth, async (req: any, res) => {
   }
 });
 
+// Una chiamata accettata da Wildix senza evento di fine da più di tanti minuti
+// viene mostrata come "Senza esito" (nessuna chiamata del voicebot dura così a
+// lungo). Lo stato nel database resta "avviata": se l'evento arriva in ritardo
+// l'esito viene comunque corretto.
+const LIVE_SENZA_ESITO_MIN = 30;
+
 // Dati per la pagina "In diretta": campagne delle ultime ore con i conteggi
 // per stato, ultimi eventi e (per gli admin) gli eventi ricevuti da Wildix.
 app.get("/api/live", requireAuth, async (req: any, res) => {
@@ -2822,7 +2828,8 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
       SELECT c.id, c.created_at, c.operatore, c.tipo_campagna, c.voicebot_nome, c.voicebot_exten, c.totale, c.scheduled_id,
         count(l.id)::int AS registrate,
         count(*) FILTER (WHERE l.stato = 'in_coda')::int      AS in_coda,
-        count(*) FILTER (WHERE l.stato = 'avviata')::int      AS avviate,
+        count(*) FILTER (WHERE l.stato = 'avviata' AND l.updated_at > now() - make_interval(mins => ${LIVE_SENZA_ESITO_MIN}::int))::int AS avviate,
+        count(*) FILTER (WHERE l.stato = 'avviata' AND l.updated_at <= now() - make_interval(mins => ${LIVE_SENZA_ESITO_MIN}::int))::int AS senza_esito,
         count(*) FILTER (WHERE l.stato = 'risposta')::int     AS risposte,
         count(*) FILTER (WHERE l.stato = 'interrotta')::int   AS interrotte,
         count(*) FILTER (WHERE l.stato = 'non_risposta')::int AS non_risposte,
@@ -2838,7 +2845,10 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
       LIMIT 30
     `) as any[];
     const events = (await sql`
-      SELECT l.id, l.campaign_id, l.numero, l.nome, l.stato, l.errore, l.durata_ms, l.queued_at, l.updated_at,
+      SELECT l.id, l.campaign_id, l.numero, l.nome,
+             CASE WHEN l.stato = 'avviata' AND l.updated_at <= now() - make_interval(mins => ${LIVE_SENZA_ESITO_MIN}::int)
+                  THEN 'senza_esito' ELSE l.stato END AS stato,
+             l.errore, l.durata_ms, l.queued_at, l.updated_at,
              c.operatore, c.voicebot_nome
       FROM live_calls l
       LEFT JOIN live_campaigns c ON c.id = l.campaign_id
