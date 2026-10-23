@@ -86,7 +86,7 @@ Con più campagne pianificate la sveglia è una sola, sulla prima. Una campagna 
 Le chiamate alle API di Make non consumano operazioni: si paga solo un'esecuzione quando c'è davvero qualcosa da fare.
 
 Per attivarla, su Vercel (Production):
-- `MAKE_API_TOKEN`: token API di Make (profilo → API → Add token) con permesso `scenarios:write`.
+- `MAKE_API_TOKEN` (accettato anche `MAKE_API_TOKE`): token API di Make (profilo → API → Add token) con permesso `scenarios:write`.
 - `MAKE_TIMER_SCENARIO_ID` (facoltativa, default `8130692`) e `MAKE_API_URL` (facoltativa, default `https://eu1.make.com/api/v2`).
 
 In alternativa, qualsiasi servizio può chiamare `/api/cron/tick` a intervalli fissi (header `x-gem-secret`), ma consuma un'esecuzione a ogni giro.

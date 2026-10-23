@@ -2437,14 +2437,18 @@ async function timerAttivo(): Promise<boolean> {
 // non consumano operazioni. Serve MAKE_API_TOKEN (permesso scenarios:write).
 const MAKE_API_URL = (process.env.MAKE_API_URL || "https://eu1.make.com/api/v2").replace(/\/$/, "");
 const MAKE_TIMER_SCENARIO_ID = (process.env.MAKE_TIMER_SCENARIO_ID || "8130692").trim();
+// Su Vercel la variabile è stata creata come MAKE_API_TOKE: si accettano entrambi i nomi.
+function makeApiToken(): string {
+  return (process.env.MAKE_API_TOKEN || process.env.MAKE_API_TOKE || "").trim();
+}
 function svegliaConfigurata(): boolean {
-  return !!process.env.MAKE_API_TOKEN && !!MAKE_TIMER_SCENARIO_ID;
+  return !!makeApiToken() && !!MAKE_TIMER_SCENARIO_ID;
 }
 
 async function makeApi(path: string, method: string, body?: unknown): Promise<{ ok: boolean; status: number; testo: string }> {
   const r = await fetch(`${MAKE_API_URL}${path}`, {
     method,
-    headers: { Authorization: `Token ${process.env.MAKE_API_TOKEN}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Token ${makeApiToken()}`, "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(10000),
   });
