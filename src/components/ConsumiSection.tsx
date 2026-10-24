@@ -3,6 +3,7 @@ import { Loader2, Download, Gauge, Info } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { authFetch } from '../lib/authFetch';
 import { cn } from '../lib/utils';
+import { TracceWildix } from './TracceWildix';
 
 interface Somma { partite: number; risposte: number; minuti: number; minutiFatturabili: number }
 interface Riga extends Somma { chiave: string }
@@ -165,6 +166,8 @@ export function ConsumiSection() {
           </div>
         )}
       </section>
+
+      {!d.perAzienda ? null : <TracceWildix />}
 
       <p className="flex items-start gap-2 text-xs text-slate-500">
         <Info className="w-4 h-4 shrink-0 mt-0.5" />
