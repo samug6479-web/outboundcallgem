@@ -2957,10 +2957,9 @@ async function sendCampaignEmail(opts: {
 // chiamate a spese dell'azienda). Ora il browser chiama queste rotte, che
 // richiedono il login, validano i dati e inoltrano a Make dal server.
 // ══════════════════════════════════════════════════════════════
-const MAKE_WEBHOOK_URL_DEFAULT =
-  process.env.MAKE_WEBHOOK_URL || "https://hook.eu1.make.com/ac3icgiyh1nbvvh463w33qh58uenvfgo";
-const MAKE_WEBHOOK_URL_APPUNTAMENTI =
-  process.env.MAKE_WEBHOOK_URL_APPUNTAMENTI || "https://hook.eu1.make.com/9f7h1ebgktojphmiulyqte4ux7f3tjqv";
+// Nessun URL di riserva nel codice: i vecchi erano pubblici nel repository.
+const MAKE_WEBHOOK_URL_DEFAULT = process.env.MAKE_WEBHOOK_URL || "";
+const MAKE_WEBHOOK_URL_APPUNTAMENTI = process.env.MAKE_WEBHOOK_URL_APPUNTAMENTI || "";
 const MAX_CONTACTS_PER_LAUNCH = 5000;
 const MAKE_PARALLEL_REQUESTS = 20;
 
@@ -3089,6 +3088,11 @@ async function sendCampaignToMake(spec: CampaignSpec) {
     : webhookMakeValido(az?.webhookChiamate) || MAKE_WEBHOOK_URL_DEFAULT;
   const avviatoIl = new Date().toISOString();
   const dryRun = isCallsDryRun();
+  if (!dryRun && !webhookUrl) {
+    throw new Error(spec.campaignType === "appuntamenti"
+      ? "Webhook Make appuntamenti non configurato: imposta MAKE_WEBHOOK_URL_APPUNTAMENTI su Vercel."
+      : "Webhook Make non configurato: imposta MAKE_WEBHOOK_URL su Vercel.");
+  }
 
   if (!dryRun && isCodaSito()) {
     const concurrency = Math.min(Math.max(spec.chunkSize || 1, 1), maxSimultanee(spec.campaignType));
