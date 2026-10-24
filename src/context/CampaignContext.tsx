@@ -147,6 +147,8 @@ interface CampaignContextType {
   loadVoicebots: () => Promise<void>;
   richiamate: Richiamate;
   setRichiamate: (r: Richiamate) => void;
+  rpoVerificato: boolean;
+  setRpoVerificato: (v: boolean) => void;
   maxConcurrency: number;
   avviaConContatti: (contatti: { nome: string | null; numero: string }[]) => void;
   reloadConfig: () => void;
@@ -192,6 +194,10 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
   const [voicebots, setVoicebots] = useState<Voicebot[]>([]);
   const [selectedVoicebot, setSelectedVoicebot] = useState<Voicebot | null>(null);
   const [richiamate, setRichiamate] = useState<Richiamate>({ tentativi: 0, intervalloMin: 120 });
+  // Conferma dell'operatore: lista verificata nel Registro pubblico delle opposizioni (campagne standard).
+  const [rpoVerificato, setRpoVerificato] = useState(false);
+  // Nuova lista = nuova verifica.
+  useEffect(() => { setRpoVerificato(false); }, [contacts]);
   const [historyFilter, setHistoryFilter] = useState({ operator: '', dateFrom: '', dateTo: '', search: '' });
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [lists, setLists] = useState<ContactList[]>([]);
@@ -670,6 +676,7 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
           voicebot_id: selectedVoicebot?.id,
           concurrency,
           richiamate: appConfig.codaSito ? richiamate : undefined,
+          rpoVerificato: campaignType === 'standard' ? rpoVerificato : undefined,
         })
       });
       const data = await res.json().catch(() => ({}));
@@ -731,7 +738,7 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       campaignNote, setCampaignNote,
       campaignType, setCampaignType,
       voicebots, selectedVoicebot, setSelectedVoicebot, loadVoicebots,
-      richiamate, setRichiamate, maxConcurrency, avviaConContatti, reloadConfig,
+      richiamate, setRichiamate, maxConcurrency, avviaConContatti, reloadConfig, rpoVerificato, setRpoVerificato,
       historyFilter, setHistoryFilter, filteredHistory, exportHistoryToXLSX,
       history, clearHistory, loadHistory, appConfig,
       scheduledCampaigns, loadScheduledCampaigns, cancelScheduledCampaign,

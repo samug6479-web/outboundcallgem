@@ -40,12 +40,15 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
     selectedVoicebot, campaignType,
     testSingleCall, testStatus,
     campaignNote, setCampaignNote,
-    richiamate, maxConcurrency,
+    richiamate, maxConcurrency, rpoVerificato, setRpoVerificato,
     historyFilter, setHistoryFilter, filteredHistory, exportHistoryToXLSX,
     history, clearHistory, saveList,
   } = useCampaign();
   const puoEsportare = user?.puoEsportare !== false;
   const oltreLimite = !!user?.limiteNumeri && validContacts.length > user.limiteNumeri;
+  // Le campagne standard chiamano persone che potrebbero non essere clienti: serve la verifica nel Registro delle opposizioni.
+  const serveRpo = campaignType === 'standard' && validContacts.length > 0;
+  const bloccoRpo = serveRpo && !rpoVerificato;
 
   const [expandedHistory, setExpandedHistory] = useState<string | null>(null);
   const [isSavingList, setIsSavingList] = useState(false);
@@ -311,11 +314,23 @@ export function LaunchSidebar({ mode = 'all' }: { mode?: 'launch' | 'history' | 
             </div>
           )}
 
+          {/* Registro pubblico delle opposizioni: dichiarazione prima del lancio */}
+          {serveRpo && (
+            <label className={cn('mb-3 flex items-start gap-2.5 p-3 rounded-xl border text-xs cursor-pointer',
+              rpoVerificato ? 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300' : 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900/50 dark:bg-amber-900/10 dark:text-amber-200')}>
+              <input type="checkbox" checked={rpoVerificato} onChange={e => setRpoVerificato(e.target.checked)} className="mt-0.5 shrink-0" />
+              <span>
+                <strong>Ho verificato questa lista nel Registro pubblico delle opposizioni</strong>, oppure i contatti hanno dato il consenso a essere chiamati.
+                {' '}<a href="https://www.registrodelleopposizioni.it/" target="_blank" rel="noopener noreferrer" className="underline" onClick={e => e.stopPropagation()}>Cos'è</a>
+              </span>
+            </label>
+          )}
+
           {/* Launch button */}
-          <button onClick={launchCampaign} disabled={isLaunching || validContacts.length === 0 || oltreLimite}
+          <button onClick={launchCampaign} disabled={isLaunching || validContacts.length === 0 || oltreLimite || bloccoRpo}
             className={cn(
               "w-full py-4 px-6 rounded-xl font-display font-extrabold text-base flex items-center justify-center gap-3 transition-all duration-200",
-              validContacts.length === 0 || oltreLimite ? "bg-slate-100 dark:bg-slate-800 text-slate-400 cursor-not-allowed"
+              validContacts.length === 0 || oltreLimite || bloccoRpo ? "bg-slate-100 dark:bg-slate-800 text-slate-400 cursor-not-allowed"
                 : "bg-brand-600 hover:bg-brand-700 text-white shadow-soft-blue hover:shadow-lg hover:-translate-y-0.5",
               isLaunching && "opacity-80 pointer-events-none"
             )}>

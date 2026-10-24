@@ -702,6 +702,7 @@ app.post("/api/followups/bulk", requireAuth, express.json(), async (req: any, re
       const esito = esitoFinaleValido(b.esito);
       const r = (await sql`UPDATE followups SET stato = 'done', esito_finale = ${esito}, chiuso_at = now(), chiuso_da = ${req.session.username},
         aggiornato_at = now(), aggiornato_da = ${req.session.username} WHERE id = ANY(${ids}::int[]) AND stato = 'pending' AND azienda = ${req.azienda} RETURNING id`) as any[];
+      await registra(req, "followup_chiusi", `${r.length} follow-up${esito ? `, esito ${ESITO_FINALE_LABEL[esito]}` : ""}`);
       return res.json({ ok: true, aggiornati: r.length });
     }
     if (b.azione !== "assegna") return res.status(400).json({ ok: false, error: "Azione non valida" });
@@ -722,6 +723,7 @@ app.post("/api/followups/bulk", requireAuth, express.json(), async (req: any, re
       const cambiati = r.filter(x => prima.get(x.id) !== assegnato!.toLowerCase());
       if (cambiati.length) avvisato = await avvisaAssegnazioni(cambiati, assegnato, req.session.username, messaggio);
     }
+    await registra(req, "followup_assegnati", `${r.length} follow-up a ${assegnato || "nessuno"}`);
     res.json({ ok: true, aggiornati: r.length, avvisato, followups: r });
   } catch (err) {
     console.error("Errore azione su più follow-up:", err);
@@ -776,6 +778,7 @@ app.put("/api/followups/:id", requireAuth, express.json(), async (req: any, res)
       avvisato = await avvisaAssegnazione(r[0], assegnato, req.session.username);
     }
     if (richiamare) aggiornaSveglia().catch(() => {});
+    if (assegnato !== undefined) await registra(req, "followup_assegnato", `${r[0].nome || r[0].numero || "Contatto"} a ${assegnato || "nessuno"}`);
     res.json({ ok: true, followup: r[0], avvisato });
   } catch (err) {
     console.error("Errore aggiornamento follow-up:", err);
@@ -1156,6 +1159,7 @@ app.get("/api/giornata", requireAuth, async (req: any, res) => {
   try {
     await ensureFollowupsExtra();
     await inviaPromemoriaFollowup();
+    conservazioneSeServe().catch(() => {});
     const inizioGiorno = ((await sql`SELECT (date_trunc('day', now() AT TIME ZONE 'Europe/Rome') AT TIME ZONE 'Europe/Rome') AS t`) as any[])[0].t;
     const fineGiorno = new Date(new Date(inizioGiorno).getTime() + 86_400_000).toISOString();
     const miei = await safe(async () => (await sql`
@@ -1312,6 +1316,7 @@ app.post("/api/followups/:id/done", requireAuth, express.json(), async (req, res
     const user = (req as any).session.username;
     await sql`UPDATE followups SET stato = 'done', esito_finale = ${esito}, chiuso_at = now(), chiuso_da = ${user},
       aggiornato_at = now(), aggiornato_da = ${user} WHERE id = ${fid} AND azienda = ${(req as any).azienda}`;
+    await registra(req, "followup_chiuso", `Follow-up ${fid}${esito ? `, esito ${ESITO_FINALE_LABEL[esito]}` : ""}`);
     res.json({ ok: true });
   } catch (err) {
     console.error("Error updating followup:", err);
@@ -2277,13 +2282,16 @@ app.post("/api/users", requireAuth, requireAdmin, async (req: any, res) => {
 
   if (invito) {
     const inviato = await creaEInviaInvito(username, (req as any).session.username).catch(err => { console.error("Errore invito:", err); return false; });
+    await registra(req, "utente_creato", `${username} (${role}), invito via email`);
     return res.json({ ok: true, invitoInviato: inviato });
   }
   // Senza invito ma con l'email: benvenuto con i dati di accesso (se l'Admin lo lascia attivo).
   if (email && req.body.inviaCredenziali !== false) {
     const inviata = await inviaCredenziali(username, String(password), (req as any).session.username).catch(err => { console.error("Errore email credenziali:", err); return false; });
+    await registra(req, "utente_creato", `${username} (${role}), dati di accesso via email`);
     return res.json({ ok: true, credenzialiInviate: inviata });
   }
+  await registra(req, "utente_creato", `${username} (${role})`);
   res.json({ ok: true });
 });
 
@@ -2428,6 +2436,7 @@ app.post("/api/users/:username/invito", requireAuth, requireAdmin, async (req: a
   try {
     const ok = await creaEInviaInvito(u.username, req.session.username);
     if (!ok) return res.status(500).json({ ok: false, error: "Email non inviata: controlla la configurazione email del sito" });
+    await registra(req, "invito_inviato", u.username);
     res.json({ ok: true, email: u.email });
   } catch (err) {
     console.error("Errore invito:", err);
@@ -2543,6 +2552,7 @@ app.put("/api/users/:username", requireAuth, requireAdmin, async (req: any, res)
   };
   await writeUsers(users);
   
+  await registra(req, "utente_modificato", `${username}: ${role}${password && String(password).trim() ? ", nuova password" : ""}`);
   res.json({ ok: true });
 });
 
@@ -2566,6 +2576,7 @@ app.delete("/api/users/:username", requireAuth, requireAdmin, async (req: any, r
   }
 
   await writeUsers(users);
+  await registra(req, "utente_eliminato", username);
   res.json({ ok: true });
 });
 
@@ -2611,6 +2622,7 @@ app.put("/api/users/:username/2fa", requireAuth, async (req: any, res) => {
   }
 
   await writeUsers(users);
+  await registra(req, "2fa", `${username}: ${enabled ? "richiesto" : "spento"}`);
   res.json({ ok: true });
 });
 
@@ -2733,6 +2745,7 @@ app.post("/api/voicebots", requireAuth, requireAdmin, async (req: any, res) => {
   bots.push({ id, nome, exten: parseInt(exten), context, descrizione: descrizione || "", attivo: true, webhookEsiti: webhookEsitiValido(webhookEsiti) || "", azienda: req.azienda });
   try {
     await writeVoicebots(bots);
+    await registra(req, "voicebot_creato", `${nome} (interno ${exten})`);
     res.json({ ok: true, id });
   } catch {
     res.status(500).json({ ok: false, error: "Errore salvataggio su GitHub" });
@@ -2752,6 +2765,7 @@ app.put("/api/voicebots/:id", requireAuth, requireAdmin, async (req: any, res) =
   if ("webhookEsiti" in (req.body || {})) bots[idx].webhookEsiti = webhookEsitiValido(req.body.webhookEsiti) || "";
   try {
     await writeVoicebots(bots);
+    await registra(req, "voicebot_modificato", `${bots[idx].nome}${"attivo" in modifiche ? (bots[idx].attivo === false ? ", disattivato" : ", attivo") : ""}`);
     res.json({ ok: true });
   } catch {
     res.status(500).json({ ok: false, error: "Errore salvataggio su GitHub" });
@@ -2764,6 +2778,7 @@ app.delete("/api/voicebots/:id", requireAuth, requireAdmin, async (req: any, res
   if (bots.length === tutti.length) return res.status(404).json({ ok: false, error: "Voicebot non trovato" });
   try {
     await writeVoicebots(bots);
+    await registra(req, "voicebot_eliminato", tutti.find((b: any) => b.id === req.params.id)?.nome || req.params.id);
     res.json({ ok: true });
   } catch {
     res.status(500).json({ ok: false, error: "Errore eliminazione su GitHub" });
@@ -4376,6 +4391,7 @@ async function handleTick(req: any, res: any) {
     await controllaFineCampagne();
     await inviaPromemoriaFollowup();
     await controlloSalute();
+    await conservazioneSeServe();
     // ?s=1 / ?s=2: quale dei due scenari sveglia sta chiamando.
     const n = parseInt(String(req.query?.s || ""), 10);
     const chiamante = n >= 1 && n <= MAKE_TIMER_SCENARI.length ? MAKE_TIMER_SCENARI[n - 1] : null;
@@ -4519,6 +4535,7 @@ async function controlloSalute(): Promise<ProblemaSalute[]> {
 async function handleSalute(req: any, res: any) {
   if (!tickAutorizzato(req)) return res.status(401).json({ ok: false });
   const problemi = await controlloSalute();
+  await conservazioneSeServe();
   res.json({ ok: true, problemi: problemi.map(p => p.chiave) });
 }
 app.post("/api/cron/salute", handleSalute);
@@ -4580,6 +4597,7 @@ app.post("/api/aziende", requireAuth, requireSuperAdmin, async (req: any, res) =
   const nuova: Azienda = { id, nome: campi.nome, attiva: campi.attiva !== false, webhookChiamate: campi.webhookChiamate || "", webhookAppuntamenti: campi.webhookAppuntamenti || "", creataAt: new Date().toISOString() };
   try {
     await scriviDatiConfig("aziende", [...aziende, nuova]);
+    await registra(req, "azienda_creata", nuova.nome);
     res.json({ ok: true, azienda: nuova });
   } catch (err) {
     console.error("Errore creazione azienda:", err);
@@ -4598,6 +4616,7 @@ app.put("/api/aziende/:id", requireAuth, requireSuperAdmin, async (req: any, res
   aziende[i] = { ...aziende[i], ...campi };
   try {
     await scriviDatiConfig("aziende", aziende);
+    await registra(req, "azienda_modificata", `${aziende[i].nome}${campi.attiva === false ? ", sospesa" : campi.attiva === true ? ", attiva" : ""}`);
     res.json({ ok: true, azienda: aziende[i] });
   } catch (err) {
     console.error("Errore modifica azienda:", err);
@@ -4616,6 +4635,7 @@ app.delete("/api/aziende/:id", requireAuth, requireSuperAdmin, async (req: any, 
   }
   try {
     await scriviDatiConfig("aziende", aziende.filter(a => a.id !== id));
+    await registra(req, "azienda_eliminata", id);
     res.json({ ok: true });
   } catch (err) {
     console.error("Errore eliminazione azienda:", err);
@@ -4775,6 +4795,7 @@ app.delete("/api/history", requireAuth, requireAdmin, async (req: any, res) => {
   try {
     await ensureArchivioSchema();
     await sql`DELETE FROM campaign_history WHERE test = ${isCallsDryRun()} AND azienda = ${req.azienda}`;
+    await registra(req, "storico_svuotato", null);
     res.json({ ok: true });
   } catch (err) {
     console.error("Errore svuotamento storico:", err);
@@ -4820,6 +4841,7 @@ app.post("/api/lists", requireAuth, async (req: any, res) => {
       VALUES (${user.username}, ${user.nome || user.username}, ${nome}, ${JSON.stringify(contatti)}::jsonb, ${req.azienda})
       RETURNING *
     `) as any[];
+    await registra(req, "lista_salvata", `${nome} (${contatti.length} contatti)`);
     res.json({ ok: true, list: mapListRow(rows[0], user) });
   } catch (err) {
     console.error("Errore salvataggio lista:", err);
@@ -4841,6 +4863,7 @@ app.delete("/api/lists/:id", requireAuth, async (req: any, res) => {
       RETURNING id
     `) as any[];
     if (rows.length === 0) return res.status(403).json({ ok: false, error: "Puoi eliminare solo le liste create da te" });
+    await registra(req, "lista_eliminata", `Lista ${id}`);
     res.json({ ok: true });
   } catch (err) {
     console.error("Errore eliminazione lista:", err);
@@ -5041,6 +5064,7 @@ app.put("/api/live/calls/:id/esito", requireAuth, async (req: any, res) => {
       WHERE id = ${id} AND azienda = ${req.azienda} RETURNING id
     `) as any[];
     if (righe.length === 0) return res.status(404).json({ ok: false, error: "Chiamata non trovata" });
+    await registra(req, "esito_corretto", `Chiamata ${id}: ${esito || "automatico"}`);
     res.json({ ok: true });
   } catch (err) {
     console.error("Errore PUT /api/live/calls/:id/esito:", err);
@@ -5066,6 +5090,7 @@ app.post("/api/live/campaigns/:id/pausa", requireAuth, async (req: any, res) => 
     if (!r[0]) return res.status(409).json({ ok: false, error: "Questa campagna non si può mettere in pausa (già fermata o inviata tutta a Make)" });
     if (!pausa) await pumpCampaign(id);
     await aggiornaSveglia();
+    await registra(req, pausa ? "campagna_pausa" : "campagna_ripresa", `Campagna ${id}`);
     res.json({ ok: true, pausa });
   } catch (err) {
     console.error("Errore pausa campagna:", err);
@@ -5097,6 +5122,7 @@ app.delete("/api/live/campaigns/:id", requireAuth, requireAdmin, async (req: any
     const r = (await sql`DELETE FROM live_campaigns WHERE id = ${id} RETURNING id`) as any[];
     if (!r[0]) return res.status(404).json({ ok: false, error: "Campagna non trovata" });
     await aggiornaSveglia();
+    await registra(req, "campagna_eliminata", `Campagna ${id}`);
     res.json({ ok: true });
   } catch (err) {
     console.error("Errore eliminazione campagna:", err);
@@ -5127,6 +5153,7 @@ app.post("/api/live/campaigns/:id/ferma", requireAuth, async (req: any, res) => 
     await inviaEsitiFalliti(id);
     await controllaFineCampagne(id);
     await aggiornaSveglia();
+    await registra(req, "campagna_fermata", `Campagna ${id}, ${annullate.length} chiamate annullate`);
     res.json({ ok: true, annullate: annullate.length });
   } catch (err) {
     console.error("Errore stop campagna:", err);
@@ -5169,6 +5196,7 @@ app.post("/api/non-chiamare", requireAuth, async (req: any, res) => {
       FROM do_not_call d WHERE l.stato = 'in_coda' AND l.inviata_at IS NULL AND d.numero = l.numero
         AND d.azienda = l.azienda AND l.azienda = ${req.azienda}
     `;
+    await registra(req, "non_chiamare_aggiunti", `${aggiunti} numeri${validi.length === 1 ? ` (${normalizePhone(String(validi[0].numero))})` : ""}`);
     res.json({ ok: true, aggiunti, giaPresenti: validi.length - aggiunti, scartati: voci.length - validi.length });
   } catch (err) {
     console.error("Errore aggiunta Non chiamare:", err);
@@ -5182,6 +5210,7 @@ app.delete("/api/non-chiamare/:numero", requireAuth, requireAdmin, async (req: a
     await ensureDncSchema();
     const n = normalizePhone(decodeURIComponent(String(req.params.numero))) || "";
     const r = (await sql`DELETE FROM do_not_call WHERE numero = ${n} AND azienda = ${req.azienda} RETURNING numero`) as any[];
+    if (r.length) await registra(req, "non_chiamare_rimosso", n);
     res.json({ ok: true, rimossi: r.length });
   } catch (err) {
     console.error("Errore rimozione Non chiamare:", err);
@@ -5210,6 +5239,7 @@ app.put("/api/impostazioni/orari", requireAuth, requireAdmin, async (req: any, r
     // Le code ferme per orario ripartono (o aspettano la nuova apertura).
     await pumpAllQueues();
     await aggiornaSveglia();
+    await registra(req, "orari_modificati", orari.attivo ? descriviOrari(orari) : "spenti");
     res.json({ ok: true, orari, descrizione: descriviOrari(orari) });
   } catch (err) {
     console.error("Errore salvataggio orari:", err);
@@ -5538,6 +5568,8 @@ async function dispatchDueCampaigns(): Promise<void> {
 
 app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
   const { contatti, tipo_campagna, scheduledAt, note, voicebot_id, concurrency, richiamate } = req.body || {};
+  // Dichiarazione dell'operatore: lista verificata nel Registro pubblico delle opposizioni (o con consenso).
+  const rpoVerificato = req.body?.rpoVerificato === true;
   const { retryMax, retryIntervalloMin } = parseRichiamate(richiamate);
   const campaignType = tipo_campagna === "appuntamenti" ? "appuntamenti" : "standard";
 
@@ -5605,6 +5637,7 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
         tipoCampagna: campaignType,
       });
       // Avvisi per l'operatore: numeri oggi in "Non chiamare" e orario fuori fascia.
+      await registra(req, "campagna_pianificata", `${contacts.length} contatti · ${bot?.nome || "voicebot predefinito"} · ${t.toLocaleString("it-IT", { timeZone: "Europe/Rome" })} · ${campaignType === "appuntamenti" ? "conferma appuntamenti" : `Registro opposizioni verificato: ${rpoVerificato ? "sì" : "no"}`}`);
       const esclusi = (await numeriNonChiamare(contacts.map(c => c.numero), azienda)).size;
       const orari = await leggiOrari(azienda);
       return res.json({
@@ -5671,6 +5704,7 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
     });
   }
 
+  if (result.sentContacts.length > 0) await registra(req, "campagna_avviata", `${result.sentContacts.length} contatti · ${bot?.nome || "voicebot predefinito"} · ${campaignType === "appuntamenti" ? "conferma appuntamenti" : `Registro opposizioni verificato: ${rpoVerificato ? "sì" : "no"}`}`);
   res.json({
     ok: result.failedContacts.length === 0,
     dryRun: result.dryRun,
@@ -5731,6 +5765,7 @@ app.post("/api/campaigns/scheduled/:id/cancel", requireAuth, async (req: any, re
     if (rows.length === 0) {
       return res.status(409).json({ ok: false, error: "Campagna non annullabile: già partita, già annullata o non tua" });
     }
+    await registra(req, "pianificata_annullata", `Campagna pianificata ${id}`);
     res.json({ ok: true });
   } catch (err) {
     console.error("Errore annullamento campagna:", err);
@@ -5769,6 +5804,283 @@ app.post("/api/campaigns/test-call", requireAuth, async (req: any, res) => {
     chunks_totali: 1,
   });
   res.status(ok ? 200 : 502).json({ ok, dryRun });
+});
+
+// ══════════════════════════════════════════════════════════════
+// PRIVACY
+// - Registro attività: chi ha fatto cosa (campagne, utenti, voicebot, Non
+//   chiamare, follow-up, impostazioni). Lo vedono gli Admin della sua azienda.
+// - Conservazione: ogni azienda sceglie dopo quanti mesi cancellare da sola
+//   trascrizioni, riassunti, dati raccolti da Wilma e liste di contatti.
+// - Diritti dell'interessato: dati di un numero da consegnare, o da cancellare.
+// ══════════════════════════════════════════════════════════════
+const REGISTRO_MESI = 24;
+let registroReady: Promise<void> | null = null;
+function ensureRegistro(): Promise<void> {
+  if (!registroReady) {
+    registroReady = (async () => {
+      await sql!`
+        CREATE TABLE IF NOT EXISTS registro_attivita (
+          id        SERIAL PRIMARY KEY,
+          ts        TIMESTAMPTZ NOT NULL DEFAULT now(),
+          azienda   TEXT        NOT NULL,
+          username  TEXT,
+          nome      TEXT,
+          azione    TEXT        NOT NULL,
+          dettaglio TEXT,
+          ip        TEXT
+        )
+      `;
+      await sql!`CREATE INDEX IF NOT EXISTS idx_registro_azienda_ts ON registro_attivita (azienda, ts DESC)`;
+    })().catch(err => { registroReady = null; throw err; });
+  }
+  return registroReady;
+}
+
+// Non blocca mai l'azione: se il registro non si scrive, lo si dice nei log.
+async function registra(req: any, azione: string, dettaglio: string | null) {
+  if (!sql) return;
+  try {
+    await ensureRegistro();
+    const u = req.utente;
+    await sql`
+      INSERT INTO registro_attivita (azienda, username, nome, azione, dettaglio, ip)
+      VALUES (${req.azienda || aziendaDi(u)}, ${u?.username || req.session?.username || null}, ${u?.nome || null}, ${azione},
+              ${dettaglio ? String(dettaglio).slice(0, 1000) : null}, ${clientIp(req)})
+    `;
+  } catch (err) {
+    console.error("Errore registro attività:", err);
+  }
+}
+
+app.get("/api/registro", requireAuth, requireAdmin, async (req: any, res) => {
+  if (!sql) return res.json({ ok: true, voci: [] });
+  const giorni = Math.min(Math.max(parseInt(String(req.query.giorni || "30"), 10) || 30, 1), 730);
+  const chi = String(req.query.chi || "").trim().toLowerCase() || null;
+  const azione = String(req.query.azione || "").trim() || null;
+  try {
+    await ensureRegistro();
+    const voci = (await sql`
+      SELECT id, ts, username, nome, azione, dettaglio, ip FROM registro_attivita
+      WHERE azienda = ${req.azienda} AND ts > now() - make_interval(days => ${giorni}::int)
+        AND (${chi}::text IS NULL OR lower(username) = ${chi})
+        AND (${azione}::text IS NULL OR azione = ${azione})
+      ORDER BY ts DESC LIMIT 2000
+    `) as any[];
+    res.json({ ok: true, voci });
+  } catch (err) {
+    console.error("Errore lettura registro:", err);
+    res.status(500).json({ ok: false, error: "Errore lettura registro" });
+  }
+});
+
+// ── Conservazione dei dati ──
+const MESI_CONSERVAZIONE = [0, 3, 6, 12, 24];
+const chiaveConservazione = (azienda: string) => `conservazione:${azienda}`;
+async function leggiConservazione(azienda: string): Promise<number> {
+  if (!sql) return 0;
+  await ensureAppState();
+  const r = (await sql`SELECT value FROM app_state WHERE key = ${chiaveConservazione(azienda)}`) as any[];
+  const m = parseInt(r[0]?.value || "0", 10);
+  return MESI_CONSERVAZIONE.includes(m) ? m : 0;
+}
+
+// Cancella i dati personali più vecchi del limite di ogni azienda. Restano i
+// conteggi (chiamate, esiti tecnici, durate) per statistiche e fatturazione.
+async function applicaConservazione(azienda: string, mesi: number): Promise<Record<string, number>> {
+  const prima = `${mesi} months`;
+  const n = (r: any) => (Array.isArray(r) ? r.length : 0);
+  const out: Record<string, number> = {};
+  out.riassunti = n(await sql!`
+    UPDATE call_results SET trascrizione = NULL, riassunto = NULL
+    WHERE azienda = ${azienda} AND ts::timestamptz < now() - ${prima}::interval AND (trascrizione IS NOT NULL OR riassunto IS NOT NULL)
+    RETURNING call_id`);
+  await ensureEsitiVoicebot();
+  out.datiWilma = n(await sql!`DELETE FROM voicebot_esiti WHERE cliente = ${azienda} AND ricevuto_at < now() - ${prima}::interval RETURNING id`);
+  await ensureLiveSchema();
+  out.chiamate = n(await sql!`
+    UPDATE live_calls SET dati = NULL WHERE azienda = ${azienda} AND queued_at < now() - ${prima}::interval AND dati IS NOT NULL RETURNING id`);
+  await ensureArchivioSchema();
+  out.storico = n(await sql!`
+    UPDATE campaign_history SET contatti = '[]'::jsonb
+    WHERE azienda = ${azienda} AND created_at < now() - ${prima}::interval AND jsonb_array_length(COALESCE(contatti, '[]'::jsonb)) > 0 RETURNING id`);
+  await ensureScheduleSchema();
+  out.pianificate = n(await sql!`
+    UPDATE scheduled_campaigns SET contacts = '[]'::jsonb
+    WHERE azienda = ${azienda} AND status <> 'pending' AND scheduled_at < now() - ${prima}::interval
+      AND jsonb_array_length(contacts) > 0 RETURNING id`);
+  await ensureFollowupsExtra();
+  out.followup = n(await sql!`
+    DELETE FROM followups WHERE azienda = ${azienda} AND stato = 'done'
+      AND COALESCE(chiuso_at, created_at) < now() - ${prima}::interval RETURNING id`);
+  return out;
+}
+
+// Al massimo una volta ogni 6 ore (dal timer e dalle pagine più aperte).
+async function conservazioneSeServe(): Promise<void> {
+  if (!sql) return;
+  try {
+    await ensureAppState();
+    const presa = (await sql`
+      INSERT INTO app_state (key, value, updated_at) VALUES ('conservazione_ultima', 'ok', now())
+      ON CONFLICT (key) DO UPDATE SET value = 'ok', updated_at = now()
+      WHERE app_state.updated_at < now() - interval '6 hours'
+      RETURNING key
+    `) as any[];
+    if (!presa.length) return;
+    await ensureRegistro();
+    await sql`DELETE FROM registro_attivita WHERE ts < now() - make_interval(months => ${REGISTRO_MESI}::int)`;
+    for (const a of await leggiAziende()) {
+      const mesi = await leggiConservazione(a.id);
+      if (!mesi) continue;
+      const fatti = await applicaConservazione(a.id, mesi);
+      const tot = Object.values(fatti).reduce((x, y) => x + y, 0);
+      if (tot > 0) {
+        await sql`INSERT INTO registro_attivita (azienda, azione, dettaglio) VALUES (${a.id}, 'conservazione_applicata',
+          ${`Dati più vecchi di ${mesi} mesi cancellati: ${fatti.riassunti} trascrizioni/riassunti, ${fatti.datiWilma} schede di Wilma, ${fatti.followup} follow-up chiusi, ${fatti.storico + fatti.pianificate} liste di campagne`})`;
+      }
+    }
+  } catch (err) {
+    console.error("Errore conservazione dati:", err);
+  }
+}
+
+app.get("/api/impostazioni/privacy", requireAuth, requireAdmin, async (req: any, res) => {
+  try {
+    res.json({ ok: true, mesi: await leggiConservazione(req.azienda), opzioni: MESI_CONSERVAZIONE });
+  } catch (err) {
+    console.error("Errore lettura privacy:", err);
+    res.status(500).json({ ok: false, error: "Errore" });
+  }
+});
+
+app.put("/api/impostazioni/privacy", requireAuth, requireAdmin, async (req: any, res) => {
+  const mesi = parseInt(req.body?.mesi, 10);
+  if (!MESI_CONSERVAZIONE.includes(mesi)) return res.status(400).json({ ok: false, error: "Scegli un periodo valido" });
+  if (!sql) return res.status(503).json({ ok: false, error: "Database non disponibile" });
+  try {
+    await ensureAppState();
+    await sql`
+      INSERT INTO app_state (key, value, updated_at) VALUES (${chiaveConservazione(req.azienda)}, ${String(mesi)}, now())
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+    `;
+    await registra(req, "conservazione_modificata", mesi ? `${mesi} mesi` : "nessuna cancellazione automatica");
+    // Si applica subito, così l'Admin vede l'effetto.
+    const fatti = mesi ? await applicaConservazione(req.azienda, mesi) : null;
+    res.json({ ok: true, mesi, cancellati: fatti });
+  } catch (err) {
+    console.error("Errore salvataggio privacy:", err);
+    res.status(500).json({ ok: false, error: "Errore salvataggio" });
+  }
+});
+
+// ── Dati di un numero (richiesta di accesso o di cancellazione) ──
+// Nelle liste salvate i numeri possono essere scritti in modi diversi: si
+// confrontano normalizzati, dopo un primo filtro sulle ultime 9 cifre.
+const ultimeCifre = (n: string) => n.replace(/\D/g, "").slice(-9);
+async function righeConNumero(tabella: "campaign_history" | "contact_lists" | "scheduled_campaigns", colonna: "contatti" | "contacts", azienda: string, numero: string) {
+  const like = `%${ultimeCifre(numero)}%`;
+  // Solo le cifre: "340 555 5555" e "+39 3405555555" si trovano allo stesso modo (poi si confronta esatto).
+  const rows = (await sql!(`SELECT id, ${colonna} AS c FROM ${tabella} WHERE azienda = $1 AND regexp_replace(${colonna}::text, '[^0-9]', '', 'g') LIKE $2`, [azienda, like])) as any[];
+  return rows.map(r => ({ id: r.id, c: Array.isArray(r.c) ? r.c : [] }))
+    .filter(r => r.c.some((x: any) => normalizePhone(String(x?.numero || "")) === numero));
+}
+
+async function datiDelNumero(azienda: string, numero: string) {
+  await ensureFollowupsExtra();
+  await ensureEsitiVoicebot();
+  await ensureLiveSchema();
+  await ensureArchivioSchema();
+  await ensureScheduleSchema();
+  await ensureDncSchema();
+  const [chiamate, followup, wilma, campagne, nome, nonChiamare] = await Promise.all([
+    sql!`SELECT call_id, ts, risposto, durata, riassunto, trascrizione FROM call_results WHERE azienda = ${azienda} AND numero = ${numero} ORDER BY ts DESC`,
+    sql!`SELECT id, motivo, stato, nota, assegnato_a, created_at, esito_finale FROM followups WHERE azienda = ${azienda} AND numero = ${numero} ORDER BY created_at DESC`,
+    sql!`SELECT ricevuto_at, esito, nome, azienda, ruolo, fascia, esigenza, email, note, riepilogo FROM voicebot_esiti WHERE cliente = ${azienda} AND numero = ${numero} ORDER BY ricevuto_at DESC`,
+    sql!`SELECT l.id, l.stato, l.queued_at, c.voicebot_nome FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id WHERE l.azienda = ${azienda} AND l.numero = ${numero} ORDER BY l.queued_at DESC`,
+    nomeContatto(numero, azienda),
+    sql!`SELECT motivo, fonte, created_at FROM do_not_call WHERE azienda = ${azienda} AND numero = ${numero}`,
+  ]) as any[];
+  const [storico, liste, pianificate] = await Promise.all([
+    righeConNumero("campaign_history", "contatti", azienda, numero),
+    righeConNumero("contact_lists", "contatti", azienda, numero),
+    righeConNumero("scheduled_campaigns", "contacts", azienda, numero),
+  ]);
+  return { chiamate, followup, wilma, campagne, nome, nonChiamare, storico, liste, pianificate };
+}
+
+function numeroDaRichiesta(v: unknown): string | null {
+  const n = normalizePhone(String(v || "").trim());
+  return n && /^\+?\d{6,15}$/.test(n) ? n : null;
+}
+
+app.get("/api/privacy/numero", requireAuth, requireAdmin, async (req: any, res) => {
+  const numero = numeroDaRichiesta(req.query.numero);
+  if (!numero) return res.status(400).json({ ok: false, error: "Numero non valido" });
+  if (!sql) return res.status(503).json({ ok: false });
+  try {
+    const d = await datiDelNumero(req.azienda, numero);
+    await registra(req, "dati_numero_consultati", `…${numero.slice(-4)}`);
+    res.json({
+      ok: true, numero,
+      riepilogo: {
+        nome: d.nome, chiamate: d.chiamate.length, followup: d.followup.length, datiWilma: d.wilma.length,
+        campagne: d.campagne.length, listeEStorico: d.storico.length + d.liste.length + d.pianificate.length,
+        nonChiamare: d.nonChiamare.length > 0,
+      },
+      // Per la risposta all'interessato (diritto di accesso).
+      dati: {
+        nome: d.nome,
+        chiamate: d.chiamate.map((c: any) => ({ data: c.ts, risposto: c.risposto, durataSecondi: c.durata ? Math.round(c.durata / 1000) : 0, riassunto: leggiRiassunto(c.riassunto)?.testo || null, trascrizione: c.trascrizione || null })),
+        followup: d.followup.map((f: any) => ({ data: f.created_at, motivo: f.motivo, stato: f.stato, nota: f.nota, esito: f.esito_finale })),
+        datiRaccoltiDalVoicebot: d.wilma,
+        campagne: d.campagne.map((c: any) => ({ data: c.queued_at, voicebot: c.voicebot_nome, esito: c.stato })),
+        nonChiamare: d.nonChiamare,
+      },
+    });
+  } catch (err) {
+    console.error("Errore dati del numero:", err);
+    res.status(500).json({ ok: false, error: "Errore lettura" });
+  }
+});
+
+// Diritto alla cancellazione: toglie il numero e i suoi dati da tutto il sito
+// dell'azienda. Le chiamate restano nei conteggi, senza numero né nome. Se
+// richiesto, il numero va (o resta) in "Non chiamare": è l'unico dato che si
+// tiene, proprio per non richiamarlo.
+app.post("/api/privacy/cancella-numero", requireAuth, requireAdmin, async (req: any, res) => {
+  const numero = numeroDaRichiesta(req.body?.numero);
+  if (!numero) return res.status(400).json({ ok: false, error: "Numero non valido" });
+  if (!sql) return res.status(503).json({ ok: false });
+  const az = req.azienda as string;
+  const tieniNonChiamare = req.body?.nonChiamare !== false;
+  try {
+    const d = await datiDelNumero(az, numero);
+    const n = (r: any) => (Array.isArray(r) ? r.length : 0);
+    const fatti: Record<string, number> = {};
+    fatti.chiamate = n(await sql`DELETE FROM call_results WHERE azienda = ${az} AND numero = ${numero} RETURNING call_id`);
+    fatti.followup = n(await sql`DELETE FROM followups WHERE azienda = ${az} AND numero = ${numero} RETURNING id`);
+    fatti.datiWilma = n(await sql`DELETE FROM voicebot_esiti WHERE cliente = ${az} AND numero = ${numero} RETURNING id`);
+    await sql`DELETE FROM contact_names WHERE azienda = ${az} AND numero = ${numero}`;
+    fatti.campagne = n(await sql`
+      UPDATE live_calls SET numero = 'cancellato', nome = NULL, dati = NULL, stato = CASE WHEN stato = 'in_coda' THEN 'annullata' ELSE stato END
+      WHERE azienda = ${az} AND numero = ${numero} RETURNING id`);
+    const togli = (c: any[]) => c.filter((x: any) => normalizePhone(String(x?.numero || "")) !== numero);
+    for (const r of d.storico) await sql`UPDATE campaign_history SET contatti = ${JSON.stringify(togli(r.c))}::jsonb WHERE id = ${r.id}`;
+    for (const r of d.liste) await sql`UPDATE contact_lists SET contatti = ${JSON.stringify(togli(r.c))}::jsonb WHERE id = ${r.id}`;
+    for (const r of d.pianificate) await sql`UPDATE scheduled_campaigns SET contacts = ${JSON.stringify(togli(r.c))}::jsonb WHERE id = ${r.id}`;
+    fatti.liste = d.storico.length + d.liste.length + d.pianificate.length;
+    await ensureNotifiche();
+    await sql`DELETE FROM notifiche WHERE testo LIKE ${"%" + numero + "%"} AND username IN (SELECT unnest(${(await utentiDellAzienda(az)).map((u: any) => String(u.username).toLowerCase())}::text[]))`;
+    if (tieniNonChiamare) await aggiungiNonChiamare([{ numero, nome: null }], "Richiesta di cancellazione dei dati", "privacy", req.utente?.nome || req.session.username, az);
+    else await sql`DELETE FROM do_not_call WHERE azienda = ${az} AND numero = ${numero}`;
+    // Nel registro non si scrive il numero intero: resta solo la parte finale.
+    await registra(req, "dati_numero_cancellati", `…${numero.slice(-4)}: ${fatti.chiamate} chiamate, ${fatti.followup} follow-up, ${fatti.datiWilma} schede di Wilma, ${fatti.liste} liste${tieniNonChiamare ? ", messo in Non chiamare" : ""}`);
+    res.json({ ok: true, cancellati: fatti, nonChiamare: tieniNonChiamare });
+  } catch (err) {
+    console.error("Errore cancellazione numero:", err);
+    res.status(500).json({ ok: false, error: "Errore cancellazione" });
+  }
 });
 
 export default app;
