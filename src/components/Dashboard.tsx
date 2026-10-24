@@ -45,7 +45,7 @@ interface NavGroup {
   viewerOnly?: boolean;
 }
 
-// Menu diviso per scopo: preparare e lanciare, seguire le chiamate, analizzare,
+// Menu diviso per scopo: preparare e lanciare, seguire i risultati,
 // amministrare. Profilo e Assistenza stanno nella scheda utente in fondo.
 const NAV_GROUPS: NavGroup[] = [
   {
@@ -59,30 +59,30 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { id: 'campaign' as Tab, label: 'Nuova Campagna', icon: Plus, viewerHidden: true },
       { id: 'appointments' as Tab, label: 'Conferma Appuntamenti', icon: CalendarCheck, viewerHidden: true },
-      { id: 'lists' as Tab, label: 'Liste Salvate', icon: List, viewerHidden: true },
-      { id: 'dnc' as Tab, label: 'Non chiamare', icon: Ban, viewerHidden: true },
+      { id: 'history' as Tab, label: 'Storico Campagne', icon: Clock },
     ]
   },
   {
-    label: 'Monitoraggio',
+    label: 'Risultati',
     items: [
       { id: 'live' as Tab, label: 'In diretta', icon: Radio, badge: 'live' },
       { id: 'callresults' as Tab, label: 'Esiti Chiamate', icon: Phone },
       { id: 'followups' as Tab, label: 'Follow-up', icon: BellRing, badge: 'followups' },
+      { id: 'stats' as Tab, label: 'Statistiche', icon: BarChart2 },
     ]
   },
   {
-    label: 'Report',
+    label: 'Contatti',
     items: [
-      { id: 'stats' as Tab, label: 'Statistiche', icon: BarChart2 },
-      { id: 'history' as Tab, label: 'Storico Campagne', icon: Clock },
-      { id: 'consumi' as Tab, label: 'Consumi', icon: Gauge, adminOnly: true },
+      { id: 'lists' as Tab, label: 'Liste Salvate', icon: List, viewerHidden: true },
+      { id: 'dnc' as Tab, label: 'Non chiamare', icon: Ban, viewerHidden: true },
     ]
   },
   {
     label: 'Amministrazione',
     adminOnly: true,
     items: [
+      { id: 'consumi' as Tab, label: 'Consumi', icon: Gauge, adminOnly: true },
       { id: 'users' as Tab, label: 'Gestione Utenti', icon: Users, adminOnly: true },
       { id: 'voicebots' as Tab, label: 'Voicebot', icon: Bot, adminOnly: true },
       { id: 'settings' as Tab, label: 'Impostazioni', icon: Settings, adminOnly: true },
@@ -167,17 +167,27 @@ export function Dashboard() {
     authFetch('/api/aziende').then(r => r.json()).then(d => setNomeAltraAzienda(d?.aziende?.find((a: any) => a.id === altraAzienda)?.nome || ''))
       .catch(() => {});
   }, [altraAzienda]);
-  // ?tab=... nell'indirizzo (es. il pulsante "Segui in diretta" dell'email)
-  // ha la precedenza sulla scheda ricordata. I Viewer non aprono pagine a loro nascoste.
-  const urlTab = new URLSearchParams(window.location.search).get('tab') as Tab | null;
+  // Ogni pagina ha il suo indirizzo (?tab=...): ricaricare, "Indietro" e i
+  // link (es. "Segui in diretta" dell'email) aprono la pagina giusta.
+  // I Viewer non aprono pagine a loro nascoste.
   const viewerHiddenTabs: Tab[] = ['campaign', 'appointments', 'lists', 'dnc'];
-  const linkTab = urlTab && urlTab in TAB_META && !(isViewer && viewerHiddenTabs.includes(urlTab)) ? urlTab : null;
-  const savedTab = sessionStorage.getItem('gem_active_tab') as Tab | null;
-  const [activeTab, setActiveTab] = useState<Tab>(linkTab || savedTab || 'home');
+  const tabValida = (t: string | null): Tab | null =>
+    t && t in TAB_META && !(isViewer && viewerHiddenTabs.includes(t as Tab)) ? t as Tab : null;
+  const tabDaUrl = () => tabValida(new URLSearchParams(window.location.search).get('tab'));
+  const [activeTab, setActiveTab] = useState<Tab>(
+    tabDaUrl() || tabValida(sessionStorage.getItem('gem_active_tab')) || 'home'
+  );
 
-  // Tolto ?tab= dall'indirizzo dopo l'apertura, così un ricaricamento non lo riapplica.
+  const urlPer = (tab: Tab) => {
+    const q = new URLSearchParams(window.location.search);
+    q.set('tab', tab);
+    return `${window.location.pathname}?${q}${window.location.hash}`;
+  };
   React.useEffect(() => {
-    if (urlTab) window.history.replaceState(null, '', window.location.pathname + window.location.hash);
+    window.history.replaceState(null, '', urlPer(activeTab));
+    const onPop = () => { const t = tabDaUrl(); if (t) setActiveTab(t); };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
   }, []);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [show2FABanner, setShow2FABanner] = useState(false);
@@ -228,6 +238,7 @@ export function Dashboard() {
   };
 
   const handleNav = (tab: Tab) => {
+    if (new URLSearchParams(window.location.search).get('tab') !== tab) window.history.pushState(null, '', urlPer(tab));
     setActiveTab(tab);
     sessionStorage.setItem('gem_active_tab', tab);
     setSidebarOpen(false);

@@ -80,7 +80,8 @@ export function GiornataSection() {
     try {
       const res = await authFetch('/api/giornata');
       const d = await res.json();
-      if (!res.ok || !d.ok) throw new Error();
+      // Senza database il server risponde ok ma senza dati.
+      if (!res.ok || !d.ok || !d.followup) throw new Error();
       setG(d);
       setErrore('');
     } catch {
