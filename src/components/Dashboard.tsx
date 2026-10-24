@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
 import { useCampaign } from '../context/CampaignContext';
 import { GemLogo } from './Icons';
-import { Gauge, LogOut, Sun, Moon, Plus, List, Clock, User, Headset, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen, Radio, Bot, Ban, Settings } from 'lucide-react';
+import { Gauge, LogOut, Sun, Moon, Plus, List, Clock, User, Headset, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen, Radio, Bot, Ban, Settings, Building2 } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { authFetch } from '../lib/authFetch';
+import { authFetch, aziendaVista } from '../lib/authFetch';
+import { AziendeSection, SceltaAzienda, apriAzienda } from './AziendeSection';
 import { Step1Upload, Step2Preview, Step3Settings } from './CampaignSteps';
 import { AppointmentPage } from './AppuntamentiSection';
 import { LaunchSidebar } from './LaunchSidebar';
@@ -24,13 +25,14 @@ import { GiornataSection } from './GiornataSection';
 import { ConsumiSection } from './ConsumiSection';
 import { SaluteAvviso } from './SaluteAvviso';
 
-type Tab = 'home' | 'consumi' | 'live' | 'campaign' | 'appointments' | 'lists' | 'dnc' | 'history' | 'callresults' | 'followups' | 'profile' | 'support' | 'stats' | 'users' | 'voicebots' | 'settings';
+type Tab = 'home' | 'aziende' | 'consumi' | 'live' | 'campaign' | 'appointments' | 'lists' | 'dnc' | 'history' | 'callresults' | 'followups' | 'profile' | 'support' | 'stats' | 'users' | 'voicebots' | 'settings';
 
 interface NavItem {
   id: Tab;
   label: string;
   icon: React.ElementType;
   adminOnly?: boolean;
+  superAdminOnly?: boolean;
   viewerHidden?: boolean;
   badge?: 'followups' | 'live';
 }
@@ -83,6 +85,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: 'users' as Tab, label: 'Gestione Utenti', icon: Users, adminOnly: true },
       { id: 'voicebots' as Tab, label: 'Voicebot', icon: Bot, adminOnly: true },
       { id: 'settings' as Tab, label: 'Impostazioni', icon: Settings, adminOnly: true },
+      { id: 'aziende' as Tab, label: 'Aziende', icon: Building2, adminOnly: true, superAdminOnly: true },
     ]
   },
 ];
@@ -94,6 +97,7 @@ const TAB_META: Record<Tab, { title: string; subtitle: string }> = {
   dnc: { title: 'Non chiamare', subtitle: 'Numeri che nessuna campagna chiama mai: chi lo ha chiesto, clienti attivi, numeri sbagliati.' },
   settings: { title: 'Impostazioni', subtitle: 'Orari in cui le campagne possono chiamare.' },
   history: { title: 'Storico Campagne', subtitle: 'Le campagne lanciate da tutti gli operatori, con i report da scaricare.' },
+  aziende: { title: 'Aziende', subtitle: 'I clienti che usano GEM Outbound, ognuno con i suoi utenti, voicebot e dati.' },
   consumi: { title: 'Consumi', subtitle: 'Chiamate e minuti del mese, per campagna, voicebot e operatore: la base per la fatturazione.' },
   home: { title: 'La mia giornata', subtitle: 'Chi richiamare oggi, i clienti caldi e le campagne in corso.' },
   live: { title: 'In diretta', subtitle: 'Le chiamate delle campagne in corso, aggiornate ogni pochi secondi.' },
@@ -151,6 +155,15 @@ export function Dashboard() {
   const pendingScheduled = scheduledCampaigns.filter(c => c.status === 'pending').length;
   const isAdmin = user?.isAdmin || user?.role === 'Admin';
   const isViewer = user?.role === 'Viewer';
+  // Super-admin che guarda un'altra azienda: banner in cima con il nome.
+  const vista = aziendaVista();
+  const altraAzienda = user?.superAdmin && vista && vista !== user.azienda ? vista : null;
+  const [nomeAltraAzienda, setNomeAltraAzienda] = useState('');
+  React.useEffect(() => {
+    if (!altraAzienda) return;
+    authFetch('/api/aziende').then(r => r.json()).then(d => setNomeAltraAzienda(d?.aziende?.find((a: any) => a.id === altraAzienda)?.nome || ''))
+      .catch(() => {});
+  }, [altraAzienda]);
   // ?tab=... nell'indirizzo (es. il pulsante "Segui in diretta" dell'email)
   // ha la precedenza sulla scheda ricordata. I Viewer non aprono pagine a loro nascoste.
   const urlTab = new URLSearchParams(window.location.search).get('tab') as Tab | null;
@@ -295,6 +308,13 @@ export function Dashboard() {
             </button>
           </div>
 
+          {/* Azienda: i super-admin scelgono quale guardare, gli altri vedono la loro */}
+          {user?.superAdmin ? <SceltaAzienda /> : user?.azienda && user.azienda !== 'gem' && user.aziendaNome && (
+            <div className="px-5 pt-3 text-xs font-semibold text-slate-500 dark:text-slate-400 truncate inline-flex items-center gap-1.5">
+              <Building2 className="w-3.5 h-3.5 shrink-0" />{user.aziendaNome}
+            </div>
+          )}
+
           {/* Nav groups */}
           <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-6">
             {NAV_GROUPS.map(group => {
@@ -302,6 +322,7 @@ export function Dashboard() {
               if (group.viewerOnly && !isViewer) return null;
               const visibleItems = group.items.filter(item => {
                 if (item.adminOnly && !isAdmin) return false;
+                if (item.superAdminOnly && !user?.superAdmin) return false;
                 if (item.viewerHidden && isViewer) return false;
                 return true;
               });
@@ -371,7 +392,7 @@ export function Dashboard() {
             <div className="grid grid-cols-3 gap-1">
               {/* Guida utente in PDF (file in public/) */}
               <a
-                href="/guida-gem-outbound.pdf?v=2026-10-24a"
+                href="/guida-gem-outbound.pdf?v=2026-10-24b"
                 download="GEM-Outbound-Guida-utente.pdf"
                 title="Scarica la guida utente (PDF)"
                 className="flex flex-col items-center justify-center gap-1 py-2 text-[11px] font-semibold text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
@@ -478,7 +499,18 @@ export function Dashboard() {
             </div>
           )}
 
-          {isAdmin && <SaluteAvviso />}
+          {altraAzienda && (
+            <div role="status" className="mb-6 flex flex-wrap items-center gap-3 p-4 rounded-2xl border border-brand-200 dark:border-brand-500/30 bg-brand-50 dark:bg-brand-500/10">
+              <Building2 className="w-5 h-5 text-brand-600 dark:text-brand-300 shrink-0" />
+              <p className="flex-1 min-w-0 text-sm text-slate-800 dark:text-slate-100">
+                Stai guardando i dati di <strong>{nomeAltraAzienda || altraAzienda}</strong>. Utenti, voicebot e campagne che crei qui sono suoi.
+              </p>
+              <button onClick={() => apriAzienda('', user?.azienda)} className="px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white text-xs font-bold rounded-lg">
+                Torna a {user?.aziendaNome || 'GEM Group'}
+              </button>
+            </div>
+          )}
+          {user?.superAdmin && <SaluteAvviso />}
 
           <NotificheAvviso onApriFollowup={() => {
             try { sessionStorage.setItem('gem_followups_miei', '1'); } catch { /* niente */ }
@@ -550,6 +582,7 @@ export function Dashboard() {
           {activeTab === 'home' && <GiornataSection />}
 
           {activeTab === 'consumi' && isAdmin && <ConsumiSection />}
+          {activeTab === 'aziende' && user?.superAdmin && <AziendeSection />}
 
           {activeTab === 'live' && (
             <LiveSection />

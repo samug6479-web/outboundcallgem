@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { isValidPhoneNumber, normalizePhoneNumber } from '../lib/utils';
-import { authFetch } from '../lib/authFetch';
+import { authFetch, CHIAVE_AZIENDA_VISTA } from '../lib/authFetch';
 import { OrariConsentiti, dentroOrari, prossimaApertura, quandoBreve } from '../lib/orari';
 import * as XLSX from 'xlsx';
 
@@ -28,6 +28,10 @@ export interface User {
   soloPropriFollowup?: boolean;
   puoEsportare?: boolean;
   limiteNumeri?: number | null;
+  // Azienda (cliente) dell'utente; i super-admin sono gli Admin di GEM.
+  azienda?: string;
+  aziendaNome?: string;
+  superAdmin?: boolean;
 }
 
 export interface Contact {
@@ -211,7 +215,8 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
           if (data?.ok) {
             const updated = { ...cachedUser, twoFactorEnabled: data.twoFactorEnabled, twoFactorRequired: data.twoFactorRequired, email: data.email, telefono: data.telefono,
               ...(data.role ? { role: data.role, canSchedule: data.canSchedule } : {}),
-              soloPropriFollowup: data.soloPropriFollowup === true, puoEsportare: data.puoEsportare !== false, limiteNumeri: data.limiteNumeri ?? null };
+              soloPropriFollowup: data.soloPropriFollowup === true, puoEsportare: data.puoEsportare !== false, limiteNumeri: data.limiteNumeri ?? null,
+              ...(data.azienda ? { azienda: data.azienda, aziendaNome: data.aziendaNome, superAdmin: data.superAdmin === true } : {}) };
             setUser(updated);
             sessionStorage.setItem('gem_session', JSON.stringify(updated));
           }
@@ -360,7 +365,8 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       const data = await res.json();
       
       if (res.ok && data.ok) {
-        const loggedUser = { username: data.username, nome: data.nome, role: data.role, isAdmin: data.isAdmin, canSchedule: data.canSchedule, email: data.email || '', telefono: data.telefono || '', twoFactorEnabled: data.twoFactorEnabled, twoFactorRequired: data.twoFactorRequired, soloPropriFollowup: data.soloPropriFollowup === true, puoEsportare: data.puoEsportare !== false, limiteNumeri: data.limiteNumeri ?? null };
+        const loggedUser = { username: data.username, nome: data.nome, role: data.role, isAdmin: data.isAdmin, canSchedule: data.canSchedule, email: data.email || '', telefono: data.telefono || '', twoFactorEnabled: data.twoFactorEnabled, twoFactorRequired: data.twoFactorRequired, soloPropriFollowup: data.soloPropriFollowup === true, puoEsportare: data.puoEsportare !== false, limiteNumeri: data.limiteNumeri ?? null,
+          azienda: data.azienda, aziendaNome: data.aziendaNome, superAdmin: data.superAdmin === true };
         setUser(loggedUser);
         sessionStorage.setItem('gem_session', JSON.stringify(loggedUser));
         if (data.token) sessionStorage.setItem('gem_token', data.token);
@@ -396,6 +402,7 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
     if (user) authFetch('/api/access-log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'logout' }) }).catch(() => {});
     sessionStorage.removeItem('gem_session');
     sessionStorage.removeItem('gem_token');
+    sessionStorage.removeItem(CHIAVE_AZIENDA_VISTA);
     setUser(null);
   };
 
@@ -608,7 +615,7 @@ export function CampaignProvider({ children }: { children: React.ReactNode }) {
       const res = await authFetch('/api/campaigns/test-call', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contact: { nome: contact.nome, numero: contact.numero } })
+        body: JSON.stringify({ contact: { nome: contact.nome, numero: contact.numero }, voicebot_id: selectedVoicebot?.id })
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.dryRun) { setTestStatus({ type: 'ok', msg: `✓ [TEST] Chiamata simulata verso ${contact.nome} — nessuna chiamata reale` }); }

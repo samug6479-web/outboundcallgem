@@ -94,7 +94,8 @@ export function Login() {
       setError('');
     } else if (res && res.ok) {
       const loggedUser = { username: res.username, nome: res.nome, role: res.role, isAdmin: res.isAdmin, canSchedule: res.canSchedule, email: res.email || '', telefono: res.telefono || '', twoFactorEnabled: res.twoFactorEnabled, twoFactorRequired: res.twoFactorRequired,
-        soloPropriFollowup: res.soloPropriFollowup === true, puoEsportare: res.puoEsportare !== false, limiteNumeri: res.limiteNumeri ?? null };
+        soloPropriFollowup: res.soloPropriFollowup === true, puoEsportare: res.puoEsportare !== false, limiteNumeri: res.limiteNumeri ?? null,
+        azienda: res.azienda, aziendaNome: res.aziendaNome, superAdmin: res.superAdmin === true };
       setUser(loggedUser);
       sessionStorage.setItem('gem_session', JSON.stringify(loggedUser));
       if (res.token) sessionStorage.setItem('gem_token', res.token);

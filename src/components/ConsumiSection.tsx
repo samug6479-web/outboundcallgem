@@ -11,6 +11,8 @@ interface Consumi {
   ok: boolean; mese: string; mesi: string[];
   totale: Somma; perVoicebot: Riga[]; perOperatore: Riga[]; perGiorno: Riga[]; campagne: Campagna[];
   altre: { chiamate: number; risposte: number; minuti: number };
+  // Solo per gli Admin di GEM: lo stesso mese per ogni azienda cliente.
+  perAzienda?: Riga[];
 }
 
 const nomeMese = (m: string) => {
@@ -77,6 +79,7 @@ export function ConsumiSection() {
     foglio('Per voicebot', d.perVoicebot.map(x => ({ Voicebot: x.chiave, ...r(x) })), [28, 16, 10, 22, 18]);
     foglio('Per operatore', d.perOperatore.map(x => ({ Operatore: x.chiave, ...r(x) })), [24, 16, 10, 22, 18]);
     foglio('Per giorno', d.perGiorno.map(x => ({ Giorno: x.chiave, ...r(x) })), [12, 16, 10, 22, 18]);
+    if (d.perAzienda) foglio('Per azienda', d.perAzienda.map(x => ({ Azienda: x.chiave, ...r(x) })), [28, 16, 10, 22, 18]);
     XLSX.writeFile(wb, `consumi-${d.mese}.xlsx`);
   };
 
@@ -129,6 +132,8 @@ export function ConsumiSection() {
           </div>
         )}
       </section>
+
+      {d.perAzienda && <Tabella titolo="Tutte le aziende (questo mese)" righe={d.perAzienda} etichetta="Azienda" />}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <Tabella titolo="Per voicebot" righe={d.perVoicebot} etichetta="Voicebot" />

@@ -101,7 +101,32 @@ function verifySessionToken(token: string): SessionPayload | null {
   }
 }
 
-function requireAuth(req: express.Request & { session?: SessionPayload }, res: express.Response, next: express.NextFunction) {
+// ── Più aziende (clienti separati) ──
+// Ogni utente, voicebot e dato (chiamate, follow-up, campagne, liste, Non
+// chiamare, orari) appartiene a un'azienda. Chi entra vede solo la sua.
+// Gli Admin dell'azienda principale (GEM) sono "super-admin": creano le
+// aziende e possono guardare quella che vogliono (header X-Azienda).
+// I dati di prima, senza azienda, sono di quella principale.
+const AZIENDA_PRINCIPALE = "gem";
+const aziendaDi = (x: any): string => (typeof x?.azienda === "string" && x.azienda.trim()) || AZIENDA_PRINCIPALE;
+interface Azienda { id: string; nome: string; attiva: boolean; webhookChiamate?: string; webhookAppuntamenti?: string; creataAt?: string }
+
+async function leggiAziende(): Promise<Azienda[]> {
+  let v: any[] | undefined;
+  if (sql) {
+    try { v = await leggiDatiConfig("aziende"); } catch (err) { console.error("Errore lettura aziende:", err); }
+  }
+  const lista: Azienda[] = (v || []).filter((a: any) => a && typeof a.id === "string" && a.id);
+  if (!lista.some(a => a.id === AZIENDA_PRINCIPALE)) lista.unshift({ id: AZIENDA_PRINCIPALE, nome: "GEM Group", attiva: true });
+  return lista.map(a => ({ ...a, nome: a.nome || a.id, attiva: a.id === AZIENDA_PRINCIPALE ? true : a.attiva !== false }));
+}
+
+// Contesto della richiesta, messo da requireAuth.
+interface RichiestaAutenticata { session?: SessionPayload; utente?: any; azienda?: string; superAdmin?: boolean }
+
+// Verifica il token e rilegge l'utente a ogni richiesta: ruolo, azienda e
+// account eliminati valgono subito, senza aspettare la scadenza del token.
+async function requireAuth(req: express.Request & RichiestaAutenticata, res: express.Response, next: express.NextFunction) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) {
@@ -111,7 +136,26 @@ function requireAuth(req: express.Request & { session?: SessionPayload }, res: e
   if (!session) {
     return res.status(401).json({ ok: false, error: "Sessione non valida o scaduta" });
   }
-  req.session = session;
+  try {
+    const users = await readUsers();
+    if (!Array.isArray(users) || users.length === 0) return res.status(503).json({ ok: false, error: "Servizio non disponibile, riprova tra poco" });
+    const user = users.find((u: any) => String(u.username).toLowerCase() === String(session.username).toLowerCase());
+    if (!user) return res.status(401).json({ ok: false, error: "Utente non più attivo" });
+    const az = aziendaDi(user);
+    const aziende = await leggiAziende();
+    if (!aziende.find(a => a.id === az)?.attiva) return res.status(403).json({ ok: false, error: "L'accesso per la tua azienda è sospeso. Contatta GEM Group." });
+    const isAdmin = ruoloDi(user) === "Admin";
+    const superAdmin = isAdmin && az === AZIENDA_PRINCIPALE;
+    const chiesta = String(req.headers["x-azienda"] || "").trim();
+    req.session = { username: user.username, isAdmin };
+    req.utente = user;
+    req.superAdmin = superAdmin;
+    req.azienda = superAdmin && chiesta && aziende.some(a => a.id === chiesta) ? chiesta : az;
+    if (sql) await ensureSchemaAziende().catch(err => console.error("Schema aziende:", err));
+  } catch (err) {
+    console.error("Errore autenticazione:", err);
+    return res.status(503).json({ ok: false, error: "Servizio non disponibile, riprova tra poco" });
+  }
   next();
 }
 
@@ -120,6 +164,53 @@ function requireAdmin(req: express.Request & { session?: SessionPayload }, res: 
     return res.status(403).json({ ok: false, error: "Permessi insufficienti (richiesto ruolo Admin)" });
   }
   next();
+}
+
+function requireSuperAdmin(req: express.Request & RichiestaAutenticata, res: express.Response, next: express.NextFunction) {
+  if (!req.superAdmin) {
+    return res.status(403).json({ ok: false, error: "Solo gli Admin di GEM Group" });
+  }
+  next();
+}
+
+// Colonna "azienda" su tutte le tabelle dei dati (una volta per istanza).
+// Le tabelle create a mano su Neon (call_results, followups, contact_names,
+// access_logs) la ricevono qui; le altre nelle loro funzioni ensure.
+let schemaAziendeReady: Promise<void> | null = null;
+function ensureSchemaAziende(): Promise<void> {
+  if (!schemaAziendeReady) {
+    schemaAziendeReady = (async () => {
+      for (const t of ["call_results", "followups", "contact_names", "access_logs"]) {
+        try {
+          await sql!(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS azienda TEXT NOT NULL DEFAULT '${AZIENDA_PRINCIPALE}'`);
+        } catch (err) { console.error(`Colonna azienda su ${t}:`, err); }
+      }
+      try {
+        await sql!`CREATE INDEX IF NOT EXISTS idx_followups_azienda ON followups (azienda, stato)`;
+        await sql!`CREATE INDEX IF NOT EXISTS idx_call_results_azienda ON call_results (azienda)`;
+      } catch (err) { console.error("Indici azienda:", err); }
+      // Lo stesso numero può avere un nome diverso in ogni azienda.
+      await sql!`CREATE UNIQUE INDEX IF NOT EXISTS uq_contact_names_azienda ON contact_names (azienda, numero)`;
+      await togliChiaveSoloNumero("contact_names");
+      await ensureFollowupsExtra();
+      await ensureLiveSchema();
+      await ensureDncSchema();
+      await ensureArchivioSchema();
+      await ensureScheduleSchema();
+      await ensureCampaignLogSchema();
+      await ensureEsitiVoicebot();
+    })().catch(err => { schemaAziendeReady = null; throw err; });
+  }
+  return schemaAziendeReady;
+}
+
+// Toglie la chiave primaria sul solo "numero" (ora l'unicità è azienda + numero).
+async function togliChiaveSoloNumero(tabella: string): Promise<void> {
+  const pk = (await sql!`
+    SELECT c.conname FROM pg_constraint c
+    WHERE c.conrelid = ${tabella}::regclass AND c.contype = 'p' AND array_length(c.conkey, 1) = 1
+  `) as any[];
+  if (pk[0]?.conname) await sql!(`ALTER TABLE ${tabella} DROP CONSTRAINT "${String(pk[0].conname).replace(/"/g, "")}"`);
 }
 
 // ── Token temporaneo per il secondo passaggio del login (2FA) ─────────
@@ -211,11 +302,12 @@ const SUPPORT_MAX_PER_USER = 5; // ticket di supporto per utente all'ora
 const TOO_MANY = "Troppi tentativi. Riprova tra qualche minuto.";
 
 // ── Registro accessi: scritto dal server, non più dal browser ─────────
-async function logAccess(username: string, nome: string | undefined, action: "login" | "logout") {
+async function logAccess(username: string, nome: string | undefined, action: "login" | "logout", azienda: string) {
   try {
+    await ensureSchemaAziende().catch(() => {});
     await withRetry(() => sql!`
-      INSERT INTO access_logs (username, nome, action)
-      VALUES (${username}, ${nome || username}, ${action})
+      INSERT INTO access_logs (username, nome, action, azienda)
+      VALUES (${username}, ${nome || username}, ${action}, ${azienda})
     `);
   } catch (err) {
     // Non bloccante: un log di accesso mancato non deve impedire login/logout.
@@ -235,12 +327,12 @@ function isCallsDryRun(): boolean {
   return process.env.VERCEL_ENV !== "production";
 }
 
-async function readCallResults(limit = 50, offset = 0): Promise<{ rows: any[]; total: number }> {
+async function readCallResults(azienda: string, limit = 50, offset = 0): Promise<{ rows: any[]; total: number }> {
   try {
     const rows = await sql`
-      SELECT * FROM call_results ORDER BY ts DESC LIMIT ${limit} OFFSET ${offset}
+      SELECT * FROM call_results WHERE azienda = ${azienda} ORDER BY ts DESC LIMIT ${limit} OFFSET ${offset}
     `;
-    const countRes = await sql`SELECT COUNT(*)::int AS total FROM call_results`;
+    const countRes = await sql`SELECT COUNT(*)::int AS total FROM call_results WHERE azienda = ${azienda}`;
     return {
       rows: (rows as any[]).map((r: any) => ({
         callId: r.call_id,
@@ -264,8 +356,8 @@ async function readCallResults(limit = 50, offset = 0): Promise<{ rows: any[]; t
 async function upsertCallResult(entry: any) {
   try {
     await withRetry(() => sql`
-      INSERT INTO call_results (call_id, numero, nome, risposto, durata, ts, trascrizione, riassunto)
-      VALUES (${entry.callId}, ${entry.numero}, ${entry.nome || null}, ${entry.risposto}, ${entry.durata}, ${entry.timestamp}, ${entry.trascrizione}, ${entry.riassunto ? JSON.stringify(entry.riassunto) : null})
+      INSERT INTO call_results (call_id, numero, nome, risposto, durata, ts, trascrizione, riassunto, azienda)
+      VALUES (${entry.callId}, ${entry.numero}, ${entry.nome || null}, ${entry.risposto}, ${entry.durata}, ${entry.timestamp}, ${entry.trascrizione}, ${entry.riassunto ? JSON.stringify(entry.riassunto) : null}, ${entry.azienda || AZIENDA_PRINCIPALE})
       ON CONFLICT (call_id) DO UPDATE SET
         numero = COALESCE(EXCLUDED.numero, call_results.numero),
         nome = COALESCE(EXCLUDED.nome, call_results.nome),
@@ -338,21 +430,44 @@ function normalizePhone(numero: string | null | undefined): string | null {
 }
 
 // ── Nome contatto: lookup numero → nome, popolato dall'app al lancio campagna ──
-async function readContactNames(): Promise<Record<string, string>> {
+async function nomeContatto(numero: string | null, azienda: string): Promise<string | null> {
+  if (!sql || !numero) return null;
   try {
-    const rows = await sql`SELECT numero, nome FROM contact_names`;
-    const map: Record<string, string> = {};
-    for (const r of rows as any[]) map[r.numero] = r.nome;
-    return map;
+    const rows = (await sql`SELECT nome FROM contact_names WHERE numero = ${numero} AND azienda = ${azienda} LIMIT 1`) as any[];
+    return rows[0]?.nome || null;
   } catch (err) {
     console.error("Error reading contact_names from Postgres:", err);
-    return {};
+    return null;
   }
+}
+
+// A quale azienda appartiene una chiamata arrivata da Wildix: quella della
+// campagna del sito che ha chiamato il numero (preferendo la campagna con
+// l'interno del voicebot citato nell'evento), altrimenti quella del voicebot
+// citato, altrimenti la principale.
+async function aziendaDellaChiamata(numero: string | null, rawEvent: string): Promise<string> {
+  if (sql && numero) {
+    try {
+      await ensureLiveSchema();
+      const r = (await sql`
+        SELECT c.azienda, c.voicebot_exten FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
+        WHERE l.numero = ${numero} AND l.queued_at > now() - interval '2 days'
+        ORDER BY COALESCE(l.inviata_at, l.queued_at) DESC LIMIT 20
+      `) as any[];
+      const scelta = r.find(x => x.voicebot_exten && rawEvent.includes(`"${x.voicebot_exten}"`)) || r[0];
+      if (scelta) return aziendaDi(scelta);
+    } catch (err) { console.error("Azienda della chiamata:", err); }
+  }
+  try {
+    const bot = (await readVoicebots()).find((b: any) => b.exten != null && rawEvent.includes(`"${b.exten}"`));
+    if (bot) return aziendaDi(bot);
+  } catch { /* principale */ }
+  return AZIENDA_PRINCIPALE;
 }
 
 // Versione "a blocchi": una sola query per tutta la lista (invece di una per
 // contatto), con i doppioni rimossi prima dell'inserimento.
-async function upsertContactNames(contacts: { numero: string; nome: string }[]) {
+async function upsertContactNames(contacts: { numero: string; nome: string }[], azienda: string) {
   const map = new Map<string, string>();
   for (const c of contacts) {
     const n = normalizePhone(c.numero);
@@ -363,9 +478,9 @@ async function upsertContactNames(contacts: { numero: string; nome: string }[]) 
   const nomi = [...map.values()];
   try {
     await withRetry(() => sql!`
-      INSERT INTO contact_names (numero, nome)
-      SELECT * FROM unnest(${numeri}::text[], ${nomi}::text[])
-      ON CONFLICT (numero) DO UPDATE SET nome = EXCLUDED.nome
+      INSERT INTO contact_names (azienda, numero, nome)
+      SELECT ${azienda}, n, nm FROM unnest(${numeri}::text[], ${nomi}::text[]) AS t(n, nm)
+      ON CONFLICT (azienda, numero) DO UPDATE SET nome = EXCLUDED.nome
     `);
   } catch (err) {
     console.error("Error upserting contact_names (batch) in Postgres:", err);
@@ -387,12 +502,12 @@ async function logWebhookEvent(eventType: string, reason: string) {
 // Non crea doppioni: Wildix può reinviare lo stesso evento, quindi lo stesso
 // motivo per la stessa chiamata viene registrato una volta sola.
 // Restituisce true se il follow-up è nuovo (serve per non mandare due volte la stessa notifica).
-async function createFollowup(entry: { callId: string; numero: string | null; nome: string | null; motivo: string; assegnatoA?: string | null }): Promise<boolean> {
+async function createFollowup(entry: { callId: string; numero: string | null; nome: string | null; motivo: string; assegnatoA?: string | null; azienda: string }): Promise<boolean> {
   try {
     await ensureFollowupsExtra();
     const r = (await sql`
-      INSERT INTO followups (call_id, numero, nome, motivo, assegnato_a)
-      SELECT ${entry.callId}, ${entry.numero}, ${entry.nome}, ${entry.motivo}, ${entry.assegnatoA || null}
+      INSERT INTO followups (call_id, numero, nome, motivo, assegnato_a, azienda)
+      SELECT ${entry.callId}, ${entry.numero}, ${entry.nome}, ${entry.motivo}, ${entry.assegnatoA || null}, ${entry.azienda}
       WHERE NOT EXISTS (
         SELECT 1 FROM followups WHERE call_id = ${entry.callId} AND motivo = ${entry.motivo}
       )
@@ -437,14 +552,14 @@ function ensureFollowupsExtra(): Promise<void> {
 }
 
 // La campagna più recente del sito che ha chiamato questo numero (ultimi giorni).
-async function campagnaDelNumero(numero: string | null): Promise<any | null> {
+async function campagnaDelNumero(numero: string | null, azienda: string): Promise<any | null> {
   if (!sql || !numero) return null;
   try {
     await ensureLiveSchema();
     const r = (await sql`
-      SELECT c.id, c.username, c.operatore, c.tipo_campagna, c.voicebot_nome, l.nome
+      SELECT c.id, c.username, c.operatore, c.tipo_campagna, c.voicebot_nome, c.azienda, l.nome
       FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
-      WHERE l.numero = ${numero} AND l.queued_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int)
+      WHERE l.numero = ${numero} AND c.azienda = ${azienda} AND l.queued_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int)
       ORDER BY l.queued_at DESC LIMIT 1
     `) as any[];
     return r[0] || null;
@@ -503,15 +618,15 @@ const MOTIVO_NON_RISPOSTO = "Non risposto";
 const MOTIVO_INTERROTTA = "Chiamata interrotta";
 const INTERRUPTED_CALL_MAX_MS = 20_000; // talkTime di Wildix è in millisecondi
 
-async function createAutoFollowup(entry: { callId: string; numero: string | null; nome: string | null; motivo: string }) {
+async function createAutoFollowup(entry: { callId: string; numero: string | null; nome: string | null; motivo: string; azienda: string }) {
   if (!entry.numero) return;
   try {
     await sql`
-      INSERT INTO followups (call_id, numero, nome, motivo)
-      SELECT ${entry.callId}, ${entry.numero}, ${entry.nome}, ${entry.motivo}
+      INSERT INTO followups (call_id, numero, nome, motivo, azienda)
+      SELECT ${entry.callId}, ${entry.numero}, ${entry.nome}, ${entry.motivo}, ${entry.azienda}
       WHERE NOT EXISTS (
         SELECT 1 FROM followups
-        WHERE numero = ${entry.numero} AND motivo = ${entry.motivo} AND stato = 'pending'
+        WHERE numero = ${entry.numero} AND motivo = ${entry.motivo} AND stato = 'pending' AND azienda = ${entry.azienda}
       )
     `;
   } catch (err) {
@@ -519,12 +634,12 @@ async function createAutoFollowup(entry: { callId: string; numero: string | null
   }
 }
 
-async function closeAutoFollowups(numero: string | null, motivi: string[]) {
+async function closeAutoFollowups(numero: string | null, motivi: string[], azienda: string) {
   if (!numero || motivi.length === 0) return;
   try {
     await sql`
       UPDATE followups SET stato = 'done'
-      WHERE numero = ${numero} AND motivo = ANY(${motivi}::text[]) AND stato = 'pending'
+      WHERE numero = ${numero} AND motivo = ANY(${motivi}::text[]) AND stato = 'pending' AND azienda = ${azienda}
     `;
   } catch (err) {
     console.error("Error closing auto followups:", err);
@@ -535,10 +650,10 @@ app.get("/api/followups", requireAuth, async (req: any, res) => {
   const stato = (req.query.stato as string) || "pending";
   try {
     await ensureFollowupsExtra().catch(err => console.error("Colonne follow-up:", err));
-    const me = await findSessionUser(req.session.username);
+    const me = req.utente;
     const solo = permessiUtente(me).soloPropriFollowup ? String(req.session.username).toLowerCase() : null;
     const rows = await sql`
-      SELECT * FROM followups WHERE stato = ${stato}
+      SELECT * FROM followups WHERE stato = ${stato} AND azienda = ${req.azienda}
         AND (${solo}::text IS NULL OR lower(assegnato_a) = ${solo})
       ORDER BY created_at DESC LIMIT 500
     `;
@@ -551,12 +666,13 @@ app.get("/api/followups", requireAuth, async (req: any, res) => {
 
 // Chi può modificare un follow-up: non i Viewer; chi vede solo i propri, solo quelli assegnati a sé.
 async function puoModificareFollowup(req: any, res: any, id: number): Promise<boolean> {
-  const me = await findSessionUser(req.session.username);
+  const me = req.utente;
   if (!me) { res.status(401).json({ ok: false, error: "Utente non trovato" }); return false; }
   if (me.role === "Viewer") { res.status(403).json({ ok: false, error: "In sola lettura" }); return false; }
+  const r = (await sql!`SELECT assegnato_a FROM followups WHERE id = ${id} AND azienda = ${req.azienda}`) as any[];
+  if (!r[0]) { res.status(404).json({ ok: false, error: "Follow-up non trovato" }); return false; }
   if (permessiUtente(me).soloPropriFollowup) {
-    const r = (await sql!`SELECT assegnato_a FROM followups WHERE id = ${id}`) as any[];
-    if (r[0] && (r[0].assegnato_a || "").toLowerCase() !== String(req.session.username).toLowerCase()) {
+    if ((r[0].assegnato_a || "").toLowerCase() !== String(req.session.username).toLowerCase()) {
       res.status(403).json({ ok: false, error: "Puoi gestire solo i follow-up assegnati a te" });
       return false;
     }
@@ -567,7 +683,7 @@ async function puoModificareFollowup(req: any, res: any, id: number): Promise<bo
 // Azioni su più follow-up insieme (Admin ed Editor): assegna a una persona o segna fatti.
 // Chi riceve l'assegnazione ha un avviso nel sito per ogni contatto e una sola email riepilogativa.
 app.post("/api/followups/bulk", requireAuth, express.json(), async (req: any, res) => {
-  const me = await findSessionUser(req.session.username);
+  const me = req.utente;
   if (!me) return res.status(401).json({ ok: false, error: "Utente non trovato" });
   if (me.role === "Viewer") return res.status(403).json({ ok: false, error: "Non autorizzato" });
   const b = req.body || {};
@@ -576,6 +692,8 @@ app.post("/api/followups/bulk", requireAuth, express.json(), async (req: any, re
   if (ids.length > 500) return res.status(400).json({ ok: false, error: "Massimo 500 follow-up per volta" });
   try {
     await ensureFollowupsExtra();
+    const diQui = (await sql`SELECT id FROM followups WHERE id = ANY(${ids}::int[]) AND azienda = ${req.azienda}`) as any[];
+    if (diQui.length !== ids.length) return res.status(404).json({ ok: false, error: "Alcuni follow-up non esistono più" });
     if (permessiUtente(me).soloPropriFollowup) {
       const miei = (await sql`SELECT id FROM followups WHERE id = ANY(${ids}::int[]) AND lower(assegnato_a) = ${String(req.session.username).toLowerCase()}`) as any[];
       if (miei.length !== ids.length) return res.status(403).json({ ok: false, error: "Puoi gestire solo i follow-up assegnati a te" });
@@ -583,13 +701,13 @@ app.post("/api/followups/bulk", requireAuth, express.json(), async (req: any, re
     if (b.azione === "fatto") {
       const esito = esitoFinaleValido(b.esito);
       const r = (await sql`UPDATE followups SET stato = 'done', esito_finale = ${esito}, chiuso_at = now(), chiuso_da = ${req.session.username},
-        aggiornato_at = now(), aggiornato_da = ${req.session.username} WHERE id = ANY(${ids}::int[]) AND stato = 'pending' RETURNING id`) as any[];
+        aggiornato_at = now(), aggiornato_da = ${req.session.username} WHERE id = ANY(${ids}::int[]) AND stato = 'pending' AND azienda = ${req.azienda} RETURNING id`) as any[];
       return res.json({ ok: true, aggiornati: r.length });
     }
     if (b.azione !== "assegna") return res.status(400).json({ ok: false, error: "Azione non valida" });
     let assegnato: string | null = null;
     if (b.assegnato_a) {
-      const u = await findSessionUser(String(b.assegnato_a));
+      const u = await utenteDellAzienda(String(b.assegnato_a), req.azienda);
       if (!u) return res.status(400).json({ ok: false, error: "Utente non trovato" });
       assegnato = u.username;
     }
@@ -597,7 +715,7 @@ app.post("/api/followups/bulk", requireAuth, express.json(), async (req: any, re
     const prima = new Map(((await sql`SELECT id, assegnato_a FROM followups WHERE id = ANY(${ids}::int[])`) as any[]).map(x => [x.id, (x.assegnato_a || "").toLowerCase()]));
     const r = (await sql`
       UPDATE followups SET assegnato_a = ${assegnato}, aggiornato_at = now(), aggiornato_da = ${req.session.username}
-      WHERE id = ANY(${ids}::int[]) RETURNING *
+      WHERE id = ANY(${ids}::int[]) AND azienda = ${req.azienda} RETURNING *
     `) as any[];
     let avvisato = false;
     if (assegnato && assegnato.toLowerCase() !== String(req.session.username).toLowerCase()) {
@@ -622,7 +740,7 @@ app.put("/api/followups/:id", requireAuth, express.json(), async (req: any, res)
   if (body.assegnato_a !== undefined) {
     if (body.assegnato_a === null || body.assegnato_a === "") assegnato = null;
     else {
-      const u = await findSessionUser(String(body.assegnato_a));
+      const u = await utenteDellAzienda(String(body.assegnato_a), req.azienda);
       if (!u) return res.status(400).json({ ok: false, error: "Utente non trovato" });
       assegnato = u.username;
     }
@@ -647,7 +765,7 @@ app.put("/api/followups/:id", requireAuth, express.json(), async (req: any, res)
         promemoria_at = CASE WHEN ${richiamare !== undefined}::boolean AND richiamare_at IS DISTINCT FROM ${richiamare ?? null}::timestamptz THEN NULL ELSE promemoria_at END,
         richiamare_at = CASE WHEN ${richiamare !== undefined}::boolean THEN ${richiamare ?? null}::timestamptz ELSE richiamare_at END,
         aggiornato_at = now(), aggiornato_da = ${req.session.username}
-      WHERE id = ${id}
+      WHERE id = ${id} AND azienda = ${req.azienda}
       RETURNING *
     `) as any[];
     if (!r[0]) return res.status(404).json({ ok: false, error: "Follow-up non trovato" });
@@ -734,7 +852,7 @@ async function avvisaAssegnazione(f: any, username: string, daUsername: string):
       riassunto = leggiRiassunto(rr[0]?.riassunto);
     }
   } catch { /* senza riassunto */ }
-  const campagna = await campagnaDelNumero(f.numero).catch(() => null);
+  const campagna = await campagnaDelNumero(f.numero, aziendaDi(f)).catch(() => null);
   const testoRiassunto = String(riassunto?.testo || riassunto?.titolo || "").trim();
   const quando = f.created_at
     ? new Date(f.created_at).toLocaleString("it-IT", { timeZone: "Europe/Rome", day: "2-digit", month: "long", hour: "2-digit", minute: "2-digit" })
@@ -1030,8 +1148,8 @@ app.post("/api/notifiche/lette", requireAuth, express.json(), async (req: any, r
 // scadute), i clienti caldi di oggi, le campagne in corso e i numeri del giorno.
 app.get("/api/giornata", requireAuth, async (req: any, res) => {
   if (!sql) return res.json({ ok: true });
-  const me = await findSessionUser(req.session.username);
-  if (!me) return res.status(401).json({ ok: false });
+  const me = req.utente;
+  const az = req.azienda as string;
   const io = String(me.username).toLowerCase();
   const solo = permessiUtente(me).soloPropriFollowup;
   const safe = async <T,>(fn: () => Promise<T>, fb: T): Promise<T> => { try { return await fn(); } catch (err) { console.error("Errore giornata:", err); return fb; } };
@@ -1042,34 +1160,34 @@ app.get("/api/giornata", requireAuth, async (req: any, res) => {
     const fineGiorno = new Date(new Date(inizioGiorno).getTime() + 86_400_000).toISOString();
     const miei = await safe(async () => (await sql`
       SELECT id, nome, numero, motivo, nota, richiamare_at, created_at FROM followups
-      WHERE stato = 'pending' AND lower(assegnato_a) = ${io}
+      WHERE stato = 'pending' AND lower(assegnato_a) = ${io} AND azienda = ${az}
       ORDER BY richiamare_at ASC NULLS LAST, created_at DESC LIMIT 200`) as any[], [] as any[]);
     const scaduti = miei.filter(f => f.richiamare_at && new Date(f.richiamare_at).getTime() < Date.now());
     const oggi = miei.filter(f => f.richiamare_at && new Date(f.richiamare_at).getTime() >= Date.now() && new Date(f.richiamare_at).getTime() < new Date(fineGiorno).getTime());
     const senzaData = miei.filter(f => !f.richiamare_at);
     const caldi = await safe(async () => (await sql`
       SELECT id, nome, numero, motivo, assegnato_a, created_at FROM followups
-      WHERE created_at >= ${inizioGiorno} AND motivo IN ('Cliente interessato', 'Appuntamento fissato')
+      WHERE created_at >= ${inizioGiorno} AND motivo IN ('Cliente interessato', 'Appuntamento fissato') AND azienda = ${az}
         AND (${solo}::boolean = false OR lower(assegnato_a) = ${io})
       ORDER BY created_at DESC LIMIT 20`) as any[], [] as any[]);
     const daAssegnare = solo || me.role === "Viewer" ? 0 : await safe(async () => ((await sql`
-      SELECT count(*)::int AS n FROM followups WHERE stato = 'pending' AND assegnato_a IS NULL`) as any[])[0]?.n || 0, 0);
+      SELECT count(*)::int AS n FROM followups WHERE stato = 'pending' AND assegnato_a IS NULL AND azienda = ${az}`) as any[])[0]?.n || 0, 0);
     await ensureLiveSchema();
     const campagne = await safe(async () => (await sql`
       SELECT c.id, c.voicebot_nome, c.operatore, c.tipo_campagna, c.created_at, c.in_pausa, count(*)::int AS totale,
         count(*) FILTER (WHERE l.stato NOT IN ('in_coda', 'avviata'))::int AS gestite,
         count(*) FILTER (WHERE l.stato = 'risposta')::int AS risposte
       FROM live_campaigns c JOIN live_calls l ON l.campaign_id = c.id
-      WHERE c.fermata_at IS NULL AND c.created_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int)
+      WHERE c.fermata_at IS NULL AND c.azienda = ${az} AND c.created_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int)
       GROUP BY c.id HAVING count(*) FILTER (WHERE l.stato IN ('in_coda', 'avviata')) > 0
       ORDER BY c.created_at DESC LIMIT 10`) as any[], [] as any[]);
     const numeri = await safe(async () => ((await sql`
       SELECT count(*) FILTER (WHERE stato IN ('risposta', 'interrotta', 'non_risposta', 'non_partita', 'errore'))::int AS chiamate,
              count(*) FILTER (WHERE stato = 'risposta')::int AS risposte
-      FROM live_calls WHERE updated_at >= ${inizioGiorno}`) as any[])[0] || { chiamate: 0, risposte: 0 }, { chiamate: 0, risposte: 0 });
+      FROM live_calls WHERE updated_at >= ${inizioGiorno} AND azienda = ${az}`) as any[])[0] || { chiamate: 0, risposte: 0 }, { chiamate: 0, risposte: 0 });
     const chiusiOggi = await safe(async () => ((await sql`
-      SELECT count(*)::int AS n FROM followups WHERE stato = 'done' AND chiuso_at >= ${inizioGiorno} AND lower(chiuso_da) = ${io}`) as any[])[0]?.n || 0, 0);
-    const users = await readUsers().catch(() => [] as any[]);
+      SELECT count(*)::int AS n FROM followups WHERE stato = 'done' AND chiuso_at >= ${inizioGiorno} AND lower(chiuso_da) = ${io} AND azienda = ${az}`) as any[])[0]?.n || 0, 0);
+    const users = await utentiDellAzienda(az).catch(() => [] as any[]);
     const nomeDi = (u?: string | null) => (u ? users.find((x: any) => x.username.toLowerCase() === u.toLowerCase())?.nome || u : null);
     res.json({
       ok: true,
@@ -1091,6 +1209,7 @@ app.get("/api/giornata", requireAuth, async (req: any, res) => {
 // ogni chiamata con conversazione arrotondata al minuto superiore.
 app.get("/api/consumi", requireAuth, requireAdmin, async (req: any, res) => {
   if (!sql) return res.json({ ok: true, mesi: [], campagne: [] });
+  const az = req.azienda as string;
   const mese = /^\d{4}-\d{2}$/.test(String(req.query.mese || "")) ? String(req.query.mese)
     : new Date().toLocaleDateString("sv-SE", { timeZone: "Europe/Rome" }).slice(0, 7);
   try {
@@ -1105,7 +1224,7 @@ app.get("/api/consumi", requireAuth, requireAdmin, async (req: any, res) => {
         COALESCE(sum(l.durata_ms) FILTER (WHERE l.stato IN ('risposta', 'interrotta') AND l.durata_ms > 0), 0)::bigint AS ms,
         COALESCE(sum(ceil(l.durata_ms / 60000.0)) FILTER (WHERE l.stato IN ('risposta', 'interrotta') AND l.durata_ms > 0), 0)::int AS minuti_fatt
       FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
-      WHERE l.updated_at >= ${da} AND l.updated_at < ${a}
+      WHERE l.updated_at >= ${da} AND l.updated_at < ${a} AND c.azienda = ${az}
       GROUP BY c.id, giorno
     `) as any[];
     const somma = (rs: any[]) => rs.reduce((t, r) => ({
@@ -1132,17 +1251,37 @@ app.get("/api/consumi", requireAuth, requireAdmin, async (req: any, res) => {
           SELECT count(*)::int AS chiamate, count(*) FILTER (WHERE risposto)::int AS risposte,
             COALESCE(sum(durata) FILTER (WHERE durata > 0), 0)::bigint AS ms
           FROM call_results r
-          WHERE r.ts::timestamptz >= ${da} AND r.ts::timestamptz < ${a}
+          WHERE r.ts::timestamptz >= ${da} AND r.ts::timestamptz < ${a} AND r.azienda = ${az}
             AND NOT EXISTS (SELECT 1 FROM live_calls l WHERE l.call_id IS NOT NULL AND l.call_id = r.call_id)
         `) as any[])[0];
         return { chiamate: r.chiamate, risposte: r.risposte, minuti: Number(r.ms) / 60000 };
       } catch { return { chiamate: 0, risposte: 0, minuti: 0 }; }
     })();
     const mesi = ((await sql`
-      SELECT DISTINCT to_char(created_at AT TIME ZONE 'Europe/Rome', 'YYYY-MM') AS m FROM live_campaigns ORDER BY 1 DESC LIMIT 24
+      SELECT DISTINCT to_char(created_at AT TIME ZONE 'Europe/Rome', 'YYYY-MM') AS m FROM live_campaigns WHERE azienda = ${az} ORDER BY 1 DESC LIMIT 24
     `) as any[]).map(r => r.m);
     if (!mesi.includes(mese)) mesi.unshift(mese);
+    // Super-admin: lo stesso mese per ogni azienda, per fatturare i clienti.
+    let perAzienda: any[] | undefined;
+    if (req.superAdmin) {
+      const aziende = await leggiAziende();
+      const pa = (await sql`
+        SELECT c.azienda,
+          count(*) FILTER (WHERE l.stato IN ('risposta', 'interrotta', 'non_risposta', 'non_partita', 'errore'))::int AS partite,
+          count(*) FILTER (WHERE l.stato IN ('risposta', 'interrotta'))::int AS risposte,
+          COALESCE(sum(l.durata_ms) FILTER (WHERE l.stato IN ('risposta', 'interrotta') AND l.durata_ms > 0), 0)::bigint AS ms,
+          COALESCE(sum(ceil(l.durata_ms / 60000.0)) FILTER (WHERE l.stato IN ('risposta', 'interrotta') AND l.durata_ms > 0), 0)::int AS minuti_fatt
+        FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
+        WHERE l.updated_at >= ${da} AND l.updated_at < ${a}
+        GROUP BY c.azienda
+      `) as any[];
+      perAzienda = aziende.map(x => {
+        const r = pa.find(y => y.azienda === x.id);
+        return { id: x.id, chiave: x.nome, attiva: x.attiva, partite: r?.partite || 0, risposte: r?.risposte || 0, minuti: Number(r?.ms || 0) / 60000, minutiFatturabili: r?.minuti_fatt || 0 };
+      }).sort((x, y) => y.minutiFatturabili - x.minutiFatturabili);
+    }
     res.json({
+      perAzienda,
       ok: true, mese, mesi,
       totale: somma(righe),
       perVoicebot: gruppo(r => r.voicebot).sort((x, y) => y.minuti - x.minuti),
@@ -1158,8 +1297,8 @@ app.get("/api/consumi", requireAuth, requireAdmin, async (req: any, res) => {
 });
 
 // Nomi degli utenti (per assegnare i follow-up). Niente dati riservati.
-app.get("/api/utenti/nomi", requireAuth, async (_req, res) => {
-  const users = await readUsers();
+app.get("/api/utenti/nomi", requireAuth, async (req: any, res) => {
+  const users = await utentiDellAzienda(req.azienda);
   res.json({ ok: true, utenti: users.map((u: any) => ({ username: u.username, nome: u.nome || u.username })) });
 });
 
@@ -1172,7 +1311,7 @@ app.post("/api/followups/:id/done", requireAuth, express.json(), async (req, res
     const esito = esitoFinaleValido(req.body?.esito);
     const user = (req as any).session.username;
     await sql`UPDATE followups SET stato = 'done', esito_finale = ${esito}, chiuso_at = now(), chiuso_da = ${user},
-      aggiornato_at = now(), aggiornato_da = ${user} WHERE id = ${fid}`;
+      aggiornato_at = now(), aggiornato_da = ${user} WHERE id = ${fid} AND azienda = ${(req as any).azienda}`;
     res.json({ ok: true });
   } catch (err) {
     console.error("Error updating followup:", err);
@@ -1181,7 +1320,7 @@ app.post("/api/followups/:id/done", requireAuth, express.json(), async (req, res
 });
 
 // ── Statistiche aggregate sui risultati del voicebot ──
-app.get("/api/voicebot-stats", requireAuth, async (_req, res) => {
+app.get("/api/voicebot-stats", requireAuth, async (req: any, res) => {
   try {
     const totals = await sql`
       SELECT
@@ -1189,12 +1328,12 @@ app.get("/api/voicebot-stats", requireAuth, async (_req, res) => {
         COUNT(*) FILTER (WHERE risposto = true)::int AS risposte,
         COUNT(*) FILTER (WHERE risposto = false)::int AS non_risposte,
         AVG(durata) FILTER (WHERE durata > 0)::int AS durata_media_ms
-      FROM call_results
+      FROM call_results WHERE azienda = ${req.azienda}
     `;
     const perGiorno = await sql`
       SELECT DATE(ts) AS giorno, COUNT(*)::int AS totale
       FROM call_results
-      WHERE ts > now() - interval '30 days'
+      WHERE ts > now() - interval '30 days' AND azienda = ${req.azienda}
       GROUP BY DATE(ts)
       ORDER BY giorno ASC
     `;
@@ -1209,7 +1348,8 @@ app.get("/api/voicebot-stats", requireAuth, async (_req, res) => {
 // days = 1 (oggi), 7, 30 o 90. Il periodo parte dalla mezzanotte (ora
 // italiana) di days-1 giorni fa, così "oggi" e i grafici per giorno
 // seguono il calendario italiano e non quello UTC.
-app.get("/api/stats", requireAuth, async (req, res) => {
+app.get("/api/stats", requireAuth, async (req: any, res) => {
+  const az = req.azienda as string;
   const allowed = [1, 7, 30, 90];
   const days = allowed.includes(parseInt(req.query.days as string)) ? parseInt(req.query.days as string) : 30;
   if (!sql) return res.status(503).json({ ok: false, error: "Database non disponibile" });
@@ -1234,9 +1374,9 @@ app.get("/api/stats", requireAuth, async (req, res) => {
       await ensureFollowupsExtra();
       const righe = (await sql`
         SELECT COALESCE(esito_finale, 'non_indicato') AS esito, lower(COALESCE(chiuso_da, '')) AS chi, COUNT(*)::int AS n
-        FROM followups WHERE stato = 'done' AND chiuso_at >= ${da}
+        FROM followups WHERE stato = 'done' AND chiuso_at >= ${da} AND azienda = ${az}
         GROUP BY 1, 2`) as any[];
-      const users = await readUsers().catch(() => [] as any[]);
+      const users = await utentiDellAzienda(az).catch(() => [] as any[]);
       const nomeDi = (u: string) => users.find((x: any) => x.username.toLowerCase() === u)?.nome || u || "—";
       const perEsito = new Map<string, number>();
       const perPersona = new Map<string, { chiusi: number; positivi: number }>();
@@ -1262,33 +1402,33 @@ app.get("/api/stats", requireAuth, async (req, res) => {
                COUNT(*) FILTER (WHERE risposto = true)::int AS risposte,
                COUNT(*) FILTER (WHERE risposto = false)::int AS non_risposte,
                AVG(durata) FILTER (WHERE durata > 0)::int AS durata_media_ms
-        FROM call_results WHERE ts >= ${da}`) as any[])[0] || empty, empty),
+        FROM call_results WHERE ts >= ${da} AND azienda = ${az}`) as any[])[0] || empty, empty),
       safe(async () => (await sql`
         SELECT to_char(DATE(ts AT TIME ZONE 'Europe/Rome'), 'YYYY-MM-DD') AS giorno,
                COUNT(*) FILTER (WHERE risposto = true)::int AS risposte,
                COUNT(*) FILTER (WHERE risposto = false)::int AS non_risposte
-        FROM call_results WHERE ts >= ${da}
+        FROM call_results WHERE ts >= ${da} AND azienda = ${az}
         GROUP BY 1 ORDER BY 1`) as any[], [] as any[]),
       safe(async () => (await sql`
         SELECT motivo, COUNT(*)::int AS totale FROM followups
-        WHERE stato = 'pending' GROUP BY motivo ORDER BY totale DESC`) as any[], [] as any[]),
+        WHERE stato = 'pending' AND azienda = ${az} GROUP BY motivo ORDER BY totale DESC`) as any[], [] as any[]),
       safe(async () => ((await sql`
         SELECT COUNT(*)::int AS campagne,
                COALESCE(SUM(sent_count), 0)::int AS contatti,
                COUNT(*) FILTER (WHERE mode = 'immediate')::int AS immediate,
                COUNT(*) FILTER (WHERE mode = 'scheduled')::int AS pianificate
-        FROM campaign_log WHERE created_at >= ${da} AND dry_run = false`) as any[])[0] || null, null),
+        FROM campaign_log WHERE created_at >= ${da} AND dry_run = false AND azienda = ${az}`) as any[])[0] || null, null),
       safe(async () => (await sql`
         SELECT COALESCE(operatore, username) AS operatore,
                COUNT(*)::int AS campagne,
                COALESCE(SUM(sent_count), 0)::int AS contatti
-        FROM campaign_log WHERE created_at >= ${da} AND dry_run = false
+        FROM campaign_log WHERE created_at >= ${da} AND dry_run = false AND azienda = ${az}
         GROUP BY 1 ORDER BY contatti DESC`) as any[], [] as any[]),
       safe(async () => ((await sql`
-        SELECT COUNT(*)::int AS n FROM scheduled_campaigns WHERE status = 'pending'`) as any[])[0]?.n ?? 0, 0),
+        SELECT COUNT(*)::int AS n FROM scheduled_campaigns WHERE status = 'pending' AND azienda = ${az}`) as any[])[0]?.n ?? 0, 0),
     ]);
 
-    const logStart = await safe(async () => ((await sql`SELECT MIN(created_at) AS inizio FROM campaign_log`) as any[])[0]?.inizio ?? null, null);
+    const logStart = await safe(async () => ((await sql`SELECT MIN(created_at) AS inizio FROM campaign_log WHERE azienda = ${az}`) as any[])[0]?.inizio ?? null, null);
 
     // Confronto tra voicebot e tra fasce orarie, dalle chiamate delle campagne del sito.
     const confronto = await safe(async () => {
@@ -1302,7 +1442,7 @@ app.get("/api/stats", requireAuth, async (req, res) => {
         FROM live_calls l
         JOIN live_campaigns c ON c.id = l.campaign_id
         LEFT JOIN call_results r ON r.call_id = l.call_id
-        WHERE l.updated_at >= ${da} AND l.stato IN ('risposta', 'interrotta', 'non_risposta', 'non_partita')
+        WHERE l.updated_at >= ${da} AND c.azienda = ${az} AND l.stato IN ('risposta', 'interrotta', 'non_risposta', 'non_partita')
         LIMIT 50000
       `) as any[];
       const vuoto = () => ({ chiamate: 0, risposte: 0, interrotte: 0, nonRaggiunte: 0, interessati: 0, durataTot: 0, durataN: 0 });
@@ -1362,7 +1502,7 @@ app.post("/api/register-campaign-contacts", requireAuth, express.json({ limit: "
   if (contacts.length > MAX_CONTACTS_PER_LAUNCH) {
     return res.status(400).json({ ok: false, error: "Troppi contatti" });
   }
-  await upsertContactNames(contacts);
+  await upsertContactNames(contacts, (req as any).azienda);
   res.json({ ok: true, count: contacts.length });
 });
 
@@ -1411,7 +1551,7 @@ app.post(
     // presenti (COALESCE), quindi non serve più leggere tutto l'array e
     // cercare l'indice manualmente come si faceva con GitHub.
     try {
-      const contactNames = await readContactNames();
+      await ensureSchemaAziende().catch(err => console.error("Schema aziende:", err));
 
       if (event.type === "call:completed") {
         const flow = event.data?.flows?.[0] || {};
@@ -1420,7 +1560,8 @@ app.post(
         // (es. nei test diretti su un interno del voicebot).
         const numero = normalizePhone(flow.remotePhone || flow.callee?.phone || event.data?.destination || null);
         const risposto = (flow.talkTime || 0) > 0;
-        const nome = numero ? contactNames[numero] || null : null;
+        const az = await aziendaDellaChiamata(numero, rawBody);
+        const nome = await nomeContatto(numero, az);
 
         await upsertCallResult({
           callId: event.id,
@@ -1430,18 +1571,19 @@ app.post(
           durata: flow.talkTime || 0,
           timestamp: new Date(event.time).toISOString(),
           trascrizione: null,
+          azienda: az,
         });
 
         const durataMs = flow.talkTime || 0;
         await markLiveCallCompleted(numero, risposto, durataMs, event.id, rawBody);
         if (!risposto) {
-          await createAutoFollowup({ callId: event.id, numero, nome, motivo: MOTIVO_NON_RISPOSTO });
+          await createAutoFollowup({ callId: event.id, numero, nome, motivo: MOTIVO_NON_RISPOSTO, azienda: az });
         } else if (durataMs < INTERRUPTED_CALL_MAX_MS) {
           // Ha risposto, quindi l'eventuale "Non risposto" è superato
-          await closeAutoFollowups(numero, [MOTIVO_NON_RISPOSTO]);
-          await createAutoFollowup({ callId: event.id, numero, nome, motivo: MOTIVO_INTERROTTA });
+          await closeAutoFollowups(numero, [MOTIVO_NON_RISPOSTO], az);
+          await createAutoFollowup({ callId: event.id, numero, nome, motivo: MOTIVO_INTERROTTA, azienda: az });
         } else {
-          await closeAutoFollowups(numero, [MOTIVO_NON_RISPOSTO, MOTIVO_INTERROTTA]);
+          await closeAutoFollowups(numero, [MOTIVO_NON_RISPOSTO, MOTIVO_INTERROTTA], az);
         }
       }
 
@@ -1455,11 +1597,13 @@ app.post(
         const trascrizione = chunks
           .map((c: any) => `[${c.time}] ${c.name}: ${c.text}`)
           .join("\n");
+        const az = await aziendaDellaChiamata(numero, rawBody);
 
         await upsertCallResult({
           callId,
           numero,
-          nome: numero ? contactNames[numero] || null : null,
+          azienda: az,
+          nome: await nomeContatto(numero, az),
           risposto: (event.data?.call?.talkTime || 0) > 0,
           durata: event.data?.call?.talkTime || null,
           timestamp: new Date().toISOString(),
@@ -1470,7 +1614,8 @@ app.post(
       if (event.type === "call:summary:completed") {
         const callId = event.id || event.data?.call?.id;
         const numero = normalizePhone(event.data?.call?.remotePhone || event.data?.call?.destination || null);
-        const nome = numero ? contactNames[numero] || null : null;
+        const az = await aziendaDellaChiamata(numero, rawBody);
+        const nome = await nomeContatto(numero, az);
         const summary = event.data?.summary || {};
 
         const riassunto = {
@@ -1490,6 +1635,7 @@ app.post(
           timestamp: new Date().toISOString(),
           trascrizione: null,
           riassunto,
+          azienda: az,
         });
 
         // ── Follow-up: qualsiasi esito che richiede intervento umano ──
@@ -1503,15 +1649,15 @@ app.post(
         else if (/non trovat/.test(testoCompleto)) motivoFollowup = "Appuntamento non trovato";
 
         if (motivoFollowup) {
-          await createFollowup({ callId, numero, nome, motivo: motivoFollowup });
+          await createFollowup({ callId, numero, nome, motivo: motivoFollowup, azienda: az });
         }
 
         // ── Esito commerciale (campagne standard del sito) ──
-        const campagna = await campagnaDelNumero(numero);
+        const campagna = await campagnaDelNumero(numero, az);
         const esitoComm = classificaEsitoCommerciale(riassunto);
         if (esitoComm === "non_chiamare" && numero) {
           // Ha chiesto di non essere più chiamato: entra nella lista "Non chiamare".
-          await aggiungiNonChiamare([{ numero, nome: nome || campagna?.nome }], "Chiesto durante la chiamata con il voicebot", "wilma", null)
+          await aggiungiNonChiamare([{ numero, nome: nome || campagna?.nome }], "Chiesto durante la chiamata con il voicebot", "wilma", null, az)
             .catch(err => console.error("Errore aggiunta Non chiamare da Wilma:", err));
         }
         // Se Wilma ha già salvato l'esito con salva_lead, il follow-up è già stato creato da lì.
@@ -1519,7 +1665,7 @@ app.post(
         if (numero) {
           try {
             await ensureEsitiVoicebot();
-            haLead = ((await sql`SELECT 1 FROM voicebot_esiti WHERE numero = ${numero} AND ricevuto_at > now() - interval '2 hours' LIMIT 1`) as any[]).length > 0;
+            haLead = ((await sql`SELECT 1 FROM voicebot_esiti WHERE numero = ${numero} AND cliente = ${az} AND ricevuto_at > now() - interval '2 hours' LIMIT 1`) as any[]).length > 0;
           } catch { /* senza tabella si procede come prima */ }
         }
         if (campagna && campagna.tipo_campagna !== "appuntamenti" && !motivoFollowup && !haLead) {
@@ -1528,7 +1674,7 @@ app.post(
             : esitoComm === "interessato" ? "Cliente interessato"
             : esitoComm === "richiamare" ? "Da richiamare (chiesto dal cliente)" : null;
           if (motivoComm) {
-            const nuovo = await createFollowup({ callId, numero, nome: nomeContatto, motivo: motivoComm, assegnatoA: campagna.username || null });
+            const nuovo = await createFollowup({ callId, numero, nome: nomeContatto, motivo: motivoComm, assegnatoA: campagna.username || null, azienda: az });
             if (nuovo && (esitoComm === "appuntamento" || esitoComm === "interessato")) {
               await notificaClienteCaldo({ numero, nome: nomeContatto, esito: esitoComm, riassunto, campagna });
             }
@@ -1538,7 +1684,10 @@ app.post(
         await controllaFineCampagne();
 
         // ── Notifica: qualsiasi esito che richiede un operatore ──
-        if (motivoFollowup && process.env.SMTP_USER && process.env.NOTIFY_EMAIL) {
+        const destIntervento = az === AZIENDA_PRINCIPALE
+          ? (process.env.NOTIFY_EMAIL || "")
+          : (await utentiDellAzienda(az)).filter((u: any) => ruoloDi(u) === "Admin" && u.email && EMAIL_VALIDA_RE.test(u.email)).map((u: any) => u.email).join(", ");
+        if (motivoFollowup && process.env.SMTP_USER && destIntervento) {
           try {
             const transporter = nodemailer.createTransport({
               host: process.env.SMTP_HOST || "smtp.gmail.com",
@@ -1548,7 +1697,7 @@ app.post(
             });
             await transporter.sendMail({
               from: `"GEM Voicebot Alert" <${process.env.SMTP_USER}>`,
-              to: process.env.NOTIFY_EMAIL,
+              to: destIntervento,
               subject: `⚠️ ${motivoFollowup} — ${nome || numero || callId}`,
               html: `
                 <h2>${motivoFollowup}</h2>
@@ -1577,7 +1726,7 @@ app.post(
 app.get("/api/call-results", requireAuth, async (req, res) => {
   const limit = Math.min(parseInt((req.query.limit as string) || "50"), 200);
   const offset = parseInt((req.query.offset as string) || "0");
-  const { rows, total } = await readCallResults(limit, offset);
+  const { rows, total } = await readCallResults((req as any).azienda, limit, offset);
   res.json({ ok: true, results: rows, total, limit, offset });
 });
 
@@ -1633,20 +1782,32 @@ function ensureDatiConfig(): Promise<void> {
 }
 
 // Valore dal database; undefined se la riga non c'è ancora.
+// Cache breve: utenti e aziende si leggono a ogni richiesta (requireAuth).
+// Si restituisce sempre una copia, così chi modifica la lista non tocca la cache.
+const DATI_CONFIG_CACHE_MS = 3000;
+const datiConfigCache = new Map<string, { v: any[] | undefined; t: number }>();
 async function leggiDatiConfig(chiave: string): Promise<any[] | undefined> {
+  const c = datiConfigCache.get(chiave);
+  if (c && Date.now() - c.t < DATI_CONFIG_CACHE_MS) return c.v === undefined ? undefined : structuredClone(c.v);
   await ensureDatiConfig();
   const r = (await withRetry(() => sql!`SELECT valore FROM dati_config WHERE chiave = ${chiave}`)) as any[];
-  if (!r[0]) return undefined;
-  const v = typeof r[0].valore === "string" ? JSON.parse(r[0].valore) : r[0].valore;
-  return Array.isArray(v) ? v : [];
+  let v: any[] | undefined = undefined;
+  if (r[0]) {
+    const x = typeof r[0].valore === "string" ? JSON.parse(r[0].valore) : r[0].valore;
+    v = Array.isArray(x) ? x : [];
+  }
+  datiConfigCache.set(chiave, { v, t: Date.now() });
+  return v === undefined ? undefined : structuredClone(v);
 }
 
 async function scriviDatiConfig(chiave: string, valore: any[]): Promise<void> {
+  datiConfigCache.delete(chiave);
   await ensureDatiConfig();
   await withRetry(() => sql!`
     INSERT INTO dati_config (chiave, valore, aggiornato_at) VALUES (${chiave}, ${JSON.stringify(valore)}::jsonb, now())
     ON CONFLICT (chiave) DO UPDATE SET valore = EXCLUDED.valore, aggiornato_at = now()
   `);
+  datiConfigCache.delete(chiave);
 }
 
 // Prima lettura: copia nel database i dati presi da GitHub, senza
@@ -1866,6 +2027,13 @@ app.get("/api/health", async (req, res) => {
   res.status(db === "ok" ? 200 : 503).json({ status: db === "ok" ? "ok" : "degradato", db });
 });
 
+// Azienda dell'utente, per l'interfaccia (nome nel menu, scelta azienda dei super-admin).
+async function infoAzienda(user: any) {
+  const az = aziendaDi(user);
+  const a = (await leggiAziende()).find(x => x.id === az);
+  return { azienda: az, aziendaNome: a?.nome || az, aziendaAttiva: !!a?.attiva, superAdmin: ruoloDi(user) === "Admin" && az === AZIENDA_PRINCIPALE };
+}
+
 app.post("/api/login", async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
@@ -1888,6 +2056,8 @@ app.post("/api/login", async (req, res) => {
     return res.status(401).json({ ok: false, error: "Credenziali errate" });
   }
   await clearAttempts(userKey);
+  const infoAz = await infoAzienda(user);
+  if (!infoAz.aziendaAttiva) return res.status(403).json({ ok: false, error: "L'accesso per la tua azienda è sospeso. Contatta GEM Group." });
 
   // Migrazione trasparente: se la password era ancora in chiaro, la
   // sostituiamo subito con l'hash bcrypt corrispondente.
@@ -1907,10 +2077,11 @@ app.post("/api/login", async (req, res) => {
     const role = user.role || (user.isAdmin ? "Admin" : "Editor");
     const isAdmin = user.isAdmin === true || user.role === "Admin";
     const token = issueSessionToken({ username: user.username, isAdmin });
-    await logAccess(user.username, user.nome, "login");
+    await logAccess(user.username, user.nome, "login", aziendaDi(user));
     return res.json({
       ok: true,
       token,
+      ...infoAz,
       username: user.username,
       nome: user.nome,
       role,
@@ -2003,12 +2174,15 @@ app.post("/api/verify-otp", async (req, res) => {
 
   const role = user.role || (user.isAdmin ? "Admin" : "Editor");
   const isAdmin = user.isAdmin === true || user.role === "Admin";
+  const infoAz = await infoAzienda(user);
+  if (!infoAz.aziendaAttiva) return res.status(403).json({ ok: false, error: "L'accesso per la tua azienda è sospeso. Contatta GEM Group." });
   const token = issueSessionToken({ username: user.username, isAdmin });
-  await logAccess(user.username, user.nome, "login");
+  await logAccess(user.username, user.nome, "login", aziendaDi(user));
 
   res.json({
     ok: true,
     token,
+    ...infoAz,
     username: user.username,
     nome: user.nome,
     role,
@@ -2022,8 +2196,8 @@ app.post("/api/verify-otp", async (req, res) => {
   });
 });
 
-app.get("/api/users", requireAuth, requireAdmin, async (req, res) => {
-  const users = await readUsers();
+app.get("/api/users", requireAuth, requireAdmin, async (req: any, res) => {
+  const users = await utentiDellAzienda(req.azienda);
   // Ultimo accesso e follow-up aperti assegnati: aiutano l'Admin a capire chi usa il sito.
   const accessi = new Map<string, string>();
   const followup = new Map<string, number>();
@@ -2034,11 +2208,11 @@ app.get("/api/users", requireAuth, requireAdmin, async (req, res) => {
       for (const r of (await sql`SELECT DISTINCT lower(username) AS u FROM inviti WHERE usato_at IS NULL AND scade_at > now() AND tipo = 'invito'`) as any[]) inviti.add(r.u);
     } catch { /* niente */ }
     try {
-      for (const r of (await sql`SELECT lower(username) AS u, max(ts) AS ts FROM access_logs WHERE action = 'login' GROUP BY 1`) as any[]) accessi.set(r.u, r.ts);
+      for (const r of (await sql`SELECT lower(username) AS u, max(ts) AS ts FROM access_logs WHERE action = 'login' AND azienda = ${req.azienda} GROUP BY 1`) as any[]) accessi.set(r.u, r.ts);
     } catch { /* registro non disponibile */ }
     try {
       await ensureFollowupsExtra();
-      for (const r of (await sql`SELECT lower(assegnato_a) AS u, count(*)::int AS n FROM followups WHERE stato = 'pending' AND assegnato_a IS NOT NULL GROUP BY 1`) as any[]) followup.set(r.u, r.n);
+      for (const r of (await sql`SELECT lower(assegnato_a) AS u, count(*)::int AS n FROM followups WHERE stato = 'pending' AND assegnato_a IS NOT NULL AND azienda = ${req.azienda} GROUP BY 1`) as any[]) followup.set(r.u, r.n);
     } catch { /* niente */ }
   }
   // Password e segreto 2FA non vengono mai esposti al client.
@@ -2076,7 +2250,7 @@ function leggiPermessi(b: any): Record<string, any> {
   return p;
 }
 
-app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
+app.post("/api/users", requireAuth, requireAdmin, async (req: any, res) => {
   const { username, password, nome, role, canSchedule } = req.body;
   const email = String(req.body.email || "").trim().toLowerCase();
   const telefono = String(req.body.telefono || "").trim().slice(0, 40);
@@ -2098,7 +2272,7 @@ app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
 
   // Con l'invito la password la sceglie la persona: intanto una casuale che nessuno conosce.
   const hashed = await bcrypt.hash(password || crypto.randomBytes(24).toString("hex"), 12);
-  users.push({ username, password: hashed, nome, role, isAdmin: role === 'Admin', canSchedule: canSchedule === true, twoFactorRequired: false, twoFactorEnabled: false, ...(email ? { email } : {}), ...(telefono ? { telefono } : {}), ...leggiPermessi(req.body) });
+  users.push({ username, password: hashed, nome, role, isAdmin: role === 'Admin', canSchedule: canSchedule === true, twoFactorRequired: false, twoFactorEnabled: false, azienda: req.azienda, ...(email ? { email } : {}), ...(telefono ? { telefono } : {}), ...leggiPermessi(req.body) });
   await writeUsers(users);
 
   if (invito) {
@@ -2248,8 +2422,7 @@ async function creaEInviaInvito(username: string, daUsername: string, tipo: "inv
 
 // Admin: manda (o rimanda) l'invito, anche per far reimpostare la password.
 app.post("/api/users/:username/invito", requireAuth, requireAdmin, async (req: any, res) => {
-  const users = await readUsers();
-  const u = users.find((x: any) => x.username.toLowerCase() === String(req.params.username).toLowerCase());
+  const u = await utenteDellAzienda(String(req.params.username), req.azienda);
   if (!u) return res.status(404).json({ ok: false, error: "Utente non trovato" });
   if (!u.email) return res.status(400).json({ ok: false, error: "Questo utente non ha l'email: aggiungila prima" });
   try {
@@ -2328,7 +2501,7 @@ app.post("/api/invito", async (req, res) => {
   }
 });
 
-app.put("/api/users/:username", requireAuth, requireAdmin, async (req, res) => {
+app.put("/api/users/:username", requireAuth, requireAdmin, async (req: any, res) => {
   const { username } = req.params;
   const { password, nome, role, canSchedule } = req.body;
 
@@ -2342,13 +2515,13 @@ app.put("/api/users/:username", requireAuth, requireAdmin, async (req, res) => {
   if (email && !EMAIL_VALIDA.test(email)) return res.status(400).json({ error: "Email non valida" });
 
   let users = await readUsers();
-  const index = users.findIndex((u: any) => u.username.toLowerCase() === username.toLowerCase());
+  const index = users.findIndex((u: any) => u.username.toLowerCase() === username.toLowerCase() && aziendaDi(u) === req.azienda);
 
   if (index === -1) {
     return res.status(404).json({ error: "Utente non trovato" });
   }
-  // Deve restare almeno un Admin.
-  if (ruoloDi(users[index]) === "Admin" && role !== "Admin" && users.filter((u: any) => ruoloDi(u) === "Admin").length <= 1) {
+  // Deve restare almeno un Admin (per azienda).
+  if (ruoloDi(users[index]) === "Admin" && role !== "Admin" && users.filter((u: any) => ruoloDi(u) === "Admin" && aziendaDi(u) === req.azienda).length <= 1) {
     return res.status(400).json({ error: "Deve restare almeno un Admin" });
   }
 
@@ -2380,12 +2553,13 @@ app.delete("/api/users/:username", requireAuth, requireAdmin, async (req: any, r
   }
 
   let users = await readUsers();
-  const target = users.find((u: any) => u.username.toLowerCase() === String(username).toLowerCase());
-  if (target && ruoloDi(target) === "Admin" && users.filter((u: any) => ruoloDi(u) === "Admin").length <= 1) {
+  const target = users.find((u: any) => u.username.toLowerCase() === String(username).toLowerCase() && aziendaDi(u) === req.azienda);
+  if (!target) return res.status(404).json({ error: "Utente non trovato" });
+  if (ruoloDi(target) === "Admin" && users.filter((u: any) => ruoloDi(u) === "Admin" && aziendaDi(u) === req.azienda).length <= 1) {
     return res.status(400).json({ error: "Deve restare almeno un Admin" });
   }
   const initialLength = users.length;
-  users = users.filter((u: any) => u.username.toLowerCase() !== username.toLowerCase());
+  users = users.filter((u: any) => u !== target);
 
   if (users.length === initialLength) {
     return res.status(404).json({ error: "Utente non trovato" });
@@ -2426,7 +2600,7 @@ app.put("/api/users/:username/2fa", requireAuth, async (req: any, res) => {
   }
 
   const users = await readUsers();
-  const idx = users.findIndex((u: any) => u.username.toLowerCase() === username.toLowerCase());
+  const idx = users.findIndex((u: any) => u.username.toLowerCase() === username.toLowerCase() && (isSelf || aziendaDi(u) === req.azienda));
   if (idx === -1) return res.status(404).json({ ok: false, error: "Utente non trovato" });
 
   if (enabled) {
@@ -2510,11 +2684,12 @@ app.get("/api/me", requireAuth, async (req: any, res) => {
   if (req.session?.username?.toLowerCase() !== String(username).toLowerCase() && !req.session?.isAdmin) {
     return res.status(403).json({ ok: false, error: 'Non puoi vedere il profilo di un altro utente' });
   }
-  const users = await readUsers();
-  const user = users.find((u: any) => u.username.toLowerCase() === String(username).toLowerCase());
+  const isSelf = req.session.username.toLowerCase() === String(username).toLowerCase();
+  const user = isSelf ? req.utente : await utenteDellAzienda(String(username), req.azienda);
   if (!user) return res.status(404).json({ ok: false });
   res.json({
     ok: true,
+    ...(isSelf ? await infoAzienda(user) : {}),
     email: user.email || '',
     telefono: user.telefono || '',
     twoFactorEnabled: user.twoFactorEnabled === true,
@@ -2533,7 +2708,8 @@ app.put("/api/me", requireAuth, async (req: any, res) => {
     return res.status(403).json({ ok: false, error: 'Non puoi modificare il profilo di un altro utente' });
   }
   const users = await readUsers();
-  const idx = users.findIndex((u: any) => u.username.toLowerCase() === username.toLowerCase());
+  const isSelf = req.session.username.toLowerCase() === String(username).toLowerCase();
+  const idx = users.findIndex((u: any) => u.username.toLowerCase() === username.toLowerCase() && (isSelf || aziendaDi(u) === req.azienda));
   if (idx === -1) return res.status(404).json({ ok: false, error: 'Utente non trovato' });
   users[idx].email = email || '';
   users[idx].telefono = telefono || '';
@@ -2543,18 +2719,18 @@ app.put("/api/me", requireAuth, async (req: any, res) => {
 
 // ── VOICEBOT ENDPOINTS ──
 app.get("/api/voicebots", requireAuth, async (req: any, res) => {
-  const bots = await readVoicebots();
+  const bots = (await readVoicebots()).filter((b: any) => aziendaDi(b) === req.azienda);
   // Il webhook esiti lo vedono solo gli Admin: chi ha l'indirizzo può scrivere nello Sheets.
   res.json({ ok: true, voicebots: req.session?.isAdmin ? bots : bots.map(({ webhookEsiti, ...b }: any) => b) });
 });
 
-app.post("/api/voicebots", requireAuth, requireAdmin, async (req, res) => {
+app.post("/api/voicebots", requireAuth, requireAdmin, async (req: any, res) => {
   const { nome, exten, context, descrizione, webhookEsiti } = req.body;
   if (!nome || !exten || !context) return res.status(400).json({ ok: false, error: "Nome, interno e contesto sono obbligatori" });
   if (webhookEsiti && !webhookEsitiValido(webhookEsiti)) return res.status(400).json({ ok: false, error: "Webhook esiti non valido: incolla l'indirizzo del webhook Make (https://hook...make.com/...)" });
   const bots = await readVoicebots();
   const id = `vb${Date.now()}`;
-  bots.push({ id, nome, exten: parseInt(exten), context, descrizione: descrizione || "", attivo: true, webhookEsiti: webhookEsitiValido(webhookEsiti) || "" });
+  bots.push({ id, nome, exten: parseInt(exten), context, descrizione: descrizione || "", attivo: true, webhookEsiti: webhookEsitiValido(webhookEsiti) || "", azienda: req.azienda });
   try {
     await writeVoicebots(bots);
     res.json({ ok: true, id });
@@ -2563,14 +2739,16 @@ app.post("/api/voicebots", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-app.put("/api/voicebots/:id", requireAuth, requireAdmin, async (req, res) => {
+app.put("/api/voicebots/:id", requireAuth, requireAdmin, async (req: any, res) => {
   const bots = await readVoicebots();
-  const idx = bots.findIndex((b: any) => b.id === req.params.id);
+  const idx = bots.findIndex((b: any) => b.id === req.params.id && aziendaDi(b) === req.azienda);
   if (idx === -1) return res.status(404).json({ ok: false, error: "Voicebot non trovato" });
   if (req.body?.webhookEsiti && !webhookEsitiValido(req.body.webhookEsiti)) {
     return res.status(400).json({ ok: false, error: "Webhook esiti non valido: incolla l'indirizzo del webhook Make (https://hook...make.com/...)" });
   }
-  bots[idx] = { ...bots[idx], ...req.body, id: req.params.id };
+  // L'azienda del voicebot non si cambia da qui.
+  const { azienda: _ignora, ...modifiche } = req.body || {};
+  bots[idx] = { ...bots[idx], ...modifiche, id: req.params.id };
   if ("webhookEsiti" in (req.body || {})) bots[idx].webhookEsiti = webhookEsitiValido(req.body.webhookEsiti) || "";
   try {
     await writeVoicebots(bots);
@@ -2580,8 +2758,10 @@ app.put("/api/voicebots/:id", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-app.delete("/api/voicebots/:id", requireAuth, requireAdmin, async (req, res) => {
-  const bots = (await readVoicebots()).filter((b: any) => b.id !== req.params.id);
+app.delete("/api/voicebots/:id", requireAuth, requireAdmin, async (req: any, res) => {
+  const tutti = await readVoicebots();
+  const bots = tutti.filter((b: any) => !(b.id === req.params.id && aziendaDi(b) === req.azienda));
+  if (bots.length === tutti.length) return res.status(404).json({ ok: false, error: "Voicebot non trovato" });
   try {
     await writeVoicebots(bots);
     res.json({ ok: true });
@@ -2607,17 +2787,15 @@ app.delete("/api/voicebots/:id", requireAuth, requireAdmin, async (req, res) => 
 // nessuno può più scrivere voci a nome di altri.
 app.post("/api/access-log", requireAuth, async (req: any, res) => {
   if (req.body?.action !== "logout") return res.status(400).json({ ok: false });
-  const users = await readUsers();
-  const user = users.find((u: any) => u.username.toLowerCase() === req.session.username.toLowerCase());
-  await logAccess(req.session.username, user?.nome, "logout");
+  await logAccess(req.session.username, req.utente?.nome, "logout", aziendaDi(req.utente));
   res.json({ ok: true });
 });
 
-app.get("/api/access-logs", requireAuth, requireAdmin, async (_req, res) => {
+app.get("/api/access-logs", requireAuth, requireAdmin, async (req: any, res) => {
   try {
     const logs = await sql`
       SELECT to_char(ts, 'YYYY-MM-DD"T"HH24:MI:SS.MSOF') AS ts, username, nome, action
-      FROM access_logs ORDER BY ts DESC LIMIT 200
+      FROM access_logs WHERE azienda = ${req.azienda} ORDER BY ts DESC LIMIT 200
     `;
     res.json({ logs });
   } catch (err) {
@@ -2842,6 +3020,13 @@ async function findSessionUser(username: string) {
   return users.find((u: any) => u.username.toLowerCase() === username.toLowerCase()) || null;
 }
 
+// Utente di una certa azienda (per assegnare follow-up, gestire utenti): gli altri non esistono.
+async function utenteDellAzienda(username: string, azienda: string) {
+  const u = await findSessionUser(username);
+  return u && aziendaDi(u) === azienda ? u : null;
+}
+const utentiDellAzienda = async (azienda: string) => (await readUsers()).filter((u: any) => aziendaDi(u) === azienda);
+
 interface CampaignSpec {
   contacts: LaunchContact[];
   campaignType: "standard" | "appuntamenti";
@@ -2852,6 +3037,7 @@ interface CampaignSpec {
   scheduledAt: string | null;
   username?: string;
   scheduledId?: number | null;
+  azienda: string;
   // Richiamate automatiche dei non raggiunti (solo con la coda del sito).
   retryMax?: number;
   retryIntervalloMin?: number;
@@ -2869,7 +3055,7 @@ function parseRichiamate(raw: any): { retryMax: number; retryIntervalloMin: numb
 // per le campagne pianificate quando arriva il loro orario.
 async function sendCampaignToMake(spec: CampaignSpec) {
   // I numeri nella lista "Non chiamare" non partono mai.
-  const esclusi = await numeriNonChiamare(spec.contacts.map(c => c.numero));
+  const esclusi = await numeriNonChiamare(spec.contacts.map(c => c.numero), spec.azienda);
   if (esclusi.size > 0) {
     const tutti = spec.contacts;
     spec = { ...spec, contacts: tutti.filter(c => !esclusi.has(normalizePhone(c.numero) || c.numero)) };
@@ -2881,7 +3067,11 @@ async function sendCampaignToMake(spec: CampaignSpec) {
   const chunks: LaunchContact[][] = [];
   for (let i = 0; i < spec.contacts.length; i += spec.chunkSize) chunks.push(spec.contacts.slice(i, i + spec.chunkSize));
 
-  const webhookUrl = spec.campaignType === "appuntamenti" ? MAKE_WEBHOOK_URL_APPUNTAMENTI : MAKE_WEBHOOK_URL_DEFAULT;
+  // Un'azienda con un suo centralino Wildix ha i suoi scenari Make.
+  const az = (await leggiAziende()).find(a => a.id === spec.azienda);
+  const webhookUrl = spec.campaignType === "appuntamenti"
+    ? webhookMakeValido(az?.webhookAppuntamenti) || MAKE_WEBHOOK_URL_APPUNTAMENTI
+    : webhookMakeValido(az?.webhookChiamate) || MAKE_WEBHOOK_URL_DEFAULT;
   const avviatoIl = new Date().toISOString();
   const dryRun = isCallsDryRun();
 
@@ -2900,8 +3090,8 @@ async function sendCampaignToMake(spec: CampaignSpec) {
       voicebot_context: spec.bot?.context || "outbound-voicebot",
     };
     const codaId = await createLiveCampaign(spec, { concurrency, webhookUrl, payloadBase });
-    if (codaId && await recordQueuedCalls(codaId, spec.contacts)) {
-      await upsertContactNames(spec.contacts);
+    if (codaId && await recordQueuedCalls(codaId, spec.contacts, spec.azienda)) {
+      await upsertContactNames(spec.contacts, spec.azienda);
       await pumpCampaign(codaId);
       // I contatti sono tutti in coda: chi non parte compare in "In diretta" come errore.
       return { dryRun, sentContacts: spec.contacts, failedContacts: [] as LaunchContact[], chunksOk: 1, chunksTotal: 1, esclusi: esclusiContatti };
@@ -2942,9 +3132,9 @@ async function sendCampaignToMake(spec: CampaignSpec) {
   const failedContacts = chunks.filter((_, i) => !results[i]).flat();
   // Numero → nome, per mostrare il nome reale negli Esiti Chiamate.
   // In modalità test non si scrive nel database.
-  if (sentContacts.length > 0 && !dryRun) await upsertContactNames(sentContacts);
+  if (sentContacts.length > 0 && !dryRun) await upsertContactNames(sentContacts, spec.azienda);
   if (liveId) {
-    await recordLiveCalls(liveId, chunks, results);
+    await recordLiveCalls(liveId, chunks, results, spec.azienda);
     if (results.some(ok => !ok)) await inviaEsitiFalliti(liveId);
   }
   return { dryRun, sentContacts, failedContacts, chunksOk: results.filter(Boolean).length, chunksTotal: chunks.length, esclusi: esclusiContatti };
@@ -2976,6 +3166,7 @@ function ensureCampaignLogSchema(): Promise<void> {
         )
       `;
       await sql!`CREATE INDEX IF NOT EXISTS idx_campaign_log_created ON campaign_log (created_at DESC)`;
+      await sql!`ALTER TABLE campaign_log ADD COLUMN IF NOT EXISTS azienda TEXT NOT NULL DEFAULT 'gem'`;
     })().catch(err => {
       campaignLogReady = null;
       throw err;
@@ -2987,17 +3178,17 @@ function ensureCampaignLogSchema(): Promise<void> {
 async function logCampaign(entry: {
   username: string; operatore?: string | null; tipoCampagna: string; voicebotNome?: string | null;
   mode: "immediate" | "scheduled"; contactsCount: number; sentCount: number; failedCount: number;
-  scheduledId?: number | null; dryRun: boolean;
+  scheduledId?: number | null; dryRun: boolean; azienda: string;
 }) {
   if (!sql) return;
   try {
     await ensureCampaignLogSchema();
     await sql`
       INSERT INTO campaign_log
-        (username, operatore, tipo_campagna, voicebot_nome, mode, contacts_count, sent_count, failed_count, scheduled_id, dry_run)
+        (username, operatore, tipo_campagna, voicebot_nome, mode, contacts_count, sent_count, failed_count, scheduled_id, dry_run, azienda)
       VALUES
         (${entry.username}, ${entry.operatore || null}, ${entry.tipoCampagna}, ${entry.voicebotNome || null}, ${entry.mode},
-         ${entry.contactsCount}, ${entry.sentCount}, ${entry.failedCount}, ${entry.scheduledId ?? null}, ${entry.dryRun}::boolean)
+         ${entry.contactsCount}, ${entry.sentCount}, ${entry.failedCount}, ${entry.scheduledId ?? null}, ${entry.dryRun}::boolean, ${entry.azienda})
     `;
   } catch (err) {
     console.error("Errore scrittura campaign_log (non bloccante):", err);
@@ -3056,6 +3247,7 @@ function ensureLiveSchema(): Promise<void> {
       await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS fermata_da TEXT`;
       await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS retry_max INT NOT NULL DEFAULT 0`;
       await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS retry_intervallo_min INT NOT NULL DEFAULT 120`;
+      await sql!`ALTER TABLE live_campaigns ADD COLUMN IF NOT EXISTS azienda TEXT NOT NULL DEFAULT 'gem'`;
       await sql!`
         CREATE TABLE IF NOT EXISTS live_calls (
           id          SERIAL PRIMARY KEY,
@@ -3083,6 +3275,8 @@ function ensureLiveSchema(): Promise<void> {
       // Esito commerciale corretto a mano dal dettaglio campagna (vince sulle regole).
       await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS esito_manuale TEXT`;
       await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS esito_manuale_da TEXT`;
+      await sql!`ALTER TABLE live_calls ADD COLUMN IF NOT EXISTS azienda TEXT NOT NULL DEFAULT 'gem'`;
+      await sql!`CREATE INDEX IF NOT EXISTS idx_live_campaigns_azienda ON live_campaigns (azienda, created_at DESC)`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_coda ON live_calls (campaign_id, stato, inviata_at)`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_numero ON live_calls (numero, queued_at DESC)`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_live_calls_campaign ON live_calls (campaign_id)`;
@@ -3105,13 +3299,13 @@ async function createLiveCampaign(
     await ensureLiveSchema();
     const rows = (await sql`
       INSERT INTO live_campaigns (username, operatore, tipo_campagna, voicebot_nome, voicebot_exten, totale, scheduled_id, webhook_esiti,
-                                  modalita_coda, concurrency, webhook_url, payload_base, retry_max, retry_intervallo_min)
+                                  modalita_coda, concurrency, webhook_url, payload_base, retry_max, retry_intervallo_min, azienda)
       VALUES (${spec.username || null}, ${spec.operatore || null}, ${spec.campaignType}, ${spec.bot?.nome || null},
               ${spec.bot?.exten != null ? String(spec.bot.exten) : null}, ${spec.contacts.length}, ${spec.scheduledId ?? null},
               ${webhookEsitiValido(spec.bot?.webhookEsiti)},
               ${!!coda}, ${coda?.concurrency ?? 1}, ${coda?.webhookUrl ?? null},
               ${coda ? JSON.stringify(coda.payloadBase) : null}::jsonb,
-              ${coda ? spec.retryMax || 0 : 0}, ${spec.retryIntervalloMin || 120})
+              ${coda ? spec.retryMax || 0 : 0}, ${spec.retryIntervalloMin || 120}, ${spec.azienda})
       RETURNING id
     `) as any[];
     return rows[0]?.id ?? null;
@@ -3121,7 +3315,7 @@ async function createLiveCampaign(
   }
 }
 
-async function recordLiveCalls(campaignId: number, chunks: LaunchContact[][], results: boolean[]) {
+async function recordLiveCalls(campaignId: number, chunks: LaunchContact[][], results: boolean[], azienda: string) {
   if (!sql) return;
   const numeri: string[] = [], nomi: string[] = [], stati: string[] = [], errori: (string | null)[] = [];
   chunks.forEach((chunk, i) => {
@@ -3134,8 +3328,8 @@ async function recordLiveCalls(campaignId: number, chunks: LaunchContact[][], re
   });
   try {
     await sql`
-      INSERT INTO live_calls (campaign_id, numero, nome, stato, errore)
-      SELECT ${campaignId}, n, nm, st, er
+      INSERT INTO live_calls (campaign_id, numero, nome, stato, errore, azienda)
+      SELECT ${campaignId}, n, nm, st, er, ${azienda}
       FROM unnest(${numeri}::text[], ${nomi}::text[], ${stati}::text[], ${errori}::text[]) AS t(n, nm, st, er)
     `;
   } catch (err) {
@@ -3175,20 +3369,23 @@ function validaOrari(raw: any): OrariConsentiti | null {
   return { attivo, giorni: giorni.sort(), fasce };
 }
 
-let orariCache: { v: OrariConsentiti; t: number } | null = null;
-async function leggiOrari(): Promise<OrariConsentiti> {
-  if (orariCache && Date.now() - orariCache.t < 30_000) return orariCache.v;
+// Ogni azienda ha i suoi orari (chiave "orari" per la principale, come prima).
+const chiaveOrari = (azienda: string) => (azienda === AZIENDA_PRINCIPALE ? "orari" : `orari:${azienda}`);
+const orariCache = new Map<string, { v: OrariConsentiti; t: number }>();
+async function leggiOrari(azienda: string): Promise<OrariConsentiti> {
+  const c = orariCache.get(azienda);
+  if (c && Date.now() - c.t < 30_000) return c.v;
   let v = ORARI_PREDEFINITI;
   if (sql) {
     try {
       await ensureAppState();
-      const r = (await sql`SELECT value FROM app_state WHERE key = 'orari'`) as any[];
+      const r = (await sql`SELECT value FROM app_state WHERE key = ${chiaveOrari(azienda)}`) as any[];
       if (r[0]?.value) v = validaOrari(JSON.parse(r[0].value)) || ORARI_PREDEFINITI;
     } catch (err) {
       console.error("Errore lettura orari consentiti:", err);
     }
   }
-  orariCache = { v, t: Date.now() };
+  orariCache.set(azienda, { v, t: Date.now() });
   return v;
 }
 
@@ -3257,17 +3454,22 @@ function ensureDncSchema(): Promise<void> {
         created_by TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )
-    `.then(() => undefined).catch(err => { dncReady = null; throw err; });
+    `.then(async () => {
+      // Ogni azienda ha la sua lista: lo stesso numero può stare in più liste.
+      await sql!`ALTER TABLE do_not_call ADD COLUMN IF NOT EXISTS azienda TEXT NOT NULL DEFAULT 'gem'`;
+      await sql!`CREATE UNIQUE INDEX IF NOT EXISTS uq_do_not_call_azienda ON do_not_call (azienda, numero)`;
+      await togliChiaveSoloNumero("do_not_call");
+    }).catch(err => { dncReady = null; throw err; });
   }
   return dncReady;
 }
 
-async function numeriNonChiamare(numeri: string[]): Promise<Set<string>> {
+async function numeriNonChiamare(numeri: string[], azienda: string): Promise<Set<string>> {
   if (!sql || numeri.length === 0) return new Set();
   try {
     await ensureDncSchema();
     const norm = [...new Set(numeri.map(n => normalizePhone(n) || n))];
-    const rows = (await sql`SELECT numero FROM do_not_call WHERE numero = ANY(${norm}::text[])`) as any[];
+    const rows = (await sql`SELECT numero FROM do_not_call WHERE numero = ANY(${norm}::text[]) AND azienda = ${azienda}`) as any[];
     return new Set(rows.map(r => r.numero));
   } catch (err) {
     console.error("Errore lettura lista Non chiamare:", err);
@@ -3275,7 +3477,7 @@ async function numeriNonChiamare(numeri: string[]): Promise<Set<string>> {
   }
 }
 
-async function aggiungiNonChiamare(voci: { numero: string; nome?: string | null }[], motivo: string | null, fonte: string, autore: string | null): Promise<number> {
+async function aggiungiNonChiamare(voci: { numero: string; nome?: string | null }[], motivo: string | null, fonte: string, autore: string | null, azienda: string): Promise<number> {
   const mappa = new Map<string, string | null>();
   for (const v of voci) {
     const n = normalizePhone(v.numero);
@@ -3286,9 +3488,9 @@ async function aggiungiNonChiamare(voci: { numero: string; nome?: string | null 
   const numeri = [...mappa.keys()];
   const nomi = numeri.map(n => mappa.get(n) || null);
   const r = (await sql`
-    INSERT INTO do_not_call (numero, nome, motivo, fonte, created_by)
-    SELECT n, nm, ${motivo}, ${fonte}, ${autore} FROM unnest(${numeri}::text[], ${nomi}::text[]) AS t(n, nm)
-    ON CONFLICT (numero) DO UPDATE SET nome = COALESCE(do_not_call.nome, EXCLUDED.nome)
+    INSERT INTO do_not_call (numero, nome, motivo, fonte, created_by, azienda)
+    SELECT n, nm, ${motivo}, ${fonte}, ${autore}, ${azienda} FROM unnest(${numeri}::text[], ${nomi}::text[]) AS t(n, nm)
+    ON CONFLICT (azienda, numero) DO UPDATE SET nome = COALESCE(do_not_call.nome, EXCLUDED.nome)
     RETURNING (xmax = 0) AS nuovo
   `) as any[];
   return r.filter(x => x.nuovo).length;
@@ -3321,15 +3523,15 @@ const CODA_DURATA_MAX_MIN = 15;
 // Le code (richiamate comprese) restano attive al massimo per questi giorni.
 const CODA_GIORNI_MAX = 7;
 
-async function recordQueuedCalls(campaignId: number, contacts: LaunchContact[]): Promise<boolean> {
+async function recordQueuedCalls(campaignId: number, contacts: LaunchContact[], azienda: string): Promise<boolean> {
   if (!sql) return false;
   const numeri = contacts.map(c => normalizePhone(c.numero) || c.numero);
   const nomi = contacts.map(c => c.nome || "");
   const dati = contacts.map(c => JSON.stringify(c));
   try {
     await sql`
-      INSERT INTO live_calls (campaign_id, numero, nome, stato, inviata_at, dati)
-      SELECT ${campaignId}, n, nm, 'in_coda', NULL, d::jsonb
+      INSERT INTO live_calls (campaign_id, numero, nome, stato, inviata_at, dati, azienda)
+      SELECT ${campaignId}, n, nm, 'in_coda', NULL, d::jsonb, ${azienda}
       FROM unnest(${numeri}::text[], ${nomi}::text[], ${dati}::text[]) WITH ORDINALITY AS t(n, nm, d, ord)
       ORDER BY ord
     `;
@@ -3375,8 +3577,9 @@ async function pumpCampaign(campaignId: number | null | undefined): Promise<numb
     await ensureLiveSchema();
     await programmaRichiamate(campaignId);
     await escludiNonChiamare(campaignId);
-    // Fuori dagli orari consentiti non parte nessuno: ci pensa la sveglia all'apertura.
-    const aperto = dentroOrari(await leggiOrari(), new Date());
+    // Fuori dagli orari consentiti (dell'azienda della campagna) non parte nessuno: ci pensa la sveglia all'apertura.
+    const azienda = aziendaDi(((await sql`SELECT azienda FROM live_campaigns WHERE id = ${campaignId}`) as any[])[0]);
+    const aperto = dentroOrari(await leggiOrari(azienda), new Date());
     for (let giro = 0; aperto && giro < 5; giro++) {
       const presi = await claimNextCalls(campaignId);
       if (presi.length === 0) break;
@@ -3432,7 +3635,7 @@ async function escludiNonChiamare(campaignId: number): Promise<void> {
   await sql!`
     UPDATE live_calls l SET stato = 'escluso', errore = 'Nella lista Non chiamare', programmata_at = NULL, updated_at = now()
     FROM do_not_call d
-    WHERE l.campaign_id = ${campaignId} AND l.stato = 'in_coda' AND l.inviata_at IS NULL AND d.numero = l.numero
+    WHERE l.campaign_id = ${campaignId} AND l.stato = 'in_coda' AND l.inviata_at IS NULL AND d.numero = l.numero AND d.azienda = l.azienda
   `;
 }
 
@@ -3491,7 +3694,7 @@ async function controllaFineCampagne(soloId?: number | null): Promise<void> {
           count(*) FILTER (WHERE l.stato = 'risposta' AND NOT EXISTS (
             SELECT 1 FROM call_results r
             WHERE r.riassunto IS NOT NULL
-              AND (r.call_id = l.call_id OR (r.numero = l.numero AND r.ts::timestamptz > c.created_at))
+              AND (r.call_id = l.call_id OR (r.numero = l.numero AND r.azienda = c.azienda AND r.ts::timestamptz > c.created_at))
           )) AS senza_riassunto
         FROM live_campaigns c JOIN live_calls l ON l.campaign_id = c.id
         WHERE c.riepilogo_inviato_at IS NULL AND c.created_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int)
@@ -3622,7 +3825,7 @@ async function chiamateCampagna(campaignId: number, createdAt: any): Promise<any
            AND (r1.riassunto IS NOT NULL OR r1.trascrizione IS NOT NULL) LIMIT 1)
         UNION ALL
         (SELECT r2.riassunto, r2.trascrizione, 1 AS prio, r2.ts::timestamptz AS t FROM call_results r2
-         WHERE l.stato IN ('risposta', 'interrotta') AND r2.numero = l.numero
+         WHERE l.stato IN ('risposta', 'interrotta') AND r2.numero = l.numero AND r2.azienda = l.azienda
            AND (r2.riassunto IS NOT NULL OR r2.trascrizione IS NOT NULL) AND r2.ts::timestamptz > ${createdAt}
          ORDER BY r2.ts::timestamptz ASC LIMIT 1)
       ) x ORDER BY x.prio, x.t LIMIT 1
@@ -4042,7 +4245,7 @@ async function prossimaSveglia(): Promise<Date | null> {
   // Code del sito: quando si libera un posto bloccato, quando scade una
   // richiamata, quando riaprono gli orari consentiti.
   const code = (await sql!`
-    SELECT c.id,
+    SELECT c.id, c.azienda,
       count(*) FILTER (WHERE l.stato = 'in_coda' AND l.inviata_at IS NULL
                          AND (l.programmata_at IS NULL OR l.programmata_at <= now())) AS pronte,
       min(l.programmata_at) FILTER (WHERE l.stato = 'in_coda' AND l.inviata_at IS NULL AND l.programmata_at > now()) AS prossima_richiamata,
@@ -4056,9 +4259,9 @@ async function prossimaSveglia(): Promise<Date | null> {
     GROUP BY c.id
   `) as any[];
   if (code.length) {
-    const orari = await leggiOrari();
     const ora = new Date();
     for (const q of code) {
+      const orari = await leggiOrari(aziendaDi(q));
       if (q.scadenza_posto) candidati.push(new Date(q.scadenza_posto).getTime() + 60_000);
       if (Number(q.pronte) > 0) {
         // Contatti pronti: se gli orari sono chiusi, alla riapertura; se sono
@@ -4208,10 +4411,8 @@ async function trovaProblemi(): Promise<ProblemaSalute[]> {
   });
   await ensureLiveSchema();
   await prova(async () => {
-    const orari = await leggiOrari();
-    if (!dentroOrari(orari, new Date())) return;
-    const ferme = (await sql!`
-      SELECT c.id, COALESCE(c.voicebot_nome, 'Campagna') AS nome, c.operatore, max(l.updated_at) AS ultimo
+    const tutte = (await sql!`
+      SELECT c.id, c.azienda, COALESCE(c.voicebot_nome, 'Campagna') AS nome, c.operatore, max(l.updated_at) AS ultimo
       FROM live_campaigns c JOIN live_calls l ON l.campaign_id = c.id
       WHERE c.modalita_coda AND NOT c.in_pausa AND c.fermata_at IS NULL
         AND c.created_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int) AND c.created_at < now() - interval '20 minutes'
@@ -4220,6 +4421,8 @@ async function trovaProblemi(): Promise<ProblemaSalute[]> {
          AND count(*) FILTER (WHERE l.stato = 'avviata' OR (l.stato = 'in_coda' AND l.inviata_at IS NOT NULL)) = 0
          AND max(l.updated_at) < now() - interval '20 minutes'
     `) as any[];
+    const ferme: any[] = [];
+    for (const f of tutte) if (dentroOrari(await leggiOrari(aziendaDi(f)), new Date())) ferme.push(f);
     if (ferme.length) problemi.push({
       chiave: "coda_ferma", titolo: ferme.length === 1 ? "Una campagna è ferma" : `${ferme.length} campagne sono ferme`,
       dettaglio: `Hanno contatti da chiamare ma nessuna chiamata parte da oltre 20 minuti, dentro gli orari consentiti: ${ferme.map(f => `${f.nome}${f.operatore ? ` (${f.operatore})` : ""}`).join(", ")}. Di solito è la sveglia Make spenta: aprire In diretta la fa ripartire.`,
@@ -4272,7 +4475,8 @@ async function controlloSalute(): Promise<ProblemaSalute[]> {
     for (const k of ultimo.keys()) if (!problemi.some(p => p.chiave === k)) await sql`DELETE FROM app_state WHERE key = ${"avviso:" + k}`;
     const daAvvisare = problemi.filter(p => !ultimo.has(p.chiave) || Date.now() - ultimo.get(p.chiave)! > SALUTE_RIPETI_ORE * 3600_000);
     if (!daAvvisare.length || !process.env.SMTP_USER) return problemi;
-    const admin = (await readUsers()).filter((u: any) => ruoloDi(u) === "Admin" && u.email && EMAIL_VALIDA_RE.test(u.email)).map((u: any) => u.email);
+    // Problemi della piattaforma: li ricevono gli Admin di GEM, non quelli dei clienti.
+    const admin = (await utentiDellAzienda(AZIENDA_PRINCIPALE)).filter((u: any) => ruoloDi(u) === "Admin" && u.email && EMAIL_VALIDA_RE.test(u.email)).map((u: any) => u.email);
     const to = admin.length ? admin : process.env.NOTIFY_EMAIL ? [process.env.NOTIFY_EMAIL] : [];
     if (!to.length) return problemi;
     // Si segna prima di inviare: due controlli insieme non mandano due email.
@@ -4321,16 +4525,110 @@ app.post("/api/cron/salute", handleSalute);
 app.get("/api/cron/salute", handleSalute);
 
 // Per l'avviso rosso agli Admin dentro il sito.
-app.get("/api/salute", requireAuth, requireAdmin, async (_req, res) => {
+app.get("/api/salute", requireAuth, requireSuperAdmin, async (_req, res) => {
   res.json({ ok: true, problemi: await controlloSalute() });
+});
+
+// ══════════════════════════════════════════════════════════════
+// AZIENDE (solo super-admin, cioè gli Admin di GEM)
+// ══════════════════════════════════════════════════════════════
+const webhookMakeValido = webhookEsitiValido;
+const slugAzienda = (nome: string) => nome.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+  .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 30);
+
+app.get("/api/aziende", requireAuth, requireSuperAdmin, async (_req: any, res) => {
+  const [aziende, users, bots] = await Promise.all([leggiAziende(), readUsers(), readVoicebots()]);
+  res.json({
+    ok: true,
+    aziende: aziende.map(a => ({
+      ...a,
+      principale: a.id === AZIENDA_PRINCIPALE,
+      utenti: users.filter((u: any) => aziendaDi(u) === a.id).length,
+      admin: users.filter((u: any) => aziendaDi(u) === a.id && ruoloDi(u) === "Admin").length,
+      voicebot: bots.filter((b: any) => aziendaDi(b) === a.id).length,
+    })),
+  });
+});
+
+// Valida i campi modificabili di un'azienda (assenti = invariati).
+function campiAzienda(b: any): { campi: Partial<Azienda>; errore?: string } {
+  const campi: Partial<Azienda> = {};
+  if (b.nome !== undefined) {
+    const nome = cleanText(b.nome, 80);
+    if (!nome) return { campi, errore: "Scrivi il nome dell'azienda" };
+    campi.nome = nome;
+  }
+  if (typeof b.attiva === "boolean") campi.attiva = b.attiva;
+  for (const k of ["webhookChiamate", "webhookAppuntamenti"] as const) {
+    if (b[k] === undefined) continue;
+    const v = String(b[k] || "").trim();
+    if (v && !webhookMakeValido(v)) return { campi, errore: "Webhook non valido: incolla l'indirizzo del webhook Make (https://hook...make.com/...)" };
+    campi[k] = v;
+  }
+  return { campi };
+}
+
+app.post("/api/aziende", requireAuth, requireSuperAdmin, async (req: any, res) => {
+  const { campi, errore } = campiAzienda(req.body || {});
+  if (errore) return res.status(400).json({ ok: false, error: errore });
+  if (!campi.nome) return res.status(400).json({ ok: false, error: "Scrivi il nome dell'azienda" });
+  if (!sql) return res.status(503).json({ ok: false, error: "Database non disponibile" });
+  const aziende = await leggiAziende();
+  if (aziende.some(a => a.nome.toLowerCase() === campi.nome!.toLowerCase())) return res.status(400).json({ ok: false, error: "Esiste già un'azienda con questo nome" });
+  let id = slugAzienda(campi.nome) || "azienda";
+  for (let i = 2; aziende.some(a => a.id === id); i++) id = `${slugAzienda(campi.nome) || "azienda"}-${i}`;
+  const nuova: Azienda = { id, nome: campi.nome, attiva: campi.attiva !== false, webhookChiamate: campi.webhookChiamate || "", webhookAppuntamenti: campi.webhookAppuntamenti || "", creataAt: new Date().toISOString() };
+  try {
+    await scriviDatiConfig("aziende", [...aziende, nuova]);
+    res.json({ ok: true, azienda: nuova });
+  } catch (err) {
+    console.error("Errore creazione azienda:", err);
+    res.status(500).json({ ok: false, error: "Errore salvataggio" });
+  }
+});
+
+app.put("/api/aziende/:id", requireAuth, requireSuperAdmin, async (req: any, res) => {
+  const { campi, errore } = campiAzienda(req.body || {});
+  if (errore) return res.status(400).json({ ok: false, error: errore });
+  const aziende = await leggiAziende();
+  const i = aziende.findIndex(a => a.id === req.params.id);
+  if (i === -1) return res.status(404).json({ ok: false, error: "Azienda non trovata" });
+  if (aziende[i].id === AZIENDA_PRINCIPALE && campi.attiva === false) return res.status(400).json({ ok: false, error: "GEM Group non si può sospendere" });
+  if (campi.nome && aziende.some((a, k) => k !== i && a.nome.toLowerCase() === campi.nome!.toLowerCase())) return res.status(400).json({ ok: false, error: "Esiste già un'azienda con questo nome" });
+  aziende[i] = { ...aziende[i], ...campi };
+  try {
+    await scriviDatiConfig("aziende", aziende);
+    res.json({ ok: true, azienda: aziende[i] });
+  } catch (err) {
+    console.error("Errore modifica azienda:", err);
+    res.status(500).json({ ok: false, error: "Errore salvataggio" });
+  }
+});
+
+// Si elimina solo un'azienda vuota (senza utenti né voicebot): i dati restano nel database.
+app.delete("/api/aziende/:id", requireAuth, requireSuperAdmin, async (req: any, res) => {
+  const id = String(req.params.id);
+  if (id === AZIENDA_PRINCIPALE) return res.status(400).json({ ok: false, error: "GEM Group non si può eliminare" });
+  const [aziende, users, bots] = await Promise.all([leggiAziende(), readUsers(), readVoicebots()]);
+  if (!aziende.some(a => a.id === id)) return res.status(404).json({ ok: false, error: "Azienda non trovata" });
+  if (users.some((u: any) => aziendaDi(u) === id) || bots.some((b: any) => aziendaDi(b) === id)) {
+    return res.status(409).json({ ok: false, error: "Prima elimina utenti e voicebot dell'azienda, oppure sospendila" });
+  }
+  try {
+    await scriviDatiConfig("aziende", aziende.filter(a => a.id !== id));
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Errore eliminazione azienda:", err);
+    res.status(500).json({ ok: false, error: "Errore eliminazione" });
+  }
 });
 
 app.post("/api/cron/tick", handleTick);
 app.get("/api/cron/tick", handleTick);
 
 // Impostazioni che l'interfaccia deve conoscere.
-app.get("/api/config", requireAuth, async (_req, res) => {
-  const orari = await leggiOrari();
+app.get("/api/config", requireAuth, async (req: any, res) => {
+  const orari = await leggiOrari(req.azienda);
   res.json({
     ok: true,
     // In anteprima (prova) le chiamate sono simulate: niente coda, quindi niente richiamate o pausa.
@@ -4382,6 +4680,8 @@ function ensureArchivioSchema(): Promise<void> {
         )
       `;
       await sql!`CREATE UNIQUE INDEX IF NOT EXISTS uq_contact_lists_import ON contact_lists (created_by, nome, created_at)`;
+      await sql!`ALTER TABLE campaign_history ADD COLUMN IF NOT EXISTS azienda TEXT NOT NULL DEFAULT 'gem'`;
+      await sql!`ALTER TABLE contact_lists ADD COLUMN IF NOT EXISTS azienda TEXT NOT NULL DEFAULT 'gem'`;
     })().catch(err => { archivioReady = null; throw err; });
   }
   return archivioReady;
@@ -4402,15 +4702,15 @@ function pulisciContattiArchivio(raw: unknown): any[] | null {
 
 async function recordHistory(h: {
   username: string; operatore: string; count: number; scheduledAt: string | null; chunkSize: number;
-  note?: string; tipoCampagna: string; voicebotNome?: string; contatti: any[]; test: boolean;
+  note?: string; tipoCampagna: string; voicebotNome?: string; contatti: any[]; test: boolean; azienda: string;
 }) {
   if (!sql) return;
   try {
     await ensureArchivioSchema();
     await sql`
-      INSERT INTO campaign_history (username, operatore, count, scheduled_at, chunk_size, note, tipo_campagna, voicebot_nome, contatti, test)
+      INSERT INTO campaign_history (username, operatore, count, scheduled_at, chunk_size, note, tipo_campagna, voicebot_nome, contatti, test, azienda)
       VALUES (${h.username}, ${h.operatore}, ${h.count}, ${h.scheduledAt}, ${h.chunkSize}, ${h.note || null},
-              ${h.tipoCampagna}, ${h.voicebotNome || null}, ${JSON.stringify(pulisciContattiArchivio(h.contatti) || [])}::jsonb, ${h.test})
+              ${h.tipoCampagna}, ${h.voicebotNome || null}, ${JSON.stringify(pulisciContattiArchivio(h.contatti) || [])}::jsonb, ${h.test}, ${h.azienda})
     `;
   } catch (err) {
     console.error("Errore scrittura storico (non bloccante):", err);
@@ -4447,20 +4747,20 @@ function permessiUtente(u: any) {
 }
 
 async function requireEditor(req: any, res: any): Promise<any | null> {
-  const user = await findSessionUser(req.session.username);
+  const user = req.utente || await findSessionUser(req.session.username);
   if (!user) { res.status(401).json({ ok: false, error: "Utente non trovato" }); return null; }
   if (user.role === "Viewer") { res.status(403).json({ ok: false, error: "Non autorizzato" }); return null; }
   return user;
 }
 
-app.get("/api/history", requireAuth, async (_req, res) => {
+app.get("/api/history", requireAuth, async (req: any, res) => {
   if (!sql) return res.json({ ok: true, history: [] });
   try {
     await ensureArchivioSchema();
     // In produzione non si vedono le campagne di prova fatte negli ambienti di test.
     const rows = (await sql`
       SELECT * FROM campaign_history
-      WHERE test = false OR ${isCallsDryRun()}
+      WHERE (test = false OR ${isCallsDryRun()}) AND azienda = ${req.azienda}
       ORDER BY created_at DESC LIMIT 200
     `) as any[];
     res.json({ ok: true, history: rows.map(mapHistoryRow) });
@@ -4470,11 +4770,11 @@ app.get("/api/history", requireAuth, async (_req, res) => {
   }
 });
 
-app.delete("/api/history", requireAuth, requireAdmin, async (_req, res) => {
+app.delete("/api/history", requireAuth, requireAdmin, async (req: any, res) => {
   if (!sql) return res.status(503).json({ ok: false });
   try {
     await ensureArchivioSchema();
-    await sql`DELETE FROM campaign_history WHERE test = ${isCallsDryRun()}`;
+    await sql`DELETE FROM campaign_history WHERE test = ${isCallsDryRun()} AND azienda = ${req.azienda}`;
     res.json({ ok: true });
   } catch (err) {
     console.error("Errore svuotamento storico:", err);
@@ -4498,7 +4798,7 @@ app.get("/api/lists", requireAuth, async (req: any, res) => {
   if (!sql) return res.json({ ok: true, lists: [] });
   try {
     await ensureArchivioSchema();
-    const rows = (await sql`SELECT * FROM contact_lists ORDER BY created_at DESC LIMIT 300`) as any[];
+    const rows = (await sql`SELECT * FROM contact_lists WHERE azienda = ${req.azienda} ORDER BY created_at DESC LIMIT 300`) as any[];
     res.json({ ok: true, lists: rows.map(r => mapListRow(r, user)) });
   } catch (err) {
     console.error("Errore lettura liste:", err);
@@ -4516,8 +4816,8 @@ app.post("/api/lists", requireAuth, async (req: any, res) => {
   try {
     await ensureArchivioSchema();
     const rows = (await sql`
-      INSERT INTO contact_lists (created_by, created_by_nome, nome, contatti)
-      VALUES (${user.username}, ${user.nome || user.username}, ${nome}, ${JSON.stringify(contatti)}::jsonb)
+      INSERT INTO contact_lists (created_by, created_by_nome, nome, contatti, azienda)
+      VALUES (${user.username}, ${user.nome || user.username}, ${nome}, ${JSON.stringify(contatti)}::jsonb, ${req.azienda})
       RETURNING *
     `) as any[];
     res.json({ ok: true, list: mapListRow(rows[0], user) });
@@ -4537,7 +4837,7 @@ app.delete("/api/lists/:id", requireAuth, async (req: any, res) => {
     await ensureArchivioSchema();
     const rows = (await sql`
       DELETE FROM contact_lists
-      WHERE id = ${id} AND (${admin} OR lower(created_by) = lower(${user.username}))
+      WHERE id = ${id} AND azienda = ${req.azienda} AND (${admin} OR lower(created_by) = lower(${user.username}))
       RETURNING id
     `) as any[];
     if (rows.length === 0) return res.status(403).json({ ok: false, error: "Puoi eliminare solo le liste create da te" });
@@ -4564,8 +4864,8 @@ app.post("/api/archivio/importa", requireAuth, async (req: any, res) => {
       const creata = data(l?.createdAt);
       if (!nome || !contatti?.length || !creata) continue;
       const r = (await sql`
-        INSERT INTO contact_lists (created_at, created_by, created_by_nome, nome, contatti)
-        VALUES (${creata}, ${user.username}, ${cleanText(l?.createdBy, 120) || user.nome || user.username}, ${nome}, ${JSON.stringify(contatti)}::jsonb)
+        INSERT INTO contact_lists (created_at, created_by, created_by_nome, nome, contatti, azienda)
+        VALUES (${creata}, ${user.username}, ${cleanText(l?.createdBy, 120) || user.nome || user.username}, ${nome}, ${JSON.stringify(contatti)}::jsonb, ${aziendaDi(user)})
         ON CONFLICT DO NOTHING RETURNING id
       `) as any[];
       listeImportate += r.length;
@@ -4575,10 +4875,10 @@ app.post("/api/archivio/importa", requireAuth, async (req: any, res) => {
       const count = parseInt(h?.count, 10);
       if (!ts || !(count >= 0)) continue;
       const r = (await sql`
-        INSERT INTO campaign_history (created_at, username, operatore, count, scheduled_at, chunk_size, note, contatti, origine)
+        INSERT INTO campaign_history (created_at, username, operatore, count, scheduled_at, chunk_size, note, contatti, origine, azienda)
         VALUES (${ts}, ${user.username}, ${cleanText(h?.opt, 120) || user.nome || user.username}, ${count}, ${data(h?.scheduledAt)},
                 ${Math.min(Math.max(parseInt(h?.chunkSize, 10) || 1, 1), 10)}, ${cleanText(h?.note, 1000) || null},
-                ${JSON.stringify(pulisciContattiArchivio(h?.contactsList) || [])}::jsonb, 'browser')
+                ${JSON.stringify(pulisciContattiArchivio(h?.contactsList) || [])}::jsonb, 'browser', ${aziendaDi(user)})
         ON CONFLICT DO NOTHING RETURNING id
       `) as any[];
       storicoImportato += r.length;
@@ -4600,8 +4900,7 @@ const LIVE_SENZA_ESITO_MIN = 30;
 // per stato, ultimi eventi e (per gli admin) gli eventi ricevuti da Wildix.
 app.get("/api/live", requireAuth, async (req: any, res) => {
   // Tutti la vedono; i Viewer solo in lettura (le azioni sono bloccate nelle loro rotte).
-  const user = await findSessionUser(req.session.username);
-  if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
+  const az = req.azienda as string;
   if (!sql) return res.json({ ok: true, campaigns: [], events: [], diagnostics: null });
   const hours = Math.min(Math.max(parseInt(String(req.query.hours || "12"), 10) || 12, 1), 72);
   try {
@@ -4626,10 +4925,10 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
         max(l.updated_at) FILTER (WHERE l.stato <> 'in_coda') AS ultimo_avanzamento
       FROM live_campaigns c
       LEFT JOIN live_calls l ON l.campaign_id = c.id
-      WHERE c.created_at > now() - make_interval(hours => ${hours})
+      WHERE c.azienda = ${az} AND (c.created_at > now() - make_interval(hours => ${hours})
          -- Anche le campagne più vecchie che hanno ancora contatti in coda (pausa, richiamate).
          OR (c.modalita_coda AND c.created_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int) AND c.fermata_at IS NULL
-             AND EXISTS (SELECT 1 FROM live_calls x WHERE x.campaign_id = c.id AND x.stato IN ('in_coda', 'avviata')))
+             AND EXISTS (SELECT 1 FROM live_calls x WHERE x.campaign_id = c.id AND x.stato IN ('in_coda', 'avviata'))))
       GROUP BY c.id
       ORDER BY c.created_at DESC
       LIMIT 30
@@ -4642,7 +4941,7 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
              c.operatore, c.voicebot_nome
       FROM live_calls l
       LEFT JOIN live_campaigns c ON c.id = l.campaign_id
-      WHERE l.updated_at > now() - make_interval(hours => ${hours}) AND l.stato <> 'in_coda'
+      WHERE l.updated_at > now() - make_interval(hours => ${hours}) AND l.stato <> 'in_coda' AND l.azienda = ${az}
       ORDER BY l.updated_at DESC
       LIMIT 80
     `) as any[];
@@ -4650,7 +4949,7 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
     // Fase 0: quali tipi di evento manda Wildix oltre a quelli già gestiti
     // (es. call:live:progress per le chiamate in corso). Solo per gli admin.
     let diagnostics: any = null;
-    if (req.session?.isAdmin) {
+    if (req.superAdmin) {
       try {
         diagnostics = (await sql`
           SELECT event_type, reason, count(*)::int AS totale FROM webhook_log GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20
@@ -4659,7 +4958,7 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
         diagnostics = [];
       }
     }
-    const orari = await leggiOrari();
+    const orari = await leggiOrari(req.azienda);
     const ora = new Date();
     const aperto = dentroOrari(orari, ora);
     res.json({
@@ -4675,9 +4974,6 @@ app.get("/api/live", requireAuth, async (req: any, res) => {
 // Dettaglio di una campagna della pagina "In diretta": tutti i numeri con
 // esito, durata e riassunto di Wilma. I Viewer la vedono in sola lettura.
 app.get("/api/live/campaigns/:id", requireAuth, async (req: any, res) => {
-  const user = await findSessionUser(req.session.username);
-  if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
-  
   const id = parseInt(String(req.params.id), 10);
   if (!sql || !(id > 0)) return res.status(404).json({ ok: false, error: "Campagna non trovata" });
   try {
@@ -4685,7 +4981,7 @@ app.get("/api/live/campaigns/:id", requireAuth, async (req: any, res) => {
     const c = ((await sql`
       SELECT id, created_at, operatore, tipo_campagna, voicebot_nome, voicebot_exten, totale, scheduled_id,
              modalita_coda, in_pausa, fermata_at, fermata_da, retry_max, retry_intervallo_min
-      FROM live_campaigns WHERE id = ${id}
+      FROM live_campaigns WHERE id = ${id} AND azienda = ${req.azienda}
     `) as any[])[0];
     if (!c) return res.status(404).json({ ok: false, error: "Campagna non trovata" });
     const limiteSenzaEsito = Date.now() - LIVE_SENZA_ESITO_MIN * 60000;
@@ -4718,7 +5014,7 @@ app.get("/api/live/campaigns/:id", requireAuth, async (req: any, res) => {
         } : null,
       };
     });
-    const dnc = await numeriNonChiamare(calls.map(x => x.numero));
+    const dnc = await numeriNonChiamare(calls.map(x => x.numero), req.azienda);
     res.json({ ok: true, campaign: c, calls: calls.map(x => ({ ...x, non_chiamare: dnc.has(x.numero) })) });
   } catch (err) {
     console.error("Errore /api/live/campaigns/:id:", err);
@@ -4729,7 +5025,7 @@ app.get("/api/live/campaigns/:id", requireAuth, async (req: any, res) => {
 // Correzione a mano dell'esito commerciale di una chiamata (Editor e Admin).
 // esito null = torna a quello automatico.
 app.put("/api/live/calls/:id/esito", requireAuth, async (req: any, res) => {
-  const user = await findSessionUser(req.session.username);
+  const user = req.utente;
   if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
   if (user.role === "Viewer") return res.status(403).json({ ok: false, error: "Non autorizzato" });
   const id = parseInt(String(req.params.id), 10);
@@ -4742,7 +5038,7 @@ app.put("/api/live/calls/:id/esito", requireAuth, async (req: any, res) => {
     await ensureLiveSchema();
     const righe = (await sql`
       UPDATE live_calls SET esito_manuale = ${esito}, esito_manuale_da = ${esito ? user.nome || user.username : null}
-      WHERE id = ${id} RETURNING id
+      WHERE id = ${id} AND azienda = ${req.azienda} RETURNING id
     `) as any[];
     if (righe.length === 0) return res.status(404).json({ ok: false, error: "Chiamata non trovata" });
     res.json({ ok: true });
@@ -4764,7 +5060,7 @@ app.post("/api/live/campaigns/:id/pausa", requireAuth, async (req: any, res) => 
     await ensureLiveSchema();
     const r = (await sql`
       UPDATE live_campaigns SET in_pausa = ${pausa}
-      WHERE id = ${id} AND modalita_coda AND fermata_at IS NULL
+      WHERE id = ${id} AND azienda = ${req.azienda} AND modalita_coda AND fermata_at IS NULL
       RETURNING id
     `) as any[];
     if (!r[0]) return res.status(409).json({ ok: false, error: "Questa campagna non si può mettere in pausa (già fermata o inviata tutta a Make)" });
@@ -4786,6 +5082,8 @@ app.delete("/api/live/campaigns/:id", requireAuth, requireAdmin, async (req: any
   if (!sql || !(id > 0)) return res.status(400).json({ ok: false, error: "Richiesta non valida" });
   try {
     await ensureLiveSchema();
+    const mia = (await sql`SELECT id FROM live_campaigns WHERE id = ${id} AND azienda = ${req.azienda}`) as any[];
+    if (!mia[0]) return res.status(404).json({ ok: false, error: "Campagna non trovata" });
     const aperte = (await sql`
       SELECT count(*)::int AS n FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
       WHERE l.campaign_id = ${id} AND c.fermata_at IS NULL
@@ -4816,7 +5114,7 @@ app.post("/api/live/campaigns/:id/ferma", requireAuth, async (req: any, res) => 
     await ensureLiveSchema();
     const r = (await sql`
       UPDATE live_campaigns SET fermata_at = now(), fermata_da = ${user.nome || user.username}, in_pausa = false
-      WHERE id = ${id} AND modalita_coda AND fermata_at IS NULL
+      WHERE id = ${id} AND azienda = ${req.azienda} AND modalita_coda AND fermata_at IS NULL
       RETURNING id
     `) as any[];
     if (!r[0]) return res.status(409).json({ ok: false, error: "Questa campagna non si può fermare (già fermata o inviata tutta a Make)" });
@@ -4843,7 +5141,7 @@ app.get("/api/non-chiamare", requireAuth, async (req: any, res) => {
   if (!sql) return res.json({ ok: true, numeri: [] });
   try {
     await ensureDncSchema();
-    const rows = (await sql`SELECT * FROM do_not_call ORDER BY created_at DESC LIMIT 10000`) as any[];
+    const rows = (await sql`SELECT * FROM do_not_call WHERE azienda = ${req.azienda} ORDER BY created_at DESC LIMIT 10000`) as any[];
     res.json({ ok: true, numeri: rows });
   } catch (err) {
     console.error("Errore lettura Non chiamare:", err);
@@ -4862,13 +5160,14 @@ app.post("/api/non-chiamare", requireAuth, async (req: any, res) => {
   try {
     const aggiunti = await aggiungiNonChiamare(
       validi.map((v: any) => ({ numero: String(v.numero), nome: cleanText(v.nome) || null })),
-      cleanText(req.body?.motivo, 300) || null, "manuale", user.nome || user.username,
+      cleanText(req.body?.motivo, 300) || null, "manuale", user.nome || user.username, req.azienda,
     );
     // I numeri aggiunti spariscono subito dalle code delle campagne in corso.
     await ensureLiveSchema();
     await sql`
       UPDATE live_calls l SET stato = 'escluso', errore = 'Nella lista Non chiamare', programmata_at = NULL, updated_at = now()
       FROM do_not_call d WHERE l.stato = 'in_coda' AND l.inviata_at IS NULL AND d.numero = l.numero
+        AND d.azienda = l.azienda AND l.azienda = ${req.azienda}
     `;
     res.json({ ok: true, aggiunti, giaPresenti: validi.length - aggiunti, scartati: voci.length - validi.length });
   } catch (err) {
@@ -4882,7 +5181,7 @@ app.delete("/api/non-chiamare/:numero", requireAuth, requireAdmin, async (req: a
   try {
     await ensureDncSchema();
     const n = normalizePhone(decodeURIComponent(String(req.params.numero))) || "";
-    const r = (await sql`DELETE FROM do_not_call WHERE numero = ${n} RETURNING numero`) as any[];
+    const r = (await sql`DELETE FROM do_not_call WHERE numero = ${n} AND azienda = ${req.azienda} RETURNING numero`) as any[];
     res.json({ ok: true, rimossi: r.length });
   } catch (err) {
     console.error("Errore rimozione Non chiamare:", err);
@@ -4891,8 +5190,8 @@ app.delete("/api/non-chiamare/:numero", requireAuth, requireAdmin, async (req: a
 });
 
 // ── Orari consentiti: tutti li leggono, solo un Admin li cambia ──
-app.get("/api/impostazioni/orari", requireAuth, async (_req, res) => {
-  const orari = await leggiOrari();
+app.get("/api/impostazioni/orari", requireAuth, async (req: any, res) => {
+  const orari = await leggiOrari(req.azienda);
   const ora = new Date();
   res.json({ ok: true, orari, descrizione: descriviOrari(orari), aperto: dentroOrari(orari, ora), prossimaApertura: prossimaApertura(orari, ora)?.toISOString() || null });
 });
@@ -4904,10 +5203,10 @@ app.put("/api/impostazioni/orari", requireAuth, requireAdmin, async (req: any, r
   try {
     await ensureAppState();
     await sql`
-      INSERT INTO app_state (key, value, updated_at) VALUES ('orari', ${JSON.stringify(orari)}, now())
+      INSERT INTO app_state (key, value, updated_at) VALUES (${chiaveOrari(req.azienda)}, ${JSON.stringify(orari)}, now())
       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
     `;
-    orariCache = null;
+    orariCache.delete(req.azienda);
     // Le code ferme per orario ripartono (o aspettano la nuova apertura).
     await pumpAllQueues();
     await aggiornaSveglia();
@@ -4961,6 +5260,8 @@ function ensureEsitiVoicebot(): Promise<void> {
       `;
       await sql!`CREATE INDEX IF NOT EXISTS idx_voicebot_esiti_call ON voicebot_esiti (live_call_id)`;
       await sql!`CREATE INDEX IF NOT EXISTS idx_voicebot_esiti_numero ON voicebot_esiti (numero, ricevuto_at DESC)`;
+      // "azienda" qui è già il campo raccolto da Wilma (l'azienda del cliente): il cliente di GEM è "cliente".
+      await sql!`ALTER TABLE voicebot_esiti ADD COLUMN IF NOT EXISTS cliente TEXT NOT NULL DEFAULT 'gem'`;
     })().catch(err => { esitiVoicebotReady = null; throw err; });
   }
   return esitiVoicebotReady;
@@ -4990,27 +5291,31 @@ app.post("/api/voicebot/esito", express.urlencoded({ extended: false, limit: "50
     if (doppio.length) return res.json({ ok: true, doppione: true });
     // La chiamata del sito a cui appartiene: l'ultima inviata a quel numero nelle ultime ore.
     const chiamata = numero ? ((await sql`
-      SELECT l.id, l.campaign_id, l.nome, c.tipo_campagna, c.username, c.voicebot_nome
+      SELECT l.id, l.campaign_id, l.nome, c.tipo_campagna, c.username, c.voicebot_nome, c.azienda
       FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
       WHERE l.numero = ${numero} AND l.inviata_at > now() - interval '6 hours'
       ORDER BY l.inviata_at DESC LIMIT 1
     `) as any[])[0] : null;
+    // Di quale cliente: della campagna, altrimenti del voicebot con quell'interno.
+    const exten = cleanText(b.voicebot_exten, 20) || null;
+    const cliente = chiamata ? aziendaDi(chiamata)
+      : aziendaDi((await readVoicebots()).find((x: any) => exten && String(x.exten) === exten));
     const r = (await sql`
-      INSERT INTO voicebot_esiti (esito, nome, azienda, ruolo, numero, fascia, esigenza, email, note, riepilogo, voicebot_exten, campaign_id, live_call_id)
+      INSERT INTO voicebot_esiti (esito, nome, azienda, ruolo, numero, fascia, esigenza, email, note, riepilogo, voicebot_exten, campaign_id, live_call_id, cliente)
       VALUES (${esito}, ${testo("nome", 200)}, ${testo("azienda", 200)}, ${testo("ruolo", 200)}, ${numero}, ${testo("fascia", 200)},
               ${testo("esigenza", 300)}, ${(testo("email", 200) || "").toLowerCase() || null}, ${testo("note", 1000)}, ${testo("riepilogo", 2000)},
-              ${cleanText(b.voicebot_exten, 20) || null}, ${chiamata?.campaign_id ?? null}, ${chiamata?.id ?? null})
+              ${exten}, ${chiamata?.campaign_id ?? null}, ${chiamata?.id ?? null}, ${cliente})
       RETURNING id
     `) as any[];
     const nomeContatto = testo("nome", 200) || chiamata?.nome || null;
     if (esito === "NON_CHIAMARE" && numero) {
-      await aggiungiNonChiamare([{ numero, nome: nomeContatto }], "Chiesto durante la chiamata con il voicebot", "wilma", null);
+      await aggiungiNonChiamare([{ numero, nome: nomeContatto }], "Chiesto durante la chiamata con il voicebot", "wilma", null, cliente);
     }
     // Campagne standard: follow-up assegnato a chi l'ha lanciata, ed email subito se è interessato.
     const comm = ESITO_VOICEBOT_COMMERCIALE[esito];
     if (chiamata && chiamata.tipo_campagna !== "appuntamenti" && (comm === "interessato" || comm === "richiamare")) {
       const motivo = comm === "interessato" ? "Cliente interessato" : "Da richiamare (chiesto dal cliente)";
-      const nuovo = await createFollowup({ callId: `lead-${r[0].id}`, numero, nome: nomeContatto, motivo, assegnatoA: chiamata.username || null });
+      const nuovo = await createFollowup({ callId: `lead-${r[0].id}`, numero, nome: nomeContatto, motivo, assegnatoA: chiamata.username || null, azienda: cliente });
       if (nuovo) {
         const dettagli = [testo("azienda", 200), testo("ruolo", 200), testo("fascia", 200) && `Quando: ${testo("fascia", 200)}`, testo("esigenza", 300) && `Interesse: ${testo("esigenza", 300)}`, testo("email", 200) && `Email: ${(testo("email", 200) || "").toLowerCase()}`].filter(Boolean) as string[];
         await ensureFollowupsExtra();
@@ -5119,6 +5424,7 @@ function ensureScheduleSchema(): Promise<void> {
       await sql!`CREATE INDEX IF NOT EXISTS idx_scheduled_campaigns_due ON scheduled_campaigns (status, scheduled_at)`;
       await sql!`ALTER TABLE scheduled_campaigns ADD COLUMN IF NOT EXISTS retry_max INT NOT NULL DEFAULT 0`;
       await sql!`ALTER TABLE scheduled_campaigns ADD COLUMN IF NOT EXISTS retry_intervallo_min INT NOT NULL DEFAULT 120`;
+      await sql!`ALTER TABLE scheduled_campaigns ADD COLUMN IF NOT EXISTS azienda TEXT NOT NULL DEFAULT 'gem'`;
     })().catch(err => {
       scheduleSchemaReady = null;
       throw err;
@@ -5168,9 +5474,12 @@ async function dispatchDueCampaigns(): Promise<void> {
 
     for (const row of due) {
       try {
-        const bots = await readVoicebots();
+        const azienda = aziendaDi(row);
+        const bots = (await readVoicebots()).filter((b: any) => aziendaDi(b) === azienda);
         const bot = row.voicebot_id ? bots.find((b: any) => b.id === row.voicebot_id) : null;
+        if (!bot && azienda !== AZIENDA_PRINCIPALE) throw new Error("Voicebot non più disponibile");
         const result = await sendCampaignToMake({
+          azienda,
           contacts: row.contacts,
           campaignType: row.tipo_campagna === "appuntamenti" ? "appuntamenti" : "standard",
           bot,
@@ -5201,6 +5510,7 @@ async function dispatchDueCampaigns(): Promise<void> {
           failedCount: result.failedContacts.length,
           scheduledId: row.id,
           dryRun: result.dryRun,
+          azienda,
         });
         if (result.sentContacts.length > 0) {
           await sendCampaignEmail({
@@ -5235,7 +5545,8 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
   if ("error" in parsed) return res.status(400).json({ ok: false, error: parsed.error });
   const contacts = parsed.contacts;
 
-  const user = await findSessionUser(req.session.username);
+  const user = req.utente;
+  const azienda = req.azienda as string;
   if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
   if (user.role === "Viewer") return res.status(403).json({ ok: false, error: "Non autorizzato" });
   const limite = permessiUtente(user).limiteNumeri;
@@ -5245,9 +5556,11 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
 
   // Voicebot: estensione e contesto vengono dalla configurazione salvata,
   // non dal browser, così non si possono indirizzare chiamate altrove.
-  const bots = await readVoicebots();
+  const bots = (await readVoicebots()).filter((b: any) => aziendaDi(b) === azienda);
   const bot = voicebot_id ? bots.find((b: any) => b.id === voicebot_id && b.attivo !== false) : null;
   if (voicebot_id && !bot) return res.status(400).json({ ok: false, error: "Voicebot non trovato o disattivato" });
+  // Il voicebot predefinito è quello di GEM: le altre aziende scelgono sempre il loro.
+  if (!bot && azienda !== AZIENDA_PRINCIPALE) return res.status(400).json({ ok: false, error: "Scegli il voicebot da usare" });
 
   const chunkSize = Math.min(Math.max(parseInt(concurrency) || 1, 1), 10);
   const cleanNote = cleanText(note, 1000);
@@ -5267,17 +5580,17 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
       await ensureScheduleSchema();
       const rows = (await sql`
         INSERT INTO scheduled_campaigns
-          (created_by, operatore, user_email, scheduled_at, tipo_campagna, voicebot_id, chunk_size, note, contacts, retry_max, retry_intervallo_min)
+          (created_by, operatore, user_email, scheduled_at, tipo_campagna, voicebot_id, chunk_size, note, contacts, retry_max, retry_intervallo_min, azienda)
         VALUES
           (${user.username}, ${user.nome || user.username}, ${user.email || null}, ${t.toISOString()},
            ${campaignType}, ${bot?.id || null}, ${chunkSize}, ${cleanNote || null}, ${JSON.stringify(contacts)}::jsonb,
-           ${retryMax}, ${retryIntervalloMin})
+           ${retryMax}, ${retryIntervalloMin}, ${azienda})
         RETURNING id
       `) as any[];
       await recordHistory({
         username: user.username, operatore: user.nome || user.username, count: contacts.length,
         scheduledAt: t.toISOString(), chunkSize, note: cleanNote, tipoCampagna: campaignType,
-        voicebotNome: bot?.nome, contatti: contacts, test: isCallsDryRun(),
+        voicebotNome: bot?.nome, contatti: contacts, test: isCallsDryRun(), azienda,
       });
       // Programma la sveglia Make per l'orario della campagna (se è la prima).
       await aggiornaSveglia();
@@ -5292,8 +5605,8 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
         tipoCampagna: campaignType,
       });
       // Avvisi per l'operatore: numeri oggi in "Non chiamare" e orario fuori fascia.
-      const esclusi = (await numeriNonChiamare(contacts.map(c => c.numero))).size;
-      const orari = await leggiOrari();
+      const esclusi = (await numeriNonChiamare(contacts.map(c => c.numero), azienda)).size;
+      const orari = await leggiOrari(azienda);
       return res.json({
         ok: true,
         scheduled: true,
@@ -5316,14 +5629,14 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
   // ── Immediata ──
   // Fuori dagli orari consentiti la campagna si crea lo stesso, ma le chiamate
   // aspettano l'apertura. Con il vecchio invio (tutto a Make) non si può: si blocca.
-  const orari = await leggiOrari();
+  const orari = await leggiOrari(azienda);
   const adesso = new Date();
   if (!dentroOrari(orari, adesso) && !isCodaSito()) {
     return res.status(400).json({ ok: false, error: `Fuori dagli orari consentiti (${descriviOrari(orari)}). Pianifica la campagna per un orario consentito.` });
   }
   const result = await sendCampaignToMake({
     contacts, campaignType, bot, chunkSize, note: cleanNote, operatore: user.nome, scheduledAt: null,
-    username: user.username, retryMax, retryIntervalloMin,
+    username: user.username, retryMax, retryIntervalloMin, azienda,
   });
   // Sveglia per l'email di fine campagna, se nessuno avrà l'app aperta.
   if (!result.dryRun) await aggiornaSveglia();
@@ -5337,13 +5650,14 @@ app.post("/api/campaigns/launch", requireAuth, async (req: any, res) => {
     sentCount: result.sentContacts.length,
     failedCount: result.failedContacts.length,
     dryRun: result.dryRun,
+    azienda,
   });
 
   if (result.sentContacts.length > 0) {
     await recordHistory({
       username: user.username, operatore: user.nome || user.username, count: result.sentContacts.length,
       scheduledAt: null, chunkSize, note: cleanNote, tipoCampagna: campaignType,
-      voicebotNome: bot?.nome, contatti: result.sentContacts, test: result.dryRun,
+      voicebotNome: bot?.nome, contatti: result.sentContacts, test: result.dryRun, azienda,
     });
     await sendCampaignEmail({
       operatore: user.nome,
@@ -5387,11 +5701,11 @@ app.get("/api/campaigns/scheduled", requireAuth, async (req: any, res) => {
     const rows = (isAdmin
       ? await sql`
           SELECT * FROM scheduled_campaigns
-          WHERE status = 'pending' OR scheduled_at > now() - interval '14 days'
+          WHERE azienda = ${req.azienda} AND (status = 'pending' OR scheduled_at > now() - interval '14 days')
           ORDER BY scheduled_at DESC LIMIT 100`
       : await sql`
           SELECT * FROM scheduled_campaigns
-          WHERE lower(created_by) = lower(${req.session.username})
+          WHERE lower(created_by) = lower(${req.session.username}) AND azienda = ${req.azienda}
             AND (status = 'pending' OR scheduled_at > now() - interval '14 days')
           ORDER BY scheduled_at DESC LIMIT 100`) as any[];
     res.json({ ok: true, campaigns: rows.map(mapScheduledRow), serverTime: new Date().toISOString() });
@@ -5410,7 +5724,7 @@ app.post("/api/campaigns/scheduled/:id/cancel", requireAuth, async (req: any, re
     const isAdmin = req.session.isAdmin === true;
     const rows = (await sql`
       UPDATE scheduled_campaigns SET status = 'cancelled'
-      WHERE id = ${id} AND status = 'pending'
+      WHERE id = ${id} AND status = 'pending' AND azienda = ${req.azienda}
         AND (${isAdmin}::boolean OR lower(created_by) = lower(${req.session.username}))
       RETURNING id
     `) as any[];
@@ -5427,15 +5741,23 @@ app.post("/api/campaigns/scheduled/:id/cancel", requireAuth, async (req: any, re
 app.post("/api/campaigns/test-call", requireAuth, async (req: any, res) => {
   const parsed = parseLaunchContacts([req.body?.contact], false);
   if ("error" in parsed) return res.status(400).json({ ok: false, error: parsed.error });
-  const user = await findSessionUser(req.session.username);
+  const user = req.utente;
   if (!user) return res.status(401).json({ ok: false, error: "Utente non trovato" });
+  if (user.role === "Viewer") return res.status(403).json({ ok: false, error: "Non autorizzato" });
 
   const dryRun = isCallsDryRun();
   if (dryRun) {
     console.log(`[DRY-RUN] Chiamata test simulata verso ${parsed.contacts[0].numero}, utente ${user.username}`);
     return res.json({ ok: true, dryRun });
   }
-  const ok = await postToMake(MAKE_WEBHOOK_URL_DEFAULT, {
+  const bot = req.body?.voicebot_id
+    ? (await readVoicebots()).find((x: any) => x.id === req.body.voicebot_id && aziendaDi(x) === req.azienda && x.attivo !== false)
+    : null;
+  if (req.body?.voicebot_id && !bot) return res.status(400).json({ ok: false, error: "Voicebot non trovato o disattivato" });
+  if (!bot && req.azienda !== AZIENDA_PRINCIPALE) return res.status(400).json({ ok: false, error: "Scegli il voicebot da usare" });
+  const az = (await leggiAziende()).find(a => a.id === req.azienda);
+  const ok = await postToMake(webhookMakeValido(az?.webhookChiamate) || MAKE_WEBHOOK_URL_DEFAULT, {
+    ...(bot ? { voicebot_nome: bot.nome, voicebot_exten: bot.exten, voicebot_context: bot.context } : {}),
     contatti: parsed.contacts,
     totale: 1,
     avviatoIl: new Date().toISOString(),
