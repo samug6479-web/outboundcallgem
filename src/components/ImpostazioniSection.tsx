@@ -3,6 +3,7 @@ import { Clock, Plus, Trash2, Loader2, CheckCircle2, AlertTriangle, Info } from 
 import { authFetch } from '../lib/authFetch';
 import { cn } from '../lib/utils';
 import { useCampaign } from '../context/CampaignContext';
+import { PrivacySection } from './PrivacySection';
 import { GIORNI, OrariConsentiti, descriviOrari, dentroOrari, prossimaApertura, quandoBreve } from '../lib/orari';
 
 const PREDEFINITI: OrariConsentiti = { attivo: false, giorni: [1, 2, 3, 4, 5], fasce: [{ da: '09:00', a: '13:00' }, { da: '14:30', a: '18:30' }] };
@@ -150,6 +151,8 @@ export function ImpostazioniSection() {
           {!appConfig.codaSito && <p className="text-amber-700 dark:text-amber-400">In questo ambiente le chiamate sono simulate: gli orari valgono solo per gli avvisi.</p>}
         </div>
       </div>
+
+      <PrivacySection />
     </div>
   );
 }

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useCampaign } from '../context/CampaignContext';
 import { GemLogo } from './Icons';
-import { Gauge, LogOut, Sun, Moon, Plus, List, Clock, User, Headset, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen, Radio, Bot, Ban, Settings, Building2 } from 'lucide-react';
+import { Gauge, LogOut, Sun, Moon, Plus, List, Clock, User, Headset, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen, Radio, Bot, Ban, Settings, Building2, ScrollText } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { authFetch, aziendaVista } from '../lib/authFetch';
 import { AziendeSection, SceltaAzienda, apriAzienda } from './AziendeSection';
@@ -24,8 +24,9 @@ import { NotificheAvviso } from './NotificheAvviso';
 import { GiornataSection } from './GiornataSection';
 import { ConsumiSection } from './ConsumiSection';
 import { SaluteAvviso } from './SaluteAvviso';
+import { RegistroSection } from './RegistroSection';
 
-type Tab = 'home' | 'aziende' | 'consumi' | 'live' | 'campaign' | 'appointments' | 'lists' | 'dnc' | 'history' | 'callresults' | 'followups' | 'profile' | 'support' | 'stats' | 'users' | 'voicebots' | 'settings';
+type Tab = 'home' | 'aziende' | 'registro' | 'consumi' | 'live' | 'campaign' | 'appointments' | 'lists' | 'dnc' | 'history' | 'callresults' | 'followups' | 'profile' | 'support' | 'stats' | 'users' | 'voicebots' | 'settings';
 
 interface NavItem {
   id: Tab;
@@ -85,6 +86,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: 'users' as Tab, label: 'Gestione Utenti', icon: Users, adminOnly: true },
       { id: 'voicebots' as Tab, label: 'Voicebot', icon: Bot, adminOnly: true },
       { id: 'settings' as Tab, label: 'Impostazioni', icon: Settings, adminOnly: true },
+      { id: 'registro' as Tab, label: 'Registro attività', icon: ScrollText, adminOnly: true },
       { id: 'aziende' as Tab, label: 'Aziende', icon: Building2, adminOnly: true, superAdminOnly: true },
     ]
   },
@@ -95,7 +97,8 @@ const TAB_META: Record<Tab, { title: string; subtitle: string }> = {
   appointments: { title: 'Conferma Appuntamenti', subtitle: 'Visualizza, importa e gestisci gli appuntamenti programmati per le campagne di richiamata.' },
   lists: { title: 'Liste Salvate', subtitle: 'Salva, gestisci o riutilizza le tue liste contatti precedentemente caricate.' },
   dnc: { title: 'Non chiamare', subtitle: 'Numeri che nessuna campagna chiama mai: chi lo ha chiesto, clienti attivi, numeri sbagliati.' },
-  settings: { title: 'Impostazioni', subtitle: 'Orari in cui le campagne possono chiamare.' },
+  settings: { title: 'Impostazioni', subtitle: 'Orari in cui le campagne possono chiamare e privacy dei dati.' },
+  registro: { title: 'Registro attività', subtitle: 'Chi ha fatto cosa: campagne, utenti, voicebot, Non chiamare, follow-up e impostazioni.' },
   history: { title: 'Storico Campagne', subtitle: 'Le campagne lanciate da tutti gli operatori, con i report da scaricare.' },
   aziende: { title: 'Aziende', subtitle: 'I clienti che usano GEM Outbound, ognuno con i suoi utenti, voicebot e dati.' },
   consumi: { title: 'Consumi', subtitle: 'Chiamate e minuti del mese, per campagna, voicebot e operatore: la base per la fatturazione.' },
@@ -392,7 +395,7 @@ export function Dashboard() {
             <div className="grid grid-cols-3 gap-1">
               {/* Guida utente in PDF (file in public/) */}
               <a
-                href="/guida-gem-outbound.pdf?v=2026-10-24b"
+                href="/guida-gem-outbound.pdf?v=2026-10-24c"
                 download="GEM-Outbound-Guida-utente.pdf"
                 title="Scarica la guida utente (PDF)"
                 className="flex flex-col items-center justify-center gap-1 py-2 text-[11px] font-semibold text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
@@ -583,6 +586,7 @@ export function Dashboard() {
 
           {activeTab === 'consumi' && isAdmin && <ConsumiSection />}
           {activeTab === 'aziende' && user?.superAdmin && <AziendeSection />}
+          {activeTab === 'registro' && isAdmin && <RegistroSection />}
 
           {activeTab === 'live' && (
             <LiveSection />
