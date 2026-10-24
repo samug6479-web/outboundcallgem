@@ -1300,6 +1300,53 @@ app.get("/api/consumi", requireAuth, requireAdmin, async (req: any, res) => {
   }
 });
 
+// ── Tracce voicebot Wildix (solo lettura) ─────────────────────────────
+// Stato, uso e costo reale di ogni sessione del voicebot, letti dalle API
+// Wildix. Solo per GEM: le aziende con un loro centralino non passano da qui.
+const WILDIX_API_URL = (process.env.WILDIX_API_URL || "https://gem.wildixin.com").replace(/\/$/, "");
+
+async function wildixGet(path: string): Promise<any> {
+  const token = process.env.WILDIX_API_TOKEN;
+  if (!token) throw Object.assign(new Error("WILDIX_API_TOKEN non configurato"), { status: 503 });
+  const r = await fetch(`${WILDIX_API_URL}${path}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) throw Object.assign(new Error(`Wildix ha risposto ${r.status}`), { status: r.status === 404 ? 404 : 502 });
+  return r.json();
+}
+
+app.get("/api/wildix/tracce", requireAuth, requireAdmin, async (req: any, res) => {
+  if (req.azienda !== AZIENDA_PRINCIPALE) return res.status(403).json({ ok: false, error: "Non disponibile" });
+  try {
+    const search = typeof req.query.search === "string" ? req.query.search.slice(0, 100) : "";
+    const data = await wildixGet(`/v2/voicebots/traces${search ? `?search=${encodeURIComponent(search)}` : ""}`);
+    const lista: any[] = Array.isArray(data) ? data : data?.traces || data?.items || [];
+    res.json({
+      ok: true,
+      tracce: lista.slice(0, 200).map(t => ({
+        sessionId: t.sessionId, botName: t.botName, callerName: t.callerName, callerNumber: t.callerNumber,
+        language: t.language, status: t.status, createdAt: t.createdAt || t.startedAt || null,
+      })),
+    });
+  } catch (err: any) {
+    console.error("Errore /api/wildix/tracce:", err.message);
+    res.status(err.status || 500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/wildix/tracce/:sessionId", requireAuth, requireAdmin, async (req: any, res) => {
+  if (req.azienda !== AZIENDA_PRINCIPALE) return res.status(403).json({ ok: false, error: "Non disponibile" });
+  try {
+    const data = await wildixGet(`/v2/voicebots/traces/${encodeURIComponent(req.params.sessionId)}`);
+    const t = data?.trace || data;
+    res.json({ ok: true, usage: t?.usage ?? null, cost: t?.cost ?? null, activities: (t?.activities || []).slice(0, 200) });
+  } catch (err: any) {
+    console.error("Errore /api/wildix/tracce/:id:", err.message);
+    res.status(err.status || 500).json({ ok: false, error: err.message });
+  }
+});
+
 // Nomi degli utenti (per assegnare i follow-up). Niente dati riservati.
 app.get("/api/utenti/nomi", requireAuth, async (req: any, res) => {
   const users = await utentiDellAzienda(req.azienda);
