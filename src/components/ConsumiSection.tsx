@@ -61,7 +61,8 @@ export function ConsumiSection() {
   useEffect(() => {
     setLoading(true);
     authFetch(`/api/consumi${mese ? `?mese=${mese}` : ''}`).then(r => r.json())
-      .then(x => { if (x?.ok) { setD(x); setErrore(''); } else setErrore(x?.error || 'Errore'); })
+      // Senza database il server risponde ok ma senza totali.
+      .then(x => { if (x?.ok && x.totale) { setD(x); setErrore(''); } else setErrore(x?.error || 'Dati non disponibili'); })
       .catch(() => setErrore('Errore di rete'))
       .finally(() => setLoading(false));
   }, [mese]);

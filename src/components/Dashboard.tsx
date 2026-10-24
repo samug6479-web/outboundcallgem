@@ -33,64 +33,48 @@ interface NavItem {
   label: string;
   icon: React.ElementType;
   adminOnly?: boolean;
-  superAdminOnly?: boolean;
   viewerHidden?: boolean;
   badge?: 'followups' | 'live';
+  // Pagine raccolte sotto questa voce: si scelgono con le schede in alto.
+  tabs?: Tab[];
 }
 
 interface NavGroup {
-  label: string;
   items: NavItem[];
-  adminOnly?: boolean;
-  viewerOnly?: boolean;
 }
 
-// Menu diviso per scopo: preparare e lanciare, seguire i risultati,
-// amministrare. Profilo e Assistenza stanno nella scheda utente in fondo.
+// Menu corto: le pagine dello stesso tipo stanno sotto una sola voce e si
+// scelgono con le schede in alto. Profilo e Assistenza stanno nella scheda
+// utente in fondo.
 const NAV_GROUPS: NavGroup[] = [
   {
-    label: '',
     items: [
       { id: 'home' as Tab, label: 'La mia giornata', icon: Sun },
-    ]
-  },
-  {
-    label: 'Campagne',
-    items: [
       { id: 'campaign' as Tab, label: 'Nuova Campagna', icon: Plus, viewerHidden: true },
       { id: 'appointments' as Tab, label: 'Conferma Appuntamenti', icon: CalendarCheck, viewerHidden: true },
-      { id: 'history' as Tab, label: 'Storico Campagne', icon: Clock },
     ]
   },
   {
-    label: 'Risultati',
     items: [
       { id: 'live' as Tab, label: 'In diretta', icon: Radio, badge: 'live' },
-      { id: 'callresults' as Tab, label: 'Esiti Chiamate', icon: Phone },
       { id: 'followups' as Tab, label: 'Follow-up', icon: BellRing, badge: 'followups' },
-      { id: 'stats' as Tab, label: 'Statistiche', icon: BarChart2 },
+      { id: 'callresults' as Tab, label: 'Risultati', icon: BarChart2, tabs: ['callresults', 'stats', 'history'] },
+      { id: 'lists' as Tab, label: 'Contatti', icon: List, viewerHidden: true, tabs: ['lists', 'dnc'] },
     ]
   },
   {
-    label: 'Contatti',
     items: [
-      { id: 'lists' as Tab, label: 'Liste Salvate', icon: List, viewerHidden: true },
-      { id: 'dnc' as Tab, label: 'Non chiamare', icon: Ban, viewerHidden: true },
-    ]
-  },
-  {
-    label: 'Amministrazione',
-    adminOnly: true,
-    items: [
-      { id: 'consumi' as Tab, label: 'Consumi', icon: Gauge, adminOnly: true },
-      { id: 'users' as Tab, label: 'Gestione Utenti', icon: Users, adminOnly: true },
-      { id: 'voicebots' as Tab, label: 'Voicebot', icon: Bot, adminOnly: true },
-      { id: 'settings' as Tab, label: 'Impostazioni', icon: Settings, adminOnly: true },
-      { id: 'registro' as Tab, label: 'Registro attività', icon: ScrollText, adminOnly: true },
-      { id: 'aziende' as Tab, label: 'Aziende', icon: Building2, adminOnly: true, superAdminOnly: true },
+      { id: 'consumi' as Tab, label: 'Amministrazione', icon: Settings, adminOnly: true, tabs: ['consumi', 'users', 'voicebots', 'settings', 'registro', 'aziende'] },
     ]
   },
 ];
+
+// Nome breve delle pagine nelle schede in alto.
+const TAB_LABEL: Partial<Record<Tab, string>> = {
+  callresults: 'Esiti chiamate', stats: 'Statistiche', history: 'Storico campagne',
+  lists: 'Liste salvate', dnc: 'Non chiamare',
+  consumi: 'Consumi', users: 'Utenti', voicebots: 'Voicebot', settings: 'Impostazioni', registro: 'Registro attività', aziende: 'Aziende',
+};
 
 const TAB_META: Record<Tab, { title: string; subtitle: string }> = {
   campaign: { title: 'Nuova Campagna', subtitle: 'Carica la lista contatti, definisci le tempistiche e avvia le chiamate sul centralino Wildix.' },
@@ -237,6 +221,10 @@ export function Dashboard() {
     // login, dove al prossimo accesso comparirà il QR per il setup.
   };
 
+  // Schede della voce di menu che contiene la pagina aperta (es. Risultati).
+  const schedeSezione = (NAV_GROUPS.flatMap(g => g.items).find(i => i.tabs?.includes(activeTab))?.tabs || [])
+    .filter(t => !(t === 'aziende' && !user?.superAdmin) && !(isViewer && viewerHiddenTabs.includes(t)));
+
   const handleNav = (tab: Tab) => {
     if (new URLSearchParams(window.location.search).get('tab') !== tab) window.history.pushState(null, '', urlPer(tab));
     setActiveTab(tab);
@@ -330,28 +318,24 @@ export function Dashboard() {
           )}
 
           {/* Nav groups */}
-          <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-6">
-            {NAV_GROUPS.map(group => {
-              if (group.adminOnly && !isAdmin) return null;
-              if (group.viewerOnly && !isViewer) return null;
+          <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-4">
+            {NAV_GROUPS.map((group, gi) => {
               const visibleItems = group.items.filter(item => {
                 if (item.adminOnly && !isAdmin) return false;
-                if (item.superAdminOnly && !user?.superAdmin) return false;
                 if (item.viewerHidden && isViewer) return false;
                 return true;
               });
               if (!visibleItems.length) return null;
               return (
-                <div key={group.label}>
-                  {group.label && <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2">{group.label}</div>}
+                <div key={gi} className={cn(gi > 0 && 'pt-4 border-t border-slate-100 dark:border-slate-800')}>
                   <div className="space-y-0.5">
                     {visibleItems.map(item => {
                       const Icon = item.icon;
-                      const active = activeTab === item.id;
+                      const active = activeTab === item.id || !!item.tabs?.includes(activeTab);
                       return (
                         <button
                           key={item.id}
-                          onClick={() => handleNav(item.id)}
+                          onClick={() => handleNav(active && item.tabs ? activeTab : item.id)}
                           className={cn(
                             "w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all text-left",
                             active
@@ -550,6 +534,27 @@ export function Dashboard() {
                   <X className="w-4 h-4" />
                 </button>
               </div>
+            </div>
+          )}
+
+          {schedeSezione.length > 1 && (
+            <div role="tablist" className="mb-6 flex gap-1 overflow-x-auto border-b border-slate-200 dark:border-slate-800">
+              {schedeSezione.map(t => (
+                <button
+                  key={t}
+                  role="tab"
+                  aria-selected={activeTab === t}
+                  onClick={() => handleNav(t)}
+                  className={cn(
+                    "px-3 py-2 -mb-px text-sm font-semibold whitespace-nowrap border-b-2 transition-colors",
+                    activeTab === t
+                      ? "border-brand-600 text-brand-700 dark:text-brand-300"
+                      : "border-transparent text-slate-500 hover:text-slate-900 dark:hover:text-white"
+                  )}
+                >
+                  {TAB_LABEL[t]}
+                </button>
+              ))}
             </div>
           )}
 
