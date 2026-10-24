@@ -1085,6 +1085,78 @@ app.get("/api/giornata", requireAuth, async (req: any, res) => {
   }
 });
 
+// ── Consumi (per la fatturazione), solo Admin ──
+// Per un mese: chiamate partite, risposte e minuti di conversazione delle campagne
+// del sito, per campagna, voicebot, operatore e giorno. "Minuti fatturabili" =
+// ogni chiamata con conversazione arrotondata al minuto superiore.
+app.get("/api/consumi", requireAuth, requireAdmin, async (req: any, res) => {
+  if (!sql) return res.json({ ok: true, mesi: [], campagne: [] });
+  const mese = /^\d{4}-\d{2}$/.test(String(req.query.mese || "")) ? String(req.query.mese)
+    : new Date().toLocaleDateString("sv-SE", { timeZone: "Europe/Rome" }).slice(0, 7);
+  try {
+    await ensureLiveSchema();
+    const da = ((await sql`SELECT (${mese + "-01"}::date::timestamp AT TIME ZONE 'Europe/Rome') AS t`) as any[])[0].t;
+    const a = ((await sql`SELECT ((${mese + "-01"}::date + interval '1 month')::timestamp AT TIME ZONE 'Europe/Rome') AS t`) as any[])[0].t;
+    const righe = (await sql`
+      SELECT c.id, c.created_at, c.operatore, c.tipo_campagna, COALESCE(c.voicebot_nome, 'Voicebot predefinito') AS voicebot,
+        to_char(l.updated_at AT TIME ZONE 'Europe/Rome', 'YYYY-MM-DD') AS giorno,
+        count(*) FILTER (WHERE l.stato IN ('risposta', 'interrotta', 'non_risposta', 'non_partita', 'errore'))::int AS partite,
+        count(*) FILTER (WHERE l.stato IN ('risposta', 'interrotta'))::int AS risposte,
+        COALESCE(sum(l.durata_ms) FILTER (WHERE l.stato IN ('risposta', 'interrotta') AND l.durata_ms > 0), 0)::bigint AS ms,
+        COALESCE(sum(ceil(l.durata_ms / 60000.0)) FILTER (WHERE l.stato IN ('risposta', 'interrotta') AND l.durata_ms > 0), 0)::int AS minuti_fatt
+      FROM live_calls l JOIN live_campaigns c ON c.id = l.campaign_id
+      WHERE l.updated_at >= ${da} AND l.updated_at < ${a}
+      GROUP BY c.id, giorno
+    `) as any[];
+    const somma = (rs: any[]) => rs.reduce((t, r) => ({
+      partite: t.partite + r.partite, risposte: t.risposte + r.risposte,
+      minuti: t.minuti + Number(r.ms) / 60000, minutiFatturabili: t.minutiFatturabili + r.minuti_fatt,
+    }), { partite: 0, risposte: 0, minuti: 0, minutiFatturabili: 0 });
+    const gruppo = (chiave: (r: any) => string) => {
+      const m = new Map<string, any[]>();
+      for (const r of righe) m.set(chiave(r), [...(m.get(chiave(r)) || []), r]);
+      return [...m.entries()].map(([k, rs]) => ({ chiave: k, ...somma(rs) }));
+    };
+    const campagne = (() => {
+      const m = new Map<number, any[]>();
+      for (const r of righe) m.set(r.id, [...(m.get(r.id) || []), r]);
+      return [...m.values()].map(rs => ({
+        id: rs[0].id, creata: rs[0].created_at, operatore: rs[0].operatore, voicebot: rs[0].voicebot,
+        tipo: rs[0].tipo_campagna, ...somma(rs),
+      })).sort((x, y) => new Date(y.creata).getTime() - new Date(x.creata).getTime());
+    })();
+    // Chiamate del voicebot fuori dalle campagne del sito (prove, appuntamenti lanciati altrove).
+    const altre = await (async () => {
+      try {
+        const r = ((await sql`
+          SELECT count(*)::int AS chiamate, count(*) FILTER (WHERE risposto)::int AS risposte,
+            COALESCE(sum(durata) FILTER (WHERE durata > 0), 0)::bigint AS ms
+          FROM call_results r
+          WHERE r.ts::timestamptz >= ${da} AND r.ts::timestamptz < ${a}
+            AND NOT EXISTS (SELECT 1 FROM live_calls l WHERE l.call_id IS NOT NULL AND l.call_id = r.call_id)
+        `) as any[])[0];
+        return { chiamate: r.chiamate, risposte: r.risposte, minuti: Number(r.ms) / 60000 };
+      } catch { return { chiamate: 0, risposte: 0, minuti: 0 }; }
+    })();
+    const mesi = ((await sql`
+      SELECT DISTINCT to_char(created_at AT TIME ZONE 'Europe/Rome', 'YYYY-MM') AS m FROM live_campaigns ORDER BY 1 DESC LIMIT 24
+    `) as any[]).map(r => r.m);
+    if (!mesi.includes(mese)) mesi.unshift(mese);
+    res.json({
+      ok: true, mese, mesi,
+      totale: somma(righe),
+      perVoicebot: gruppo(r => r.voicebot).sort((x, y) => y.minuti - x.minuti),
+      perOperatore: gruppo(r => r.operatore || "—").sort((x, y) => y.minuti - x.minuti),
+      perGiorno: gruppo(r => r.giorno).sort((x, y) => x.chiave.localeCompare(y.chiave)),
+      campagne,
+      altre,
+    });
+  } catch (err) {
+    console.error("Errore /api/consumi:", err);
+    res.status(500).json({ ok: false, error: "Errore caricamento consumi" });
+  }
+});
+
 // Nomi degli utenti (per assegnare i follow-up). Niente dati riservati.
 app.get("/api/utenti/nomi", requireAuth, async (_req, res) => {
   const users = await readUsers();
@@ -1959,7 +2031,7 @@ app.get("/api/users", requireAuth, requireAdmin, async (req, res) => {
   if (sql) {
     try {
       await ensureInviti();
-      for (const r of (await sql`SELECT DISTINCT lower(username) AS u FROM inviti WHERE usato_at IS NULL AND scade_at > now()`) as any[]) inviti.add(r.u);
+      for (const r of (await sql`SELECT DISTINCT lower(username) AS u FROM inviti WHERE usato_at IS NULL AND scade_at > now() AND tipo = 'invito'`) as any[]) inviti.add(r.u);
     } catch { /* niente */ }
     try {
       for (const r of (await sql`SELECT lower(username) AS u, max(ts) AS ts FROM access_logs WHERE action = 'login' GROUP BY 1`) as any[]) accessi.set(r.u, r.ts);
@@ -2055,7 +2127,8 @@ function ensureInviti(): Promise<void> {
         scade_at   TIMESTAMPTZ NOT NULL,
         usato_at   TIMESTAMPTZ
       )
-    `.then(() => undefined).catch(err => { invitiReady = null; throw err; });
+    `.then(() => sql!`ALTER TABLE inviti ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'invito'`)
+     .then(() => undefined).catch(err => { invitiReady = null; throw err; });
   }
   return invitiReady;
 }
@@ -2102,7 +2175,8 @@ async function inviaCredenziali(username: string, password: string, daUsername: 
 }
 
 // Crea un link nuovo (quelli vecchi non usati smettono di valere) e lo manda per email.
-async function creaEInviaInvito(username: string, daUsername: string): Promise<boolean> {
+// tipo "reset": l'utente ha chiesto "Password dimenticata" (link valido 1 ora, testo diverso).
+async function creaEInviaInvito(username: string, daUsername: string, tipo: "invito" | "reset" = "invito"): Promise<boolean> {
   if (!sql) return false;
   const users = await readUsers();
   const u = users.find((x: any) => x.username.toLowerCase() === username.toLowerCase());
@@ -2110,7 +2184,8 @@ async function creaEInviaInvito(username: string, daUsername: string): Promise<b
   await ensureInviti();
   await sql`UPDATE inviti SET usato_at = now() WHERE lower(username) = ${u.username.toLowerCase()} AND usato_at IS NULL`;
   const token = crypto.randomBytes(32).toString("base64url");
-  await sql`INSERT INTO inviti (token_hash, username, creato_da, scade_at) VALUES (${hashToken(token)}, ${u.username}, ${daUsername}, now() + make_interval(hours => ${INVITO_ORE}::int))`;
+  const ore = tipo === "reset" ? 1 : INVITO_ORE;
+  await sql`INSERT INTO inviti (token_hash, username, creato_da, scade_at, tipo) VALUES (${hashToken(token)}, ${u.username}, ${daUsername}, now() + make_interval(hours => ${ore}::int), ${tipo})`;
   if (!process.env.SMTP_USER) return false;
   const da = await findSessionUser(daUsername).catch(() => null);
   const daNome = da?.nome || daUsername;
@@ -2124,6 +2199,27 @@ async function creaEInviaInvito(username: string, daUsername: string): Promise<b
     secure: process.env.SMTP_SECURE === "true",
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
   });
+  if (tipo === "reset") {
+    await transporter.sendMail({
+      from: `"GEM Outbound" <${process.env.SMTP_USER}>`,
+      to: u.email,
+      subject: "Reimposta la tua password di GEM Outbound",
+      text: [`Ciao${nome ? ` ${nome}` : ""}, hai chiesto di reimpostare la password di GEM Outbound.`, "", `Nome utente: ${u.username}`, "", "Scegli la nuova password da qui (il link vale 1 ora):", link, "", "Se non sei stato tu, ignora questa email: la password resta quella di prima."].join("\n"),
+      html: `
+<div style="background:#eef1f6;padding:28px 12px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0;">
+  <tr><td style="padding:28px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+    <td><img src="${appUrl}/gem-logo-color.png" width="96" alt="GEM Group" style="display:block;width:96px;height:auto;"></td>
+    <td style="text-align:right;"><span style="display:inline-block;background:#fef3c7;color:#92400e;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;">&#9679; Password</span></td></tr></table></td></tr>
+  <tr><td style="padding:26px 40px 6px;font-size:24px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">Reimposta la password</td></tr>
+  <tr><td style="padding:0 40px 20px;font-size:15px;color:#475569;line-height:1.6;">Ciao${nome ? ` ${escapeHtml(nome)}` : ""}, hai chiesto di reimpostare la password per il nome utente <strong style="color:#0f172a;font-family:monospace;">${escapeHtml(u.username)}</strong>.</td></tr>
+  <tr><td style="padding:4px 40px 8px;"><a href="${link}" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:14px 20px;border-radius:9px;">Scegli la nuova password</a></td></tr>
+  <tr><td style="padding:4px 40px 30px;font-size:13px;color:#64748b;line-height:1.5;text-align:center;">Il link vale 1 ora e si può usare una volta sola. Se non sei stato tu, ignora questa email: la password resta quella di prima.</td></tr>
+  <tr><td style="padding:18px 40px;border-top:1px solid #eef1f6;font-size:12px;color:#94a3b8;line-height:1.6;">GEM Group &middot; Email automatica inviata da GEM Outbound.</td></tr>
+</table></div>`,
+    });
+    return true;
+  }
   await transporter.sendMail({
     from: `"GEM Outbound" <${process.env.SMTP_USER}>`,
     to: u.email,
@@ -2166,11 +2262,35 @@ app.post("/api/users/:username/invito", requireAuth, requireAdmin, async (req: a
   }
 });
 
+// Pubblico: "Password dimenticata". Si scrive email o nome utente; se l'account
+// esiste e ha l'email arriva un link (1 ora). La risposta è sempre la stessa,
+// così non si scopre quali account esistono.
+app.post("/api/password-dimenticata", async (req, res) => {
+  const chi = String(req.body?.chi || "").trim().toLowerCase().slice(0, 200);
+  const risposta = { ok: true, messaggio: "Se l'account esiste e ha un'email, ti abbiamo mandato un link per scegliere una nuova password. Vale 1 ora." };
+  if (!chi) return res.status(400).json({ ok: false, error: "Scrivi la tua email o il nome utente" });
+  const ipKey = `reset:ip:${clientIp(req)}`;
+  const chiKey = `reset:chi:${chi}`;
+  const [perIp, perChi] = await Promise.all([countAttempts(ipKey, 15), countAttempts(chiKey, 60)]);
+  if (perIp >= 5 || perChi >= 3) return res.status(429).json({ ok: false, error: TOO_MANY });
+  await Promise.all([recordAttempt(ipKey), recordAttempt(chiKey)]);
+  try {
+    const users = await readUsers();
+    const trovati = users.filter((u: any) => u.username.toLowerCase() === chi || (u.email && String(u.email).toLowerCase() === chi));
+    for (const u of trovati.slice(0, 3)) {
+      await creaEInviaInvito(u.username, u.username, "reset").catch(err => console.error("Errore email reset:", err));
+    }
+  } catch (err) {
+    console.error("Errore password dimenticata:", err);
+  }
+  res.json(risposta);
+});
+
 // Pubblico: dati dell'invito (per mostrare a chi è) e scelta della password.
 async function invitoValido(token: string): Promise<any | null> {
   if (!sql || !token || token.length > 100) return null;
   await ensureInviti();
-  const r = (await sql`SELECT username FROM inviti WHERE token_hash = ${hashToken(token)} AND usato_at IS NULL AND scade_at > now()`) as any[];
+  const r = (await sql`SELECT username, tipo FROM inviti WHERE token_hash = ${hashToken(token)} AND usato_at IS NULL AND scade_at > now()`) as any[];
   return r[0] || null;
 }
 app.get("/api/invito/:token", async (req, res) => {
@@ -2179,7 +2299,7 @@ app.get("/api/invito/:token", async (req, res) => {
     if (!inv) return res.status(404).json({ ok: false, error: "Link non valido o scaduto. Chiedi all'Admin di mandarne un altro." });
     const u = (await readUsers()).find((x: any) => x.username.toLowerCase() === inv.username.toLowerCase());
     if (!u) return res.status(404).json({ ok: false, error: "Utente non più presente" });
-    res.json({ ok: true, username: u.username, nome: u.nome });
+    res.json({ ok: true, username: u.username, nome: u.nome, tipo: inv.tipo || "invito" });
   } catch (err) {
     console.error("Errore lettura invito:", err);
     res.status(500).json({ ok: false, error: "Errore" });
@@ -2200,6 +2320,7 @@ app.post("/api/invito", async (req, res) => {
     if (i === -1) return res.status(404).json({ ok: false, error: "Utente non più presente" });
     users[i] = { ...users[i], password: await bcrypt.hash(password, 12) };
     await writeUsers(users);
+    await clearAttempts(`login:user:${String(users[i].username).toLowerCase()}`);
     res.json({ ok: true, username: users[i].username });
   } catch (err) {
     console.error("Errore conferma invito:", err);
@@ -4051,6 +4172,7 @@ async function handleTick(req: any, res: any) {
     const code = await pumpAllQueues();
     await controllaFineCampagne();
     await inviaPromemoriaFollowup();
+    await controlloSalute();
     // ?s=1 / ?s=2: quale dei due scenari sveglia sta chiamando.
     const n = parseInt(String(req.query?.s || ""), 10);
     const chiamante = n >= 1 && n <= MAKE_TIMER_SCENARI.length ? MAKE_TIMER_SCENARI[n - 1] : null;
@@ -4061,6 +4183,148 @@ async function handleTick(req: any, res: any) {
     res.status(500).json({ ok: false });
   }
 }
+// ══════════════════════════════════════════════════════════════
+// CONTROLLO DI SALUTE
+// Cerca i problemi che bloccano le campagne senza che nessuno se ne accorga
+// e li manda per email agli Admin (al massimo una volta ogni 6 ore per
+// problema). Parte dal timer, da uno scenario Make orario (/api/cron/salute)
+// e quando un Admin apre il sito.
+// ══════════════════════════════════════════════════════════════
+const SALUTE_RIPETI_ORE = 6;
+interface ProblemaSalute { chiave: string; titolo: string; dettaglio: string }
+
+async function trovaProblemi(): Promise<ProblemaSalute[]> {
+  if (!sql) return [];
+  const problemi: ProblemaSalute[] = [];
+  const prova = async (fn: () => Promise<void>) => { try { await fn(); } catch (err) { console.error("Controllo salute:", err); } };
+  await ensureAppState();
+  await prova(async () => {
+    if (!svegliaConfigurata()) return;
+    const st = (await sql!`SELECT value, updated_at FROM app_state WHERE key = 'sveglia_stato'`) as any[];
+    if (st[0]?.value === "errore") problemi.push({
+      chiave: "sveglia", titolo: "La sveglia Make non riesce a programmarsi",
+      dettaglio: "Le campagne in coda, le richiamate e le campagne pianificate potrebbero non partire da sole. Controlla in Make che gli scenari \"sveglia\" siano attivi e che il token API sia valido.",
+    });
+  });
+  await ensureLiveSchema();
+  await prova(async () => {
+    const orari = await leggiOrari();
+    if (!dentroOrari(orari, new Date())) return;
+    const ferme = (await sql!`
+      SELECT c.id, COALESCE(c.voicebot_nome, 'Campagna') AS nome, c.operatore, max(l.updated_at) AS ultimo
+      FROM live_campaigns c JOIN live_calls l ON l.campaign_id = c.id
+      WHERE c.modalita_coda AND NOT c.in_pausa AND c.fermata_at IS NULL
+        AND c.created_at > now() - make_interval(days => ${CODA_GIORNI_MAX}::int) AND c.created_at < now() - interval '20 minutes'
+      GROUP BY c.id
+      HAVING count(*) FILTER (WHERE l.stato = 'in_coda' AND l.inviata_at IS NULL AND (l.programmata_at IS NULL OR l.programmata_at <= now())) > 0
+         AND count(*) FILTER (WHERE l.stato = 'avviata' OR (l.stato = 'in_coda' AND l.inviata_at IS NOT NULL)) = 0
+         AND max(l.updated_at) < now() - interval '20 minutes'
+    `) as any[];
+    if (ferme.length) problemi.push({
+      chiave: "coda_ferma", titolo: ferme.length === 1 ? "Una campagna è ferma" : `${ferme.length} campagne sono ferme`,
+      dettaglio: `Hanno contatti da chiamare ma nessuna chiamata parte da oltre 20 minuti, dentro gli orari consentiti: ${ferme.map(f => `${f.nome}${f.operatore ? ` (${f.operatore})` : ""}`).join(", ")}. Di solito è la sveglia Make spenta: aprire In diretta la fa ripartire.`,
+    });
+  });
+  await prova(async () => {
+    const e = ((await sql!`
+      SELECT count(*) FILTER (WHERE stato = 'errore')::int AS errori, count(*)::int AS totale,
+        (array_agg(errore ORDER BY updated_at DESC) FILTER (WHERE stato = 'errore' AND errore IS NOT NULL))[1] AS ultimo
+      FROM live_calls WHERE updated_at > now() - interval '1 hour' AND inviata_at IS NOT NULL
+    `) as any[])[0];
+    if (e && e.errori >= 5 && e.errori >= e.totale * 0.3) problemi.push({
+      chiave: "errori_chiamate", titolo: `${e.errori} chiamate in errore nell'ultima ora`,
+      dettaglio: `Su ${e.totale} chiamate inviate, ${e.errori} non sono arrivate a Wildix.${e.ultimo ? ` Ultimo errore: ${String(e.ultimo).slice(0, 200)}.` : ""} Controlla lo scenario Make che avvia le chiamate.`,
+    });
+  });
+  await prova(async () => {
+    const n = ((await sql!`
+      SELECT count(*)::int AS n FROM live_calls
+      WHERE stato = 'avviata' AND updated_at < now() - make_interval(mins => ${CODA_DURATA_MAX_MIN + 5}::int)
+        AND updated_at > now() - interval '3 hours'
+    `) as any[])[0]?.n || 0;
+    if (n >= 3) problemi.push({
+      chiave: "esiti_wildix", titolo: `${n} chiamate senza esito da Wildix`,
+      dettaglio: "Le chiamate sono partite ma Wildix non ha mandato com'è finita. Controlla su Wildix che il webhook degli eventi di chiamata verso il sito sia attivo.",
+    });
+  });
+  await prova(async () => {
+    await ensureScheduleSchema();
+    const sc = (await sql!`
+      SELECT count(*)::int AS n FROM scheduled_campaigns
+      WHERE (status = 'expired' AND scheduled_at > now() - interval '24 hours') OR (status = 'failed' AND scheduled_at > now() - interval '24 hours')
+    `) as any[];
+    if (sc[0]?.n > 0) problemi.push({
+      chiave: "pianificate", titolo: sc[0].n === 1 ? "Una campagna pianificata non è partita" : `${sc[0].n} campagne pianificate non sono partite`,
+      dettaglio: "Nelle ultime 24 ore. Le trovi in Storico Campagne > pianificate, con il motivo. Rilanciale se servono.",
+    });
+  });
+  return problemi;
+}
+
+// Trova i problemi e avvisa gli Admin dei nuovi (o di quelli avvisati più di 6 ore fa).
+async function controlloSalute(): Promise<ProblemaSalute[]> {
+  const problemi = await trovaProblemi();
+  if (!sql) return problemi;
+  try {
+    const avvisi = (await sql`SELECT key, updated_at FROM app_state WHERE key LIKE 'avviso:%'`) as any[];
+    const ultimo = new Map(avvisi.map(a => [a.key.slice(7), new Date(a.updated_at).getTime()]));
+    // Problemi risolti: si dimenticano, così se tornano si avvisa di nuovo.
+    for (const k of ultimo.keys()) if (!problemi.some(p => p.chiave === k)) await sql`DELETE FROM app_state WHERE key = ${"avviso:" + k}`;
+    const daAvvisare = problemi.filter(p => !ultimo.has(p.chiave) || Date.now() - ultimo.get(p.chiave)! > SALUTE_RIPETI_ORE * 3600_000);
+    if (!daAvvisare.length || !process.env.SMTP_USER) return problemi;
+    const admin = (await readUsers()).filter((u: any) => ruoloDi(u) === "Admin" && u.email && EMAIL_VALIDA_RE.test(u.email)).map((u: any) => u.email);
+    const to = admin.length ? admin : process.env.NOTIFY_EMAIL ? [process.env.NOTIFY_EMAIL] : [];
+    if (!to.length) return problemi;
+    // Si segna prima di inviare: due controlli insieme non mandano due email.
+    for (const p of daAvvisare) {
+      await sql`INSERT INTO app_state (key, value, updated_at) VALUES (${"avviso:" + p.chiave}, ${p.titolo}, now())
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`;
+    }
+    const appUrl = (process.env.APP_URL || "https://outboundcallgem.vercel.app").replace(/\/$/, "");
+    const blocchi = problemi.map(p => `<tr><td style="padding:12px 0;border-bottom:1px solid #eef1f6;"><div style="font-size:15px;font-weight:700;color:#991b1b;">${escapeHtml(p.titolo)}</div><div style="font-size:14px;color:#475569;line-height:1.5;margin-top:4px;">${escapeHtml(p.dettaglio)}</div></td></tr>`).join("");
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || "smtp.gmail.com",
+      port: parseInt(process.env.SMTP_PORT || "587"),
+      secure: process.env.SMTP_SECURE === "true",
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+    await transporter.sendMail({
+      from: `"GEM Outbound" <${process.env.SMTP_USER}>`,
+      to: to.join(", "),
+      subject: `Attenzione: ${daAvvisare[0].titolo}${problemi.length > 1 ? ` (+${problemi.length - 1})` : ""}`,
+      text: ["GEM Outbound ha trovato questi problemi:", "", ...problemi.map(p => `- ${p.titolo}: ${p.dettaglio}`), "", `In diretta: ${appUrl}/?tab=live`].join("\n"),
+      html: `
+<div style="background:#eef1f6;padding:28px 12px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0;">
+  <tr><td style="padding:28px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+    <td><img src="${appUrl}/gem-logo-color.png" width="96" alt="GEM Group" style="display:block;width:96px;height:auto;"></td>
+    <td style="text-align:right;"><span style="display:inline-block;background:#fee2e2;color:#991b1b;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;">&#9679; Da controllare</span></td></tr></table></td></tr>
+  <tr><td style="padding:26px 40px 6px;font-size:24px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">Qualcosa non va nelle campagne</td></tr>
+  <tr><td style="padding:0 40px 8px;font-size:15px;color:#475569;line-height:1.6;">Il controllo automatico di GEM Outbound ha trovato:</td></tr>
+  <tr><td style="padding:0 40px 8px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">${blocchi}</table></td></tr>
+  <tr><td style="padding:16px 40px 30px;"><a href="${appUrl}/?tab=live" style="display:block;background:#1e3dc8;color:#ffffff;text-decoration:none;text-align:center;font-size:15px;font-weight:600;padding:14px 20px;border-radius:9px;">Apri In diretta</a></td></tr>
+  <tr><td style="padding:18px 40px;border-top:1px solid #eef1f6;font-size:12px;color:#94a3b8;line-height:1.6;">Email automatica agli Admin di GEM Outbound. Per lo stesso problema arriva al massimo ogni ${SALUTE_RIPETI_ORE} ore.</td></tr>
+</table></div>`,
+    });
+  } catch (err) {
+    console.error("Errore avviso salute:", err);
+  }
+  return problemi;
+}
+
+async function handleSalute(req: any, res: any) {
+  if (!tickAutorizzato(req)) return res.status(401).json({ ok: false });
+  const problemi = await controlloSalute();
+  res.json({ ok: true, problemi: problemi.map(p => p.chiave) });
+}
+app.post("/api/cron/salute", handleSalute);
+app.get("/api/cron/salute", handleSalute);
+
+// Per l'avviso rosso agli Admin dentro il sito.
+app.get("/api/salute", requireAuth, requireAdmin, async (_req, res) => {
+  res.json({ ok: true, problemi: await controlloSalute() });
+});
+
 app.post("/api/cron/tick", handleTick);
 app.get("/api/cron/tick", handleTick);
 

@@ -19,14 +19,17 @@ export function Login() {
 
   // Invito: ?invito=... nell'indirizzo (link dell'email). Si sceglie la password.
   const [invito, setInvito] = useState(() => new URLSearchParams(window.location.search).get('invito') || '');
-  const [invitato, setInvitato] = useState<{ nome: string; username: string } | null>(null);
+  const [invitato, setInvitato] = useState<{ nome: string; username: string; tipo?: string } | null>(null);
+  // Password dimenticata
+  const [dimenticata, setDimenticata] = useState(false);
+  const [chi, setChi] = useState('');
   const [pw2, setPw2] = useState('');
   const [fatto, setFatto] = useState('');
   useEffect(() => {
     if (!invito) return;
     setLoading(true);
     fetch(`/api/invito/${encodeURIComponent(invito)}`).then(r => r.json())
-      .then(d => { if (d?.ok) setInvitato({ nome: d.nome, username: d.username }); else setError(d?.error || 'Link non valido o scaduto.'); })
+      .then(d => { if (d?.ok) setInvitato({ nome: d.nome, username: d.username, tipo: d.tipo }); else setError(d?.error || 'Link non valido o scaduto.'); })
       .catch(() => setError('Errore di rete'))
       .finally(() => setLoading(false));
   }, [invito]);
@@ -34,6 +37,23 @@ export function Login() {
     window.history.replaceState(null, '', window.location.pathname);
     setInvito(''); setInvitato(null); setPassword(''); setPw2('');
   };
+  const chiediReset = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(''); setFatto('');
+    if (!chi.trim()) { setError('Scrivi la tua email o il nome utente.'); return; }
+    setLoading(true);
+    try {
+      const res = await fetch('/api/password-dimenticata', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chi: chi.trim() }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || !d.ok) throw new Error(d.error || 'Non riuscito');
+      setDimenticata(false);
+      setFatto(d.messaggio);
+    } catch (err: any) {
+      setError(err?.message || 'Errore di rete');
+    }
+    setLoading(false);
+  };
+
   const confermaInvito = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
@@ -114,7 +134,7 @@ export function Login() {
 
         <div className="text-center mb-8">
           <h1 className="text-2xl font-bold font-serif text-slate-900 dark:text-white mb-2 tracking-tight">Accesso Sistema</h1>
-          <p className="text-sm font-medium text-slate-500 uppercase tracking-widest">{invito ? 'Scegli la tua password' : isOtpStep ? 'Verifica in due passaggi' : 'Campagne Outbound'}</p>
+          <p className="text-sm font-medium text-slate-500 uppercase tracking-widest">{invito ? 'Scegli la tua password' : dimenticata ? 'Password dimenticata' : isOtpStep ? 'Verifica in due passaggi' : 'Campagne Outbound'}</p>
         </div>
 
         {fatto && !invito && (
@@ -127,7 +147,7 @@ export function Login() {
             {invitato ? (
               <>
                 <p className="text-sm text-slate-600 dark:text-slate-300 text-center">
-                  Ciao <strong>{invitato.nome}</strong>, il tuo nome utente è <strong className="font-mono">{invitato.username}</strong>. Scegli una password di almeno 8 caratteri.
+                  {invitato.tipo === 'reset' ? 'Scegli la nuova password per ' : 'Ciao '}<strong>{invitato.nome}</strong>{invitato.tipo === 'reset' ? '.' : ','} {invitato.tipo === 'reset' ? 'Nome utente:' : 'il tuo nome utente è'} <strong className="font-mono">{invitato.username}</strong>. Scegli una password di almeno 8 caratteri.
                 </p>
                 <div className="space-y-2">
                   <label htmlFor="inv-pw" className="block text-xs font-bold text-slate-500 uppercase tracking-wider">Nuova password</label>
@@ -150,6 +170,23 @@ export function Login() {
             <button type="button" onClick={() => { lasciaInvito(); setError(''); }}
               className="w-full flex items-center justify-center gap-2 text-sm font-bold text-slate-500 hover:text-slate-800 dark:hover:text-slate-200">
               <ArrowLeft className="w-4 h-4" /> Vai all'accesso
+            </button>
+          </form>
+        ) : dimenticata ? (
+          <form onSubmit={chiediReset} className="space-y-5 animate-in fade-in duration-300">
+            <p className="text-sm text-slate-600 dark:text-slate-300 text-center">Scrivi la tua email o il nome utente: ti mandiamo un link per scegliere una nuova password.</p>
+            <div className="space-y-2">
+              <label htmlFor="pd-chi" className="block text-xs font-bold text-slate-500 uppercase tracking-wider">Email o nome utente</label>
+              <input id="pd-chi" type="text" autoComplete="username" value={chi} onChange={e => setChi(e.target.value)} autoFocus
+                className="w-full px-4 py-3.5 bg-slate-50 dark:bg-slate-950/50 border border-slate-200 dark:border-slate-800 rounded-xl text-sm focus:outline-none focus:ring-1 focus:ring-slate-900 dark:focus:ring-slate-100 text-slate-900 dark:text-slate-100" />
+            </div>
+            <button type="submit" disabled={loading}
+              className={cn("w-full py-4 bg-slate-900 dark:bg-brand-500 text-white font-bold rounded-xl text-sm shadow-md flex items-center justify-center gap-2", loading && "opacity-70 pointer-events-none")}>
+              {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <KeyRound className="w-5 h-5" />} Mandami il link
+            </button>
+            <button type="button" onClick={() => { setDimenticata(false); setError(''); }}
+              className="w-full flex items-center justify-center gap-2 text-sm font-bold text-slate-500 hover:text-slate-800 dark:hover:text-slate-200">
+              <ArrowLeft className="w-4 h-4" /> Torna all'accesso
             </button>
           </form>
         ) : isOtpStep ? (
@@ -245,6 +282,10 @@ export function Login() {
             >
               {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <LogIn className="w-5 h-5" />}
               {loading ? "Accesso in corso..." : "Accedi in Sicurezza"}
+            </button>
+            <button type="button" onClick={() => { setDimenticata(true); setError(''); setFatto(''); setChi(username); }}
+              className="w-full text-center text-xs font-semibold text-slate-500 hover:text-slate-800 dark:hover:text-slate-200">
+              Password dimenticata?
             </button>
           </form>
         )}

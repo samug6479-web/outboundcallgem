@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useCampaign } from '../context/CampaignContext';
 import { GemLogo } from './Icons';
-import { LogOut, Sun, Moon, Plus, List, Clock, User, Headset, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen, Radio, Bot, Ban, Settings } from 'lucide-react';
+import { Gauge, LogOut, Sun, Moon, Plus, List, Clock, User, Headset, BarChart2, Users, Phone, Menu, X, ChevronRight, CalendarCheck, Check, ShieldAlert, Loader2, BellRing, UserCog, BookOpen, Radio, Bot, Ban, Settings } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { authFetch } from '../lib/authFetch';
 import { Step1Upload, Step2Preview, Step3Settings } from './CampaignSteps';
@@ -21,8 +21,10 @@ import { NonChiamareSection } from './NonChiamareSection';
 import { ImpostazioniSection } from './ImpostazioniSection';
 import { NotificheAvviso } from './NotificheAvviso';
 import { GiornataSection } from './GiornataSection';
+import { ConsumiSection } from './ConsumiSection';
+import { SaluteAvviso } from './SaluteAvviso';
 
-type Tab = 'home' | 'live' | 'campaign' | 'appointments' | 'lists' | 'dnc' | 'history' | 'callresults' | 'followups' | 'profile' | 'support' | 'stats' | 'users' | 'voicebots' | 'settings';
+type Tab = 'home' | 'consumi' | 'live' | 'campaign' | 'appointments' | 'lists' | 'dnc' | 'history' | 'callresults' | 'followups' | 'profile' | 'support' | 'stats' | 'users' | 'voicebots' | 'settings';
 
 interface NavItem {
   id: Tab;
@@ -71,6 +73,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { id: 'stats' as Tab, label: 'Statistiche', icon: BarChart2 },
       { id: 'history' as Tab, label: 'Storico Campagne', icon: Clock },
+      { id: 'consumi' as Tab, label: 'Consumi', icon: Gauge, adminOnly: true },
     ]
   },
   {
@@ -91,6 +94,7 @@ const TAB_META: Record<Tab, { title: string; subtitle: string }> = {
   dnc: { title: 'Non chiamare', subtitle: 'Numeri che nessuna campagna chiama mai: chi lo ha chiesto, clienti attivi, numeri sbagliati.' },
   settings: { title: 'Impostazioni', subtitle: 'Orari in cui le campagne possono chiamare.' },
   history: { title: 'Storico Campagne', subtitle: 'Le campagne lanciate da tutti gli operatori, con i report da scaricare.' },
+  consumi: { title: 'Consumi', subtitle: 'Chiamate e minuti del mese, per campagna, voicebot e operatore: la base per la fatturazione.' },
   home: { title: 'La mia giornata', subtitle: 'Chi richiamare oggi, i clienti caldi e le campagne in corso.' },
   live: { title: 'In diretta', subtitle: 'Le chiamate delle campagne in corso, aggiornate ogni pochi secondi.' },
   followups: { title: 'Follow-up', subtitle: 'Contatti da richiamare o gestire a mano: chiamate non risposte, rifiuti, disdette e trasferimenti.' },
@@ -367,7 +371,7 @@ export function Dashboard() {
             <div className="grid grid-cols-3 gap-1">
               {/* Guida utente in PDF (file in public/) */}
               <a
-                href="/guida-gem-outbound.pdf?v=2026-10-23k"
+                href="/guida-gem-outbound.pdf?v=2026-10-24a"
                 download="GEM-Outbound-Guida-utente.pdf"
                 title="Scarica la guida utente (PDF)"
                 className="flex flex-col items-center justify-center gap-1 py-2 text-[11px] font-semibold text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
@@ -474,6 +478,8 @@ export function Dashboard() {
             </div>
           )}
 
+          {isAdmin && <SaluteAvviso />}
+
           <NotificheAvviso onApriFollowup={() => {
             try { sessionStorage.setItem('gem_followups_miei', '1'); } catch { /* niente */ }
             window.dispatchEvent(new Event('gem:followups-miei'));
@@ -542,6 +548,8 @@ export function Dashboard() {
           )}
 
           {activeTab === 'home' && <GiornataSection />}
+
+          {activeTab === 'consumi' && isAdmin && <ConsumiSection />}
 
           {activeTab === 'live' && (
             <LiveSection />
